@@ -229,8 +229,17 @@ void Halo::InitComposition() {
 }
 
 void Halo::InitGraphics() {
-    winrt::check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                           nullptr, 0, D3D11_SDK_VERSION, m_d3d.put(), nullptr, nullptr));
+    // Our device only draws the icons once; the compositor renders everything
+    // on the GPU regardless. The software (WARP) device avoids loading the GPU
+    // driver into this process: measured 17 MB private vs 46 MB on hardware.
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr,
+                                   0, D3D11_SDK_VERSION, m_d3d.put(), nullptr, nullptr);
+    if (FAILED(hr)) {
+        Log(L"WARP device unavailable " + Hex(hr) + L", using the GPU");
+        winrt::check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+                                               m_d3d.put(), nullptr, nullptr));
+    }
     auto dxgi = m_d3d.as<IDXGIDevice>();
     winrt::check_hresult(D2D1CreateDevice(dxgi.get(), nullptr, m_d2d.put()));
 
