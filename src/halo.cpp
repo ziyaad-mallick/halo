@@ -17,6 +17,7 @@
 #include <winrt/Windows.UI.Composition.Desktop.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <memory>
@@ -49,7 +50,16 @@ using winrt::Windows::Foundation::Size;
 
 namespace {
 
+// Settings
+constexpr bool kAutoHide = true;
+constexpr UINT kHideDelayMs = 500;        // cursor must stay away this long before hiding
+constexpr float kSpringDamping = 0.72f;   // < 1 overshoots slightly
+constexpr int kSpringPeriodMs = 55;       // lower = snappier
+constexpr int kHideDurationMs = 200;
+constexpr int kStripPx = 2;               // hit strip left on the screen edge while hidden
+
 constexpr int kHotkeyQuit = 1;
+constexpr UINT_PTR kHideTimer = 1;
 constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
 
 void Log(std::wstring const& msg) {
@@ -98,6 +108,8 @@ private:
     void InitGraphics();
     wuc::ContainerVisual BuildPill();
     void BuildDock();
+    void Reveal();
+    void StartHide();
     wuc::CompositionDrawingSurface MakeSurface(Size size);
     wuc::CompositionBrush MakeIconBrush(IconImage const& icon, float size);
 
@@ -108,6 +120,12 @@ private:
     std::vector<PinnedApp> m_apps;
     std::unique_ptr<Dock> m_dock;
     bool m_trackingMouse = false;
+
+    enum class State { Hidden, Shown, Hiding };
+    State m_state = State::Shown;
+    unsigned m_hideGen = 0;  // invalidates a hide batch that a reveal interrupted
+    RECT m_full{}, m_strip{};
+    wuc::ContainerVisual m_slide{nullptr};  // the dock's parent; its Offset.Y slides the dock off-screen
 
     winrt::Windows::System::DispatcherQueueController m_dq{nullptr};
     wuc::Compositor m_comp{nullptr};
@@ -151,17 +169,24 @@ bool Halo::Create(HINSTANCE inst) {
     float n = static_cast<float>(std::max<size_t>(m_apps.size(), 1));
     float growth = 3.0f * pitch * (m_metrics.maxScale - 1);  // generous bound on how far the wave widens it
     m_width = static_cast<int>(std::ceil(n * pitch + 2 * m_metrics.padding + growth + m_scale.f(40)));
+    // The window reaches the monitor's bottom edge so a hiding dock slides
+    // fully off-screen; the dock itself sits a margin above it.
+    int margin = m_scale.px(8);
     m_height = static_cast<int>(
-        std::ceil(m_metrics.pillHeight + m_metrics.restSize * (m_metrics.maxScale - 1) + m_scale.f(16)));
+        std::ceil(m_metrics.pillHeight + m_metrics.restSize * (m_metrics.maxScale - 1) + m_scale.f(16))) + margin;
     m_metrics.centerX = m_width / 2.0f;
-    m_metrics.bottom = static_cast<float>(m_height);
+    m_metrics.bottom = static_cast<float>(m_height - margin);
 
     int x = mi.rcMonitor.left + ((mi.rcMonitor.right - mi.rcMonitor.left) - m_width) / 2;
-    int y = mi.rcMonitor.bottom - m_scale.px(8) - m_height;
+    int y = mi.rcMonitor.bottom - m_height;
+    m_full = {x, y, x + m_width, y + m_height};
+    m_strip = {x, mi.rcMonitor.bottom - kStripPx, x + m_width, mi.rcMonitor.bottom};
+    RECT const& first = kAutoHide ? m_strip : m_full;
+    if (kAutoHide) m_state = State::Hidden;
 
     m_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                             wc.lpszClassName, L"Halo", WS_POPUP, x, y, m_width, m_height, nullptr, nullptr,
-                             inst, this);
+                             wc.lpszClassName, L"Halo", WS_POPUP, first.left, first.top, first.right - first.left,
+                             first.bottom - first.top, nullptr, nullptr, inst, this);
     if (!m_hwnd) {
         Log(L"CreateWindowEx failed " + std::to_wstring(GetLastError()));
         return false;
@@ -197,6 +222,10 @@ void Halo::InitComposition() {
     m_root = m_comp.CreateContainerVisual();
     m_root.RelativeSizeAdjustment({1, 1});
     m_target.Root(m_root);
+    m_slide = m_comp.CreateContainerVisual();
+    m_slide.RelativeSizeAdjustment({1, 1});
+    if (kAutoHide) m_slide.Offset({0, static_cast<float>(m_height), 0});
+    m_root.Children().InsertAtTop(m_slide);
 }
 
 void Halo::InitGraphics() {
@@ -278,7 +307,7 @@ wuc::ContainerVisual Halo::BuildPill() {
 
 void Halo::BuildDock() {
     auto pill = BuildPill();
-    m_dock = std::make_unique<Dock>(m_comp, m_root, pill, m_metrics);
+    m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics);
 
     std::vector<wuc::CompositionBrush> brushes;
     std::vector<PinnedApp> shown;
@@ -294,6 +323,41 @@ void Halo::BuildDock() {
     }
     m_apps = std::move(shown);
     m_dock->SetIcons(brushes);
+}
+
+// Shows the full window at once and springs the dock up from wherever it is.
+void Halo::Reveal() {
+    KillTimer(m_hwnd, kHideTimer);
+    if (m_state == State::Shown) return;
+    if (m_state == State::Hidden)
+        SetWindowPos(m_hwnd, HWND_TOPMOST, m_full.left, m_full.top, m_full.right - m_full.left,
+                     m_full.bottom - m_full.top, SWP_NOACTIVATE);
+    m_state = State::Shown;
+    ++m_hideGen;
+    auto spring = m_comp.CreateSpringScalarAnimation();
+    spring.FinalValue(0.0f);
+    spring.DampingRatio(kSpringDamping);
+    spring.Period(std::chrono::milliseconds(kSpringPeriodMs));
+    m_slide.StartAnimation(L"Offset.Y", spring);
+}
+
+void Halo::StartHide() {
+    if (m_state != State::Shown) return;
+    m_state = State::Hiding;
+    unsigned gen = ++m_hideGen;
+    auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    auto slide = m_comp.CreateScalarKeyFrameAnimation();
+    slide.InsertKeyFrame(1.0f, static_cast<float>(m_height),
+                         m_comp.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.9f, 0.5f}));
+    slide.Duration(std::chrono::milliseconds(kHideDurationMs));
+    m_slide.StartAnimation(L"Offset.Y", slide);
+    batch.End();
+    batch.Completed([this, gen](auto&&, auto&&) {
+        if (gen != m_hideGen || m_state != State::Hiding) return;  // a reveal took over
+        m_state = State::Hidden;
+        SetWindowPos(m_hwnd, HWND_TOPMOST, m_strip.left, m_strip.top, m_strip.right - m_strip.left,
+                     m_strip.bottom - m_strip.top, SWP_NOACTIVATE);
+    });
 }
 
 LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -317,14 +381,22 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, m_hwnd, 0};
                 m_trackingMouse = TrackMouseEvent(&tme);
             }
+            if (kAutoHide) Reveal();
             if (m_dock) m_dock->OnPointerMove(mx);
             return 0;
         case WM_MOUSELEAVE:
             m_trackingMouse = false;
             if (m_dock) m_dock->OnPointerLeave();
+            if (kAutoHide && m_state == State::Shown) SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
+            return 0;
+        case WM_TIMER:
+            if (w == kHideTimer) {
+                KillTimer(m_hwnd, kHideTimer);
+                StartHide();
+            }
             return 0;
         case WM_LBUTTONUP:
-            if (m_dock) {
+            if (m_dock && m_state == State::Shown) {
                 int i = m_dock->HitTest(mx, my);
                 if (i >= 0 && i < static_cast<int>(m_apps.size())) {
                     ShellExecuteW(nullptr, L"open", m_apps[i].linkPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -334,7 +406,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
             return 0;
-        case WM_CLOSE: DestroyWindow(m_hwnd); return 0;
+        case WM_CLOSE: KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);
