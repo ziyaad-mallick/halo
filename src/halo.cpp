@@ -1,5 +1,6 @@
-// Halo M0 spike: a frosted-glass pill drawn with Windows.UI.Composition in a
-// transparent, topmost, non-activating Win32 window.
+// Halo M0 spike: a macOS-style dock drawn with Windows.UI.Composition in a
+// transparent, topmost, non-activating Win32 window: a frosted-glass pill
+// with the user's pinned apps, magnified on hover by the compositor.
 #include <windows.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
@@ -17,8 +18,14 @@
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
+#include <memory>
+#include <shellapi.h>
 #include <string>
+#include <vector>
+#include "dock.h"
 #include "effects.h"
+#include "icons.h"
 
 // Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
 struct ICompositorDesktopInterop : IUnknown {
@@ -86,22 +93,26 @@ public:
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+    LRESULT OnMessage(UINT, WPARAM, LPARAM);
     void InitComposition();
     void InitGraphics();
-    void BuildPill();
-    void BuildTestSurface();
+    wuc::ContainerVisual BuildPill();
+    void BuildDock();
     wuc::CompositionDrawingSurface MakeSurface(Size size);
-    void DrawTestRoundedRect(wuc::CompositionDrawingSurface const& surface);
+    wuc::CompositionBrush MakeIconBrush(IconImage const& icon, float size);
 
     HWND m_hwnd{};
     Scale m_scale{1.0f};
     int m_width{}, m_height{};
+    DockMetrics m_metrics;
+    std::vector<PinnedApp> m_apps;
+    std::unique_ptr<Dock> m_dock;
+    bool m_trackingMouse = false;
 
     winrt::Windows::System::DispatcherQueueController m_dq{nullptr};
     wuc::Compositor m_comp{nullptr};
     wuc::Desktop::DesktopWindowTarget m_target{nullptr};
     wuc::ContainerVisual m_root{nullptr};
-    wuc::ContainerVisual m_pill{nullptr};
 
     winrt::com_ptr<ID3D11Device> m_d3d;
     winrt::com_ptr<ID2D1Device> m_d2d;
@@ -125,8 +136,26 @@ bool Halo::Create(HINSTANCE inst) {
     GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     m_scale.v = dpiX / 96.0f;
 
-    m_width = m_scale.px(760);
-    m_height = m_scale.px(120);
+    Step(L"pinned apps", [&] { m_apps = LoadPinnedApps(); });
+
+    // Metrics in physical px. The window is as wide as the dock can grow and
+    // tall enough for a fully magnified icon above the pill.
+    m_metrics.restSize = m_scale.f(44);
+    m_metrics.gap = m_scale.f(10);
+    m_metrics.maxScale = 1.6f;
+    m_metrics.radius = m_scale.f(130);
+    m_metrics.padding = m_scale.f(12);
+    m_metrics.pillHeight = m_scale.f(64);
+    m_metrics.cornerRadius = m_scale.f(20);
+    float pitch = m_metrics.restSize + m_metrics.gap;
+    float n = static_cast<float>(std::max<size_t>(m_apps.size(), 1));
+    float growth = 3.0f * pitch * (m_metrics.maxScale - 1);  // generous bound on how far the wave widens it
+    m_width = static_cast<int>(std::ceil(n * pitch + 2 * m_metrics.padding + growth + m_scale.f(40)));
+    m_height = static_cast<int>(
+        std::ceil(m_metrics.pillHeight + m_metrics.restSize * (m_metrics.maxScale - 1) + m_scale.f(16)));
+    m_metrics.centerX = m_width / 2.0f;
+    m_metrics.bottom = static_cast<float>(m_height);
+
     int x = mi.rcMonitor.left + ((mi.rcMonitor.right - mi.rcMonitor.left) - m_width) / 2;
     int y = mi.rcMonitor.bottom - m_scale.px(8) - m_height;
 
@@ -138,7 +167,8 @@ bool Halo::Create(HINSTANCE inst) {
         return false;
     }
     Log(L"window " + std::to_wstring(m_width) + L"x" + std::to_wstring(m_height) + L" at " + std::to_wstring(x) +
-        L"," + std::to_wstring(y) + L" scale " + std::to_wstring(m_scale.v));
+        L"," + std::to_wstring(y) + L" scale " + std::to_wstring(m_scale.v) + L", " +
+        std::to_wstring(m_apps.size()) + L" apps");
 
     BOOL on = TRUE;
     HRESULT hr = DwmSetWindowAttribute(m_hwnd, kDwmUseHostBackdropBrush, &on, sizeof(on));
@@ -147,8 +177,7 @@ bool Halo::Create(HINSTANCE inst) {
     bool ok = Step(L"composition", [&] { InitComposition(); });
     if (ok) {
         Step(L"graphics device", [&] { InitGraphics(); });
-        Step(L"pill", [&] { BuildPill(); });
-        Step(L"test surface", [&] { BuildTestSurface(); });
+        ok = Step(L"dock", [&] { BuildDock(); });
     }
     if (!RegisterHotKey(m_hwnd, kHotkeyQuit, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_ESCAPE))
         Log(L"RegisterHotKey Ctrl+Win+Esc failed " + std::to_wstring(GetLastError()));
@@ -187,44 +216,43 @@ wuc::CompositionDrawingSurface Halo::MakeSurface(Size size) {
                                        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
 }
 
-void Halo::DrawTestRoundedRect(wuc::CompositionDrawingSurface const& surface) {
+// Draws the 256px icon into a surface the size of the fully magnified icon,
+// with high-quality downscaling: magnified icons show 1:1 pixels, and at
+// rest the compositor only shrinks it by 1/maxScale, so nothing shimmers.
+wuc::CompositionBrush Halo::MakeIconBrush(IconImage const& icon, float size) {
+    float px = std::ceil(size);
+    auto surface = MakeSurface({px, px});
     auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
     winrt::com_ptr<ID2D1DeviceContext> dc;
     POINT offset{};
     winrt::check_hresult(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset));
     try {
         dc->Clear(D2D1::ColorF(0, 0.0f));
-        winrt::com_ptr<ID2D1SolidColorBrush> fill, stroke;
-        dc->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.55f, 1.0f, 1.0f), fill.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.9f), stroke.put());
-        auto size = surface.Size();
-        D2D1_ROUNDED_RECT rr{D2D1::RectF(offset.x + 1.5f, offset.y + 1.5f, offset.x + size.Width - 1.5f,
-                                         offset.y + size.Height - 1.5f),
-                             size.Width * 0.22f, size.Width * 0.22f};
-        dc->FillRoundedRectangle(rr, fill.get());
-        dc->DrawRoundedRectangle(rr, stroke.get(), 2.0f);
+        winrt::com_ptr<ID2D1Bitmap> bitmap;
+        D2D1_BITMAP_PROPERTIES props =
+            D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(icon.width, icon.height), icon.bgra.data(),
+                                              icon.width * 4, &props, bitmap.put()));
+        D2D1_RECT_F dest = D2D1::RectF(static_cast<float>(offset.x), static_cast<float>(offset.y),
+                                       offset.x + px, offset.y + px);
+        dc->DrawBitmap(bitmap.get(), &dest, 1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
     } catch (...) {
         interop->EndDraw();
         throw;
     }
     winrt::check_hresult(interop->EndDraw());
+    auto brush = m_comp.CreateSurfaceBrush(surface);
+    brush.Stretch(wuc::CompositionStretch::Uniform);
+    return brush;
 }
 
-void Halo::BuildPill() {
-    float w = m_scale.f(560), h = m_scale.f(64);
-    float px = (m_width - w) / 2.0f, py = m_height - h;
-
-    // The container carries the rounded clip so blur, tint and rim share one shape.
-    m_pill = m_comp.CreateContainerVisual();
-    m_pill.Size({w, h});
-    m_pill.Offset({px, py, 0});
-    auto geo = m_comp.CreateRoundedRectangleGeometry();
-    geo.Size({w, h});
-    geo.CornerRadius({m_scale.f(20), m_scale.f(20)});
-    m_pill.Clip(m_comp.CreateGeometricClip(geo));
+// The frosted glass: blurred host backdrop, a dark tint and a 1px top rim.
+// Layers size relative to the container, which the dock resizes and clips.
+wuc::ContainerVisual Halo::BuildPill() {
+    auto pill = m_comp.CreateContainerVisual();
 
     auto glass = m_comp.CreateSpriteVisual();
-    glass.Size({w, h});
+    glass.RelativeSizeAdjustment({1, 1});
     Step(L"blur effect brush", [&] {
         auto backdrop = m_comp.CreateHostBackdropBrush();
         auto blur = winrt::make<halo::GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), 30.0f);
@@ -233,44 +261,83 @@ void Halo::BuildPill() {
         brush.SetSourceParameter(L"backdrop", backdrop);
         glass.Brush(brush);
     });
-    m_pill.Children().InsertAtTop(glass);
+    pill.Children().InsertAtTop(glass);
 
     auto tint = m_comp.CreateSpriteVisual();
-    tint.Size({w, h});
+    tint.RelativeSizeAdjustment({1, 1});
     tint.Brush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x80, 0x16, 0x16, 0x1A)));
-    m_pill.Children().InsertAtTop(tint);
+    pill.Children().InsertAtTop(tint);
 
     auto rim = m_comp.CreateSpriteVisual();
-    rim.Size({w, std::max(1.0f, m_scale.f(1))});
+    rim.RelativeSizeAdjustment({1, 0});
+    rim.Size({0, std::max(1.0f, m_scale.f(1))});
     rim.Brush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x4D, 0xFF, 0xFF, 0xFF)));
-    m_pill.Children().InsertAtTop(rim);
-
-    m_root.Children().InsertAtTop(m_pill);
+    pill.Children().InsertAtTop(rim);
+    return pill;  // the dock places it in the tree
 }
 
-void Halo::BuildTestSurface() {
-    float s = m_scale.f(40);
-    auto surface = MakeSurface({s, s});
-    DrawTestRoundedRect(surface);
-    auto sprite = m_comp.CreateSpriteVisual();
-    sprite.Size({s, s});
-    sprite.Brush(m_comp.CreateSurfaceBrush(surface));
-    // Left end of the pill, vertically centred inside it.
-    float pillX = (m_width - m_scale.f(560)) / 2.0f, pillY = m_height - m_scale.f(64);
-    sprite.Offset({pillX + m_scale.f(16), pillY + (m_scale.f(64) - s) / 2.0f, 0});
-    m_root.Children().InsertAtTop(sprite);
+void Halo::BuildDock() {
+    auto pill = BuildPill();
+    m_dock = std::make_unique<Dock>(m_comp, m_root, pill, m_metrics);
+
+    std::vector<wuc::CompositionBrush> brushes;
+    std::vector<PinnedApp> shown;
+    float iconPx = m_metrics.restSize * m_metrics.maxScale;
+    for (auto const& app : m_apps) {
+        IconImage icon;
+        if (!LoadJumboIcon(app.linkPath, icon) || icon.width == 0) {
+            Log(L"no icon for " + app.name);
+            continue;
+        }
+        brushes.push_back(MakeIconBrush(icon, iconPx));
+        shown.push_back(app);
+    }
+    m_apps = std::move(shown);
+    m_dock->SetIcons(brushes);
 }
 
 LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(l);
+        auto* self = static_cast<Halo*>(cs->lpCreateParams);
+        self->m_hwnd = h;
+        SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+    auto* self = reinterpret_cast<Halo*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    return self ? self->OnMessage(m, w, l) : DefWindowProcW(h, m, w, l);
+}
+
+LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
+    const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
+    const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-        case WM_HOTKEY:
-            if (w == kHotkeyQuit) PostMessageW(h, WM_CLOSE, 0, 0);
+        case WM_MOUSEMOVE:
+            if (!m_trackingMouse) {
+                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, m_hwnd, 0};
+                m_trackingMouse = TrackMouseEvent(&tme);
+            }
+            if (m_dock) m_dock->OnPointerMove(mx);
             return 0;
-        case WM_CLOSE: DestroyWindow(h); return 0;
+        case WM_MOUSELEAVE:
+            m_trackingMouse = false;
+            if (m_dock) m_dock->OnPointerLeave();
+            return 0;
+        case WM_LBUTTONUP:
+            if (m_dock) {
+                int i = m_dock->HitTest(mx, my);
+                if (i >= 0 && i < static_cast<int>(m_apps.size())) {
+                    ShellExecuteW(nullptr, L"open", m_apps[i].linkPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                }
+            }
+            return 0;
+        case WM_HOTKEY:
+            if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        case WM_CLOSE: DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
-    return DefWindowProcW(h, m, w, l);
+    return DefWindowProcW(m_hwnd, m, w, l);
 }
 
 int Halo::Run() {
