@@ -65,6 +65,9 @@ public:
     // Bounces icon `index` three times, or until it is running.
     void Bounce(int index);
 
+    // One short bob (half a bounce high) on icon `index`: feedback for clicking an app that is running.
+    void Bob(int index);
+
     // Where icon `index` (into the last SetItems) is centered with the dock at
     // rest (no magnification), in the parent's coordinates.
     std::pair<float, float> RestIconCenter(size_t index) const;
