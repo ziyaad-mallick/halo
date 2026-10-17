@@ -103,6 +103,9 @@ bool Identify(HWND hwnd, RunningApp& app) {
         app.exe = ExeOf(real);
         if (app.aumid.empty()) app.aumid = AumidOfProcess(real);
     }
+    // Packaged desktop apps (Claude, Spotify, Terminal) set no window ID, but
+    // their process has one, and it is what their pin carries.
+    if (app.aumid.empty()) app.aumid = AumidOfProcess(pid);
     // File Explorer windows carry no ID; the pin knows it by this one.
     constexpr wchar_t kExplorer[] = L"\\explorer.exe";
     constexpr size_t kExplorerLen = ARRAYSIZE(kExplorer) - 1;
