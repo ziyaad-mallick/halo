@@ -7,6 +7,7 @@
 
 #include <windows.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,9 @@ public:
     std::wstring KeyOf(HWND hwnd) const;        // the app a tracked window belongs to, or empty
 
     void OnEvent(DWORD event, HWND hwnd);  // WinEvent callback target
+
+    // Called with the app of each tracked window that comes to the front.
+    std::function<void(RunningApp const&)> onForeground;
 
 private:
     struct Win {

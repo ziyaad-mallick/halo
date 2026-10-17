@@ -1,5 +1,7 @@
 #include "winkey.h"
 
+#include <atomic>
+
 namespace halo::winkey {
 namespace {
 
@@ -10,6 +12,7 @@ HHOOK g_hook = nullptr;
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
 HWND g_target = nullptr;
+std::atomic<bool> g_watchEsc{false};  // the launcher panel is up: report Esc
 bool g_testMode = false;  // HALO_TEST_WINKEY=1: also handle injected input (tests drive it with SendInput)
 Tracker g_track;
 
@@ -24,6 +27,8 @@ void Key(INPUT& in, WORD vk, bool up) {
 LRESULT CALLBACK LowLevel(int code, WPARAM w, LPARAM l) {
     if (code == HC_ACTION) {
         auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(l);
+        if (g_watchEsc && k->vkCode == VK_ESCAPE && (w == WM_KEYDOWN || w == WM_SYSKEYDOWN) && k->dwExtraInfo != kMine)
+            PostMessageW(g_target, EscapeMessage(), 0, 0);
         if (k->dwExtraInfo != kMine && (!(k->flags & LLKHF_INJECTED) || g_testMode)) {
             bool down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
             if (g_track.Feed(k->vkCode, down)) {
@@ -80,6 +85,13 @@ void Remove() {
     CloseHandle(g_thread);
     g_thread = nullptr;
 }
+
+UINT EscapeMessage() {
+    static UINT m = RegisterWindowMessageW(L"Halo.WinKeyEscape");
+    return m;
+}
+
+void WatchEscape(bool on) { g_watchEsc = on; }
 
 void OpenPalette() {
     // Win is already released (the tap's Win-up went through before this message ran).
