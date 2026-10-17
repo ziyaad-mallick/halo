@@ -12,7 +12,7 @@ WINLIBS=(-lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldw
 
 build_halo() {
   echo "== halo.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/icons.cpp \
+  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/icons.cpp src/apps.cpp \
     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}"
 }
 

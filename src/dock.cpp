@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.UI.h>
 
 using namespace winrt;
@@ -106,19 +107,58 @@ float Dock::MagnificationAt(float pointerX, size_t i) const {
     return 1 + (m_m.maxScale - 1) * intensity * (std::cos(t * kPi) + 1) / 2;
 }
 
-void Dock::SetIcons(std::vector<CompositionBrush> const& icons) {
+float Dock::DotSize() const { return std::max(2.0f, std::round(m_m.restSize / 11)); }
+
+void Dock::SetCenter(float x) {
+    m_m.centerX = x;
+    m_props.InsertScalar(L"Center", x);
+}
+
+void Dock::SetIcons(std::vector<Item> const& items, size_t divider) {
     for (auto& v : m_icons) m_root.Children().Remove(v);
+    for (auto& d : m_dots) if (d) m_root.Children().Remove(d);
+    if (m_divider) m_root.Children().Remove(m_divider);
     m_icons.clear();
-    for (auto const& brush : icons) {
+    m_dots.clear();
+    m_divider = nullptr;
+    const float vPad = (m_m.pillHeight - m_m.restSize) / 2;
+    const float dot = DotSize();
+    for (auto const& item : items) {
         auto v = m_compositor.CreateSpriteVisual();
-        v.Brush(brush);
+        v.Brush(item.brush);
         v.Size({m_m.restSize, m_m.restSize});
         // Grow upward from the bottom-center, like the macOS dock.
         v.CenterPoint({m_m.restSize / 2, m_m.restSize, 0});
-        float vPad = (m_m.pillHeight - m_m.restSize) / 2;
         v.Offset({0, m_m.bottom - vPad - m_m.restSize, 0});
         m_root.Children().InsertAtTop(v);
         m_icons.push_back(v);
+
+        // The running dot sits in the padding under the icon and stays put.
+        Visual d{nullptr};
+        if (item.running) {
+            auto geometry = m_compositor.CreateEllipseGeometry();
+            geometry.Radius({dot / 2, dot / 2});
+            auto shape = m_compositor.CreateSpriteShape(geometry);
+            shape.Offset({dot / 2, dot / 2});
+            shape.FillBrush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0xD0, 0xFF, 0xFF, 0xFF)));
+            auto sv = m_compositor.CreateShapeVisual();
+            sv.Size({dot, dot});
+            sv.Shapes().Append(shape);
+            sv.Offset({0, m_m.bottom - vPad / 2 - dot / 2, 0});
+            m_root.Children().InsertAtTop(sv);
+            d = sv;
+        }
+        m_dots.push_back(d);
+    }
+    m_dividerAt = divider > 0 && divider < items.size() ? divider : 0;
+    if (m_dividerAt) {
+        float w = std::max(1.0f, std::round(m_m.restSize / 44));
+        float h = m_m.restSize * 0.9f;
+        m_divider = m_compositor.CreateSpriteVisual();
+        m_divider.Size({w, h});
+        m_divider.Brush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x50, 0xFF, 0xFF, 0xFF)));
+        m_divider.Offset({0, m_m.bottom - vPad - m_m.restSize + (m_m.restSize - h) / 2, 0});
+        m_root.Children().InsertAtTop(m_divider);
     }
     BuildExpressions();
 }
@@ -147,6 +187,23 @@ void Dock::BuildExpressions() {
             std::to_wstring(i) + L".Scale.X / 2 - p.Rest / 2");
         bindAll(x);
         Start(m_icons[i], L"Offset.X", x, L"icon x");
+
+        if (m_dots[i]) {
+            auto dx = m_compositor.CreateExpressionAnimation(
+                L"p.Center - (" + total + L") / 2 + " + SlotSumExpr(i) + L" + p.Pitch * v" +
+                std::to_wstring(i) + L".Scale.X / 2 - " + std::to_wstring(DotSize() / 2));
+            bindAll(dx);
+            Start(m_dots[i], L"Offset.X", dx, L"dot x");
+        }
+    }
+
+    // The divider sits on the boundary between the last pinned slot and the first extra one.
+    if (m_divider) {
+        auto dx = m_compositor.CreateExpressionAnimation(
+            L"p.Center - (" + total + L") / 2 + " + SlotSumExpr(m_dividerAt) + L" - " +
+            std::to_wstring(m_divider.Size().x / 2));
+        bindAll(dx);
+        Start(m_divider, L"Offset.X", dx, L"divider x");
     }
 
     // The pill wraps the slots: it grows with the icons instead of letting
