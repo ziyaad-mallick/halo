@@ -13,12 +13,12 @@
 #include <winrt/Windows.UI.Composition.h>
 
 struct DockMetrics {
-    float restSize = 44.0f;    // icon size at rest, px
+    float restSize = 28.0f;    // icon size at rest, px
     float gap = 10.0f;         // space between icons at rest, px
-    float maxScale = 1.6f;     // magnification under the cursor
-    float radius = 130.0f;     // how far the wave reaches, px
-    float padding = 12.0f;     // pill padding around the outer icons, px
-    float pillHeight = 64.0f;  // background height at rest, px
+    float maxScale = 1.57f;    // magnification under the cursor
+    float radius = 100.0f;     // how far the wave reaches, px
+    float padding = 10.0f;     // pill padding around the outer icons, px
+    float pillHeight = 50.0f;  // background height at rest, px
     float cornerRadius = 20.0f;
     float bottom = 0.0f;       // y of the pill's bottom edge in the parent
     float centerX = 0.0f;      // x of the dock's center in the parent

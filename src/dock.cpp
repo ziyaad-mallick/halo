@@ -41,14 +41,16 @@ std::wstring MagnificationExpr(float restCenter) {
 
 // Sum of the slot widths of icons [0, count): each slot is Pitch * scale, so
 // neighbours make room for the full magnified size, like macOS.
-std::wstring SlotSumExpr(size_t count) {
+std::wstring SlotSumExpr(size_t count, size_t dividerAt) {
     if (count == 0) return L"0";
     std::wstring s = L"p.Pitch * (";
     for (size_t j = 0; j < count; j++) {
         if (j) s += L" + ";
         s += L"v" + std::to_wstring(j) + L".Scale.X";
     }
-    return s + L")";
+    s += L")";
+    if (dividerAt && count >= dividerAt) s += L" + p.DividerSlot";  // the divider's own slot
+    return s;
 }
 
 }  // namespace
@@ -70,6 +72,7 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
     m_props.InsertScalar(L"Gap", m_m.gap);
     m_props.InsertScalar(L"Padding", m_m.padding);
     m_props.InsertScalar(L"Center", m_m.centerX);
+    m_props.InsertScalar(L"DividerSlot", 0.0f);
 
     m_pill.Size({RestWidth(), m_m.pillHeight});
     m_pill.Offset({m_m.centerX - RestWidth() / 2, m_m.bottom - m_m.pillHeight, 0});
@@ -107,7 +110,7 @@ float Dock::MagnificationAt(float pointerX, size_t i) const {
     return 1 + (m_m.maxScale - 1) * intensity * (std::cos(t * kPi) + 1) / 2;
 }
 
-float Dock::DotSize() const { return std::max(2.0f, std::round(m_m.restSize / 11)); }
+float Dock::DotSize() const { return m_m.restSize / 7; }  // 4 logical px at the rest size of 28
 
 void Dock::SetCenter(float x) {
     m_m.centerX = x;
@@ -133,31 +136,33 @@ void Dock::SetIcons(std::vector<Item> const& items, size_t divider) {
         m_root.Children().InsertAtTop(v);
         m_icons.push_back(v);
 
-        // The running dot sits in the padding under the icon and stays put.
+        // The running dot sits one dot-size under the icon and stays put.
         Visual d{nullptr};
         if (item.running) {
             auto geometry = m_compositor.CreateEllipseGeometry();
             geometry.Radius({dot / 2, dot / 2});
             auto shape = m_compositor.CreateSpriteShape(geometry);
             shape.Offset({dot / 2, dot / 2});
-            shape.FillBrush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0xD0, 0xFF, 0xFF, 0xFF)));
+            shape.FillBrush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0xB3, 0xFF, 0xFF, 0xFF)));
             auto sv = m_compositor.CreateShapeVisual();
             sv.Size({dot, dot});
             sv.Shapes().Append(shape);
-            sv.Offset({0, m_m.bottom - vPad / 2 - dot / 2, 0});
+            sv.Offset({0, m_m.bottom - vPad + dot, 0});
             m_root.Children().InsertAtTop(sv);
             d = sv;
         }
         m_dots.push_back(d);
     }
     m_dividerAt = divider > 0 && divider < items.size() ? divider : 0;
+    m_props.InsertScalar(L"DividerSlot", m_dividerAt ? m_m.gap : 0.0f);
     if (m_dividerAt) {
-        float w = std::max(1.0f, std::round(m_m.restSize / 44));
-        float h = m_m.restSize * 0.9f;
+        // A 1px line, 60% of the pill high, in a slot one gap wide: a full gap each side.
+        float w = std::max(1.0f, std::round(m_m.restSize / 28));
+        float h = m_m.pillHeight * 0.6f;
         m_divider = m_compositor.CreateSpriteVisual();
         m_divider.Size({w, h});
-        m_divider.Brush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x50, 0xFF, 0xFF, 0xFF)));
-        m_divider.Offset({0, m_m.bottom - vPad - m_m.restSize + (m_m.restSize - h) / 2, 0});
+        m_divider.Brush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x33, 0xFF, 0xFF, 0xFF)));
+        m_divider.Offset({0, m_m.bottom - (m_m.pillHeight + h) / 2, 0});
         m_root.Children().InsertAtTop(m_divider);
     }
     BuildExpressions();
@@ -172,7 +177,7 @@ void Dock::BuildExpressions() {
         }
     };
 
-    const std::wstring total = SlotSumExpr(n);
+    const std::wstring total = SlotSumExpr(n, m_dividerAt);
     for (size_t i = 0; i < n; i++) {
         auto scale = m_compositor.CreateExpressionAnimation(
             L"Vector3(" + MagnificationExpr(RestCenter(i)) + L", " +
@@ -183,14 +188,14 @@ void Dock::BuildExpressions() {
         // Slots packed around the dock's center; the icon sits centered in
         // its slot (Offset is its top-left before scaling).
         auto x = m_compositor.CreateExpressionAnimation(
-            L"p.Center - (" + total + L") / 2 + " + SlotSumExpr(i) + L" + p.Pitch * v" +
+            L"p.Center - (" + total + L") / 2 + " + SlotSumExpr(i, m_dividerAt) + L" + p.Pitch * v" +
             std::to_wstring(i) + L".Scale.X / 2 - p.Rest / 2");
         bindAll(x);
         Start(m_icons[i], L"Offset.X", x, L"icon x");
 
         if (m_dots[i]) {
             auto dx = m_compositor.CreateExpressionAnimation(
-                L"p.Center - (" + total + L") / 2 + " + SlotSumExpr(i) + L" + p.Pitch * v" +
+                L"p.Center - (" + total + L") / 2 + " + SlotSumExpr(i, m_dividerAt) + L" + p.Pitch * v" +
                 std::to_wstring(i) + L".Scale.X / 2 - " + std::to_wstring(DotSize() / 2));
             bindAll(dx);
             Start(m_dots[i], L"Offset.X", dx, L"dot x");
@@ -200,7 +205,7 @@ void Dock::BuildExpressions() {
     // The divider sits on the boundary between the last pinned slot and the first extra one.
     if (m_divider) {
         auto dx = m_compositor.CreateExpressionAnimation(
-            L"p.Center - (" + total + L") / 2 + " + SlotSumExpr(m_dividerAt) + L" - " +
+            L"p.Center - (" + total + L") / 2 + " + SlotSumExpr(m_dividerAt, 0) + L" + p.DividerSlot / 2 - " +
             std::to_wstring(m_divider.Size().x / 2));
         bindAll(dx);
         Start(m_divider, L"Offset.X", dx, L"divider x");

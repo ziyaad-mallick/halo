@@ -10,6 +10,7 @@
 #include <dispatcherqueue.h>
 #include <windows.ui.composition.interop.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.h>
@@ -112,6 +113,7 @@ private:
     void InitComposition();
     void InitGraphics();
     wuc::ContainerVisual BuildPill();
+    wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
     void RefreshDock();
     void Layout(size_t icons);
@@ -178,16 +180,16 @@ bool Halo::Create(HINSTANCE inst) {
 
     // Metrics in physical px. The window is tall enough for a fully
     // magnified icon above the pill.
-    m_metrics.restSize = m_scale.f(44);
+    m_metrics.restSize = m_scale.f(28);
     m_metrics.gap = m_scale.f(10);
-    m_metrics.maxScale = 1.6f;
-    m_metrics.radius = m_scale.f(130);
-    m_metrics.padding = m_scale.f(12);
-    m_metrics.pillHeight = m_scale.f(64);
+    m_metrics.maxScale = 1.57f;
+    m_metrics.radius = m_scale.f(100);
+    m_metrics.padding = m_scale.f(10);
+    m_metrics.pillHeight = m_scale.f(50);
     m_metrics.cornerRadius = m_scale.f(20);
     // The window reaches the monitor's bottom edge so a hiding dock slides
     // fully off-screen; the dock itself sits a margin above it.
-    int margin = m_scale.px(8);
+    int margin = m_scale.px(6);
     m_height = static_cast<int>(
         std::ceil(m_metrics.pillHeight + m_metrics.restSize * (m_metrics.maxScale - 1) + m_scale.f(16))) + margin;
     m_metrics.bottom = static_cast<float>(m_height - margin);
@@ -297,8 +299,42 @@ wuc::CompositionBrush Halo::MakeIconBrush(IconImage const& icon, float size) {
     return brush;
 }
 
-// The frosted glass: blurred host backdrop, a dark tint and a 1px top rim.
-// Layers size relative to the container, which the dock resizes and clips.
+// Grayscale noise, drawn once, for the glass's grain.
+wuc::CompositionBrush Halo::MakeNoiseBrush(int w, int h) {
+    auto surface = MakeSurface({static_cast<float>(w), static_cast<float>(h)});
+    auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
+    winrt::com_ptr<ID2D1DeviceContext> dc;
+    POINT offset{};
+    winrt::check_hresult(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset));
+    try {
+        std::vector<uint32_t> px(static_cast<size_t>(w) * h);
+        uint32_t seed = 0x2545F491;
+        for (auto& p : px) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;  // xorshift32
+            uint32_t g = seed & 0xFF;
+            p = 0xFF000000 | g << 16 | g << 8 | g;
+        }
+        winrt::com_ptr<ID2D1Bitmap> bitmap;
+        D2D1_BITMAP_PROPERTIES props =
+            D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, &props, bitmap.put()));
+        D2D1_RECT_F dest = D2D1::RectF(static_cast<float>(offset.x), static_cast<float>(offset.y),
+                                       static_cast<float>(offset.x + w), static_cast<float>(offset.y + h));
+        dc->DrawBitmap(bitmap.get(), &dest, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr, nullptr);
+    } catch (...) {
+        interop->EndDraw();
+        throw;
+    }
+    winrt::check_hresult(interop->EndDraw());
+    auto brush = m_comp.CreateSurfaceBrush(surface);
+    brush.Stretch(wuc::CompositionStretch::None);
+    return brush;
+}
+
+// Quiet Dock's glass: blurred host backdrop, a #16161A tint at 50%, 2.5%
+// grain and a 1px rim whose vertical gradient is bright on top and faintly
+// bright again at the bottom. Layers size relative to the container, which
+// the dock resizes and clips.
 wuc::ContainerVisual Halo::BuildPill() {
     auto pill = m_comp.CreateContainerVisual();
 
@@ -306,7 +342,7 @@ wuc::ContainerVisual Halo::BuildPill() {
     glass.RelativeSizeAdjustment({1, 1});
     Step(L"blur effect brush", [&] {
         auto backdrop = m_comp.CreateHostBackdropBrush();
-        auto blur = winrt::make<halo::GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), 30.0f);
+        auto blur = winrt::make<halo::GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), 40.0f);
         auto factory = m_comp.CreateEffectFactory(blur.as<winrt::Windows::Graphics::Effects::IGraphicsEffect>());
         auto brush = factory.CreateBrush();
         brush.SetSourceParameter(L"backdrop", backdrop);
@@ -319,10 +355,39 @@ wuc::ContainerVisual Halo::BuildPill() {
     tint.Brush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x80, 0x16, 0x16, 0x1A)));
     pill.Children().InsertAtTop(tint);
 
-    auto rim = m_comp.CreateSpriteVisual();
-    rim.RelativeSizeAdjustment({1, 0});
-    rim.Size({0, std::max(1.0f, m_scale.f(1))});
-    rim.Brush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x4D, 0xFF, 0xFF, 0xFF)));
+    Step(L"noise", [&] {
+        auto noise = m_comp.CreateSpriteVisual();
+        noise.RelativeSizeAdjustment({1, 1});
+        noise.Opacity(0.025f);
+        noise.Brush(MakeNoiseBrush(m_monitor.right - m_monitor.left, static_cast<int>(std::ceil(m_metrics.pillHeight))));
+        pill.Children().InsertAtTop(noise);
+    });
+
+    // The rim is a stroke inset by half its width, so it stays inside the clip.
+    const float t = m_scale.f(1);
+    const float r = m_metrics.cornerRadius - t / 2;
+    auto rimShape = m_comp.CreateRoundedRectangleGeometry();
+    rimShape.Offset({t / 2, t / 2});
+    rimShape.CornerRadius({r, r});
+    auto rimSize = m_comp.CreateExpressionAnimation(
+        L"Vector2(pill.Size.X - " + std::to_wstring(t) + L", pill.Size.Y - " + std::to_wstring(t) + L")");
+    rimSize.SetReferenceParameter(L"pill", pill);
+    rimShape.StartAnimation(L"Size", rimSize);
+    auto gradient = m_comp.CreateLinearGradientBrush();
+    gradient.MappingMode(wuc::CompositionMappingMode::Relative);
+    gradient.StartPoint({0, 0});
+    gradient.EndPoint({0, 1});
+    auto stop = [&](float at, uint8_t a) {
+        gradient.ColorStops().Append(
+            m_comp.CreateColorGradientStop(at, winrt::Windows::UI::ColorHelper::FromArgb(a, 0xFF, 0xFF, 0xFF)));
+    };
+    stop(0.0f, 0x70); stop(0.35f, 0x18); stop(0.7f, 0x0A); stop(1.0f, 0x26);
+    auto rimSprite = m_comp.CreateSpriteShape(rimShape);
+    rimSprite.StrokeBrush(gradient);
+    rimSprite.StrokeThickness(t);
+    auto rim = m_comp.CreateShapeVisual();
+    rim.RelativeSizeAdjustment({1, 1});
+    rim.Shapes().Append(rimSprite);
     pill.Children().InsertAtTop(rim);
     return pill;  // the dock places it in the tree
 }
