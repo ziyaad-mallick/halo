@@ -95,6 +95,12 @@ private:
     wuc::CompositionDrawingSurface MakeSurface(float w, float h);
     wuc::SpriteVisual MakeSurfaceVisual(wuc::CompositionDrawingSurface const& s, float w, float h);
     void LoadFiles();
+    void Prefetch();
+    void Refresh();
+    void Relayout();
+    void Place();
+    HWND PaletteWindow() const;
+    static std::wstring IconKey(std::wstring const& path);
     void LoadMru();
     void SaveMru() const;
     void Animate(wuc::CompositionObject const& target, wchar_t const* prop, float to, int ms);
@@ -141,6 +147,10 @@ private:
     int m_avatarPx = 0;
     bool m_avatarTried = false;
     bool m_dryRun = false;
+    float m_iconPx = 44;           // app icon size, logical px (shrinks under a tight palette)
+    bool m_iconMiss = false;       // the last build lacked a file icon the cache didn't have yet
+    float m_paletteBottom = 0;     // Command Palette's bottom edge in screen px, once seen
+    D2D1_RECT_F m_vsep{};
 
     bool m_open = false;
     bool m_standalone = false;
