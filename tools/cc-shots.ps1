@@ -4,7 +4,7 @@
 # HALO_TEST_CC_DRYRUN=1 (toggles, sliders and media buttons are logged, not performed).
 #   tools/cc-shots.ps1 -Steps open|click|slide|out [-Scale 1.5] [-Tag cc]
 # Clicks are posted straight to the panel window in logical px (x Scale = client px).
-# Output: build/<Tag>-*.png (top-right 460x660 of the primary screen) and build/<Tag>.log.
+# Output: build/<Tag>-*.png (top-right 460x900 of the primary screen) and build/<Tag>.log.
 param([string]$Exe = '', [string]$Tag = 'cc', [string]$Steps = 'open', [double]$Scale = 1.0)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot
@@ -33,7 +33,7 @@ Start-Sleep -Seconds 2
 $dock = [T]::Find($p.Id, 'HaloDockWindow')
 function Shot($name) {
   $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-  $bmp = New-Object System.Drawing.Bitmap 460, 660
+  $bmp = New-Object System.Drawing.Bitmap 460, 900
   $g = [System.Drawing.Graphics]::FromImage($bmp)
   $g.CopyFromScreen($b.Right - 460, $b.Top, 0, 0, $bmp.Size)
   $bmp.Save("$Out-$name.png"); $g.Dispose(); $bmp.Dispose()
@@ -57,11 +57,14 @@ try {
   "panel=$panel foreground=$([T]::GetForegroundWindow())"
   Shot 'open'
   if ($Steps -match 'click') {
-    Click $panel 80 110; Click $panel 240 110; Click $panel 80 180; Click $panel 240 180; Click $panel 280 58
+    Click $panel 80 110; Click $panel 80 144; Click $panel 80 178; Click $panel 80 212; Click $panel 250 120; Click $panel 216 200; Click $panel 40 281; Click $panel 107 281; Click $panel 280 58
     Shot 'clicked'
   }
-  if ($Steps -match 'slide') { Click $panel 150 238; Click $panel 100 284; Shot 'slid' }
-  if ($Steps -match 'out') { Click $panel 100 320; Shot 'outs' }
+  if ($Steps -match 'slide') { Click $panel 150 360; Click $panel 100 438; Shot 'slid' }
+  if ($Steps -match 'wifi') { Click $panel 136 110; Start-Sleep -Seconds 3; Shot 'wifi'; Start-Sleep -Seconds 6; Shot 'wifi2' }
+  if ($Steps -match 'bt') { Click $panel 136 110; Click $panel 136 144; Start-Sleep -Seconds 4; Shot 'bt' }
+  if ($Steps -match 'out') { Click $panel 250 422; Shot 'outs' }
+  if ($Steps -match 'chord') { Click $panel 174 281; Click $panel 240 281; Click $panel 300 281 }
   $mem1 = (Get-Process -Id $p.Id).PrivateMemorySize64 / 1MB
   if ($Steps -match 'esc') {
     [T]::PostMessage($panel, 0x100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null

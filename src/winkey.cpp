@@ -35,7 +35,12 @@ LRESULT CALLBACK LowLevel(int code, WPARAM w, LPARAM l) {
             // Win+A belongs to Halo's Control Center while the hook runs (RegisterHotKey can't take it
             // from the shell). Feed() first so the Win release no longer counts as a lone tap, then cancel
             // the Start menu with an unassigned key exactly like a tap does.
-            if (k->vkCode == 'A' && (g_swallowA || (down && g_track.winDown))) {
+            // Win can be held without Feed() having seen it (an injected Win from a remapper, or a Win
+            // press before the hook started), so also ask the async key state: that was the leak that let
+            // the stock Quick Settings open behind the panel.
+            const bool winHeld = g_track.winDown || ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000);
+            if (down && (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN)) g_swallowA = false;  // never stay stuck swallowing A
+            if (k->vkCode == 'A' && (g_swallowA || (down && winHeld))) {
                 if (down && !g_swallowA) {
                     g_swallowA = true;
                     g_track.Feed(k->vkCode, true);

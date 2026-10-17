@@ -97,10 +97,40 @@ private:
 };
 std::wstring ConnectedSsid();  // empty when not on Wi-Fi
 
+// ---- Quick toggles ------------------------------------------------------------------------
+bool ReadDarkMode();
+void SetDarkMode(bool on);  // apps + system theme, then broadcasts the change
+bool ReadEnergySaver();     // battery saver active (toggling is the Settings page: ms-settings:batterysaver)
+bool HotspotAvailable();
+bool ReadHotspot();
+void SetHotspot(bool on);
+void SendWinChord(WORD key, bool shift);  // Win+Shift+S, Win+K, Win+P: the shell owns these
+void OpenSettings(wchar_t const* uri);
+
+// ---- Wi-Fi networks and paired Bluetooth devices (inline lists) ----------------------------------
+struct WifiNet {
+    std::wstring ssid;
+    int bars = 0;
+    bool secure = true, connected = false;
+};
+struct BtDevice {
+    std::wstring name;
+    bool connected = false;
+};
+void WifiRefresh(HWND notify, UINT msg);  // posts `msg` twice: the cached report, then the scan
+void WifiStop();
+std::vector<WifiNet> const& WifiNets();
+void WifiConnect(std::wstring const& ssid);
+void BtRefresh(HWND notify, UINT msg);
+void BtStop();
+std::vector<BtDevice> const& BtDevices();
+
 // ---- Now Playing (GSMTC) ------------------------------------------------------------------
 struct MediaState {
     bool has = false, playing = false, canPrev = false, canNext = false;
     std::wstring title, artist;
+    int artSize = 0;  // album art is artSize x artSize premultiplied BGRA; 0 = none
+    std::vector<uint32_t> art;
 };
 
 class Media {
