@@ -1,5 +1,6 @@
 #define SECURITY_WIN32
 #include "launcher.h"
+#include "motion.h"
 #include "winkey.h"
 
 #include <windows.ui.composition.interop.h>
@@ -60,9 +61,6 @@ constexpr float kRise = 24;       // how far below its place the panel starts
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
 constexpr int kMaxApps = 8, kMaxFiles = 6, kKeepApps = 12;
 constexpr int kGraceMs = 800;     // how long Command Palette has to take the keyboard
-constexpr float kSpringDamping = 0.72f;
-constexpr int kSpringPeriodMs = 55;
-constexpr int kFadeInMs = 180, kOutMs = 150;
 constexpr UINT_PTR kRefreshTimer = 1;
 constexpr UINT_PTR kStackTimer = 2;
 
@@ -770,20 +768,14 @@ void Launcher::Show(LauncherAnchor const& anchor, bool standalone) {
         return;
     }
 
-    // Rises out of the gap above the dock: starts low (clipped by the window's bottom edge) and faded.
-    float home = kTop * m_s;
-    m_panel.Offset({0, home + kRise * m_s, 0});
-    m_panel.Opacity(0.0f);
+    // Rises out of the gap above the dock with the dock's spring (clipped by the window's bottom edge),
+    // growing from its bottom centre.
+    const float home = kTop * m_s;
+    m_panel.Offset({0, home, 0});
     Place();
+    motion::In(m_comp, m_panel, {0, home, 0}, {m_w / 2, m_h}, {0, kRise * m_s});
     ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     SetTimer(m_hwnd, kRefreshTimer, 420, nullptr);  // once, after the rise has settled
-
-    auto spring = m_comp.CreateSpringScalarAnimation();
-    spring.FinalValue(home);
-    spring.DampingRatio(kSpringDamping);
-    spring.Period(std::chrono::milliseconds(kSpringPeriodMs));
-    m_panel.StartAnimation(L"Offset.Y", spring);
-    Animate(m_panel, L"Opacity", 1.0f, kFadeInMs);
 
     m_open = true;
     if (!m_hook)
@@ -806,8 +798,7 @@ void Launcher::Hide() {
     }
     unsigned gen = ++m_gen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    Animate(m_panel, L"Offset.Y", kTop * m_s + 14 * m_s, kOutMs);
-    Animate(m_panel, L"Opacity", 0.0f, kOutMs);
+    motion::Out(m_comp, m_panel, {0, kTop * m_s, 0}, {m_w / 2, m_h}, {0, kRise * m_s});
     batch.End();
     batch.Completed([this, gen](auto&&, auto&&) {
         if (gen == m_gen && !m_open) Close();

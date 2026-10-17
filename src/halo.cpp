@@ -912,7 +912,6 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_DISPLAYCHANGE:
             if (m_multimon) m_multimon->OnDisplayChange();
-            if (m_cc) m_cc->OnDisplayChange();
             halo::edge::OnDisplayChange();
             return 0;
         case kMsgEdge:

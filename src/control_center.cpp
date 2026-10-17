@@ -56,9 +56,8 @@ constexpr int kMaxOutputs = 6;
 
 constexpr UINT kMsgAudio = WM_APP + 1, kMsgMic = WM_APP + 2, kMsgRadios = WM_APP + 3, kMsgBright = WM_APP + 4,
                kMsgMedia = WM_APP + 5, kMsgWifi = WM_APP + 6, kMsgBt = WM_APP + 7, kMsgLate = WM_APP + 8;
-constexpr UINT_PTR kTimerClose = 1, kTimerHot = 1, kTimerChord = 2;
-constexpr UINT kHotDwellMs = 180;
-constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloControlCenterHotZone";
+constexpr UINT_PTR kTimerClose = 1, kTimerChord = 2;
+constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloControlCenterTimers";
 
 enum class Id {
     None, WifiPill, BtPill, WifiText, BtText, Wifi, Bluetooth, RowTile, Airplane, Hotspot, Night, Dark, Dnd,
@@ -150,16 +149,11 @@ struct ControlCenter::Impl {
     WORD chordKey = 0;
     bool chordShift = false;
 
-    // ---- hot zone ----
-    bool hotTracking = false;
-    POINT touchStart{-1, -1};
 
     Impl(ControlCenter* a, HINSTANCE i, HWND o, wuc::Compositor c, wuc::CompositionGraphicsDevice g)
         : api(a), inst(i), owner(o), comp(std::move(c)), gdev(std::move(g)) {}
 
     void RegisterClasses();
-    void PlaceHotZone();
-    bool FlickedIn();
     void Open();
     void Close();
     void Teardown();
@@ -189,7 +183,6 @@ struct ControlCenter::Impl {
     SIZE WindowPx() const;
 
     LRESULT PanelProc(HWND h, UINT m, WPARAM w, LPARAM l);
-    LRESULT HotProc(HWND h, UINT m, WPARAM w, LPARAM l);
     static LRESULT CALLBACK PanelThunk(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK HotThunk(HWND, UINT, WPARAM, LPARAM);
 };
@@ -206,104 +199,19 @@ void ControlCenter::Impl::RegisterClasses() {
     RegisterClassExW(&wc);
     wc.lpfnWndProc = HotThunk;
     wc.lpszClassName = kHotClass;
-    wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassExW(&wc);
+    hot = CreateWindowExW(0, kHotClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, this);
 }
 
-// A 2 px strip on the right edge of the primary monitor, from just below the caption-button row down
-// a third of the screen, so it never covers a maximized window's close button. Nearly invisible
-// (alpha 1), non-activating. Resting in its top 100 px opens the panel after a dwell; a fast flick into
-// it, or a touch swipe in from it, opens the panel anywhere along it.
-void ControlCenter::Impl::PlaceHotZone() {
-    HMONITOR m = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfoW(m, &mi);
-    UINT dpi = 96, dy = 96;
-    GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &dpi, &dy);
-    float k = dpi / 96.0f;
-    int w = std::max(2, static_cast<int>(2 * k)), y = mi.rcMonitor.top + static_cast<int>(36 * k);
-    int h = std::max<int>(static_cast<int>(132 * k), (mi.rcMonitor.bottom - mi.rcMonitor.top) / 3);
-    if (!hot) {
-        hot = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, kHotClass,
-                              L"HaloControlCenterHotZone", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, this);
-        if (!hot) return;
-        SetLayeredWindowAttributes(hot, 0, 1, LWA_ALPHA);
-    }
-    SetWindowPos(hot, HWND_TOPMOST, mi.rcMonitor.right - w, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-}
-
+// A message-only window that hosts the delayed Win-chord timer (Cast, Snip): it outlives the panel.
+// Edge gestures that open the panel live in edge.cpp.
 LRESULT CALLBACK ControlCenter::Impl::HotThunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self ? self->HotProc(h, m, w, l) : DefWindowProcW(h, m, w, l);
-}
-
-// True when the pointer arrived at this message fast and from the left: >= 1.2 px/ms over the last
-// 100 ms, at least 60 px of travel, mostly horizontal. Uses the system's mouse-move history, so it is
-// event-driven (no polling and no hook).
-bool ControlCenter::Impl::FlickedIn() {
-    DWORD pos = GetMessagePos();
-    MOUSEMOVEPOINT cur{static_cast<int>(static_cast<short>(LOWORD(pos))), static_cast<int>(static_cast<short>(HIWORD(pos))),
-                       static_cast<DWORD>(GetMessageTime()), 0};
-    MOUSEMOVEPOINT hist[16]{};
-    int n = GetMouseMovePointsEx(sizeof(cur), &cur, hist, 16, GMMP_USE_DISPLAY_POINTS);
-    if (n < 2) return false;
-    int oldest = 0;
-    for (int i = 1; i < n; i++) {
-        if (static_cast<int>(hist[0].time - hist[i].time) > 100) break;
-        oldest = i;
-    }
-    if (!oldest) return false;
-    float dt = static_cast<float>(std::max<DWORD>(1, hist[0].time - hist[oldest].time));
-    int dx = static_cast<short>(hist[0].x) - static_cast<short>(hist[oldest].x);
-    int dy = std::abs(static_cast<short>(hist[0].y) - static_cast<short>(hist[oldest].y));
-    return dx >= 60 && dx > dy && dx / dt >= 1.2f;
-}
-
-// Event-driven: the pointer entering the strip arms one dwell timer; leaving disarms it.
-LRESULT ControlCenter::Impl::HotProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    switch (m) {
-        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-        case WM_MOUSEMOVE:
-            if (st == St::Closed && FlickedIn()) { Open(); return 0; }
-            if (!hotTracking) {
-                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
-                hotTracking = TrackMouseEvent(&tme);
-                RECT r;
-                GetWindowRect(h, &r);
-                POINT p;
-                GetCursorPos(&p);
-                if (p.y - r.top < 100 * s) SetTimer(h, kTimerHot, kHotDwellMs, nullptr);  // dwell only near the corner
-            }
-            return 0;
-        case WM_MOUSELEAVE:
-            hotTracking = false;
-            KillTimer(h, kTimerHot);
-            return 0;
-        // Touch: a finger that lands on the strip and drags left by 40 px. (Windows' own edge-swipe
-        // gesture may claim the touch first; see the report.)
-        case WM_POINTERDOWN:
-        case WM_POINTERUPDATE: {
-            POINTER_INFO pi{};
-            if (!GetPointerInfo(GET_POINTERID_WPARAM(w), &pi) || pi.pointerType != PT_TOUCH) break;
-            if (m == WM_POINTERDOWN) touchStart = pi.ptPixelLocation;
-            else if (IS_POINTER_INCONTACT_WPARAM(w) && touchStart.x >= 0 && touchStart.x - pi.ptPixelLocation.x >= 40 * s &&
-                     st == St::Closed) {
-                touchStart = {-1, -1};
-                Open();
-            }
-            return 0;
-        }
-        case WM_POINTERUP: touchStart = {-1, -1}; break;
-        case WM_TIMER:
-            if (w == kTimerHot) {
-                KillTimer(h, kTimerHot);
-                if (st == St::Closed) Open();
-            } else if (w == kTimerChord) {
-                KillTimer(h, kTimerChord);
-                svc::SendWinChord(chordKey, chordShift);
-            }
-            return 0;
+    if (self && m == WM_TIMER && w == kTimerChord) {
+        KillTimer(h, kTimerChord);
+        svc::SendWinChord(self->chordKey, self->chordShift);
+        return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
@@ -1302,7 +1210,6 @@ void ControlCenter::Impl::BuildVisuals() {
 ControlCenter::ControlCenter(HINSTANCE inst, HWND owner, wuc::Compositor comp, wuc::CompositionGraphicsDevice gdev)
     : m(std::make_unique<Impl>(this, inst, owner, std::move(comp), std::move(gdev))) {
     m->RegisterClasses();
-    m->PlaceHotZone();
 }
 
 ControlCenter::~ControlCenter() {
@@ -1314,7 +1221,6 @@ void ControlCenter::Toggle() { IsOpen() ? Close() : Open(); }
 void ControlCenter::Open() { m->Open(); }
 void ControlCenter::Close() { m->Close(); }
 bool ControlCenter::IsOpen() const { return m->st == Impl::St::Open; }
-void ControlCenter::OnDisplayChange() { m->PlaceHotZone(); }
 // The panel itself (physical px), not the padded window.
 RECT ControlCenter::PanelRectScreen() const { return m->st == Impl::St::Closed ? RECT{} : m->rect; }
 

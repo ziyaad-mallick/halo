@@ -784,7 +784,7 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
             float inset = (7.0f * i) * s;
             peek.Size({wPx - 2 * inset, 20 * s});
             peek.Offset({inset, hPx + (i == 1 ? 5.0f : 10.0f) * s - 20 * s, 0});
-            peek.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(i == 1 ? 0x70 : 0x48, 0x16, 0x16, 0x1A)));
+            peek.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(i == 1 ? 0x30 : 0x1A, 0xFF, 0xFF, 0xFF)));
             auto g = comp.CreateRoundedRectangleGeometry();
             g.CornerRadius({kRadius * s, kRadius * s});
             g.Size(peek.Size());
