@@ -85,8 +85,9 @@ constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
 constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Control Center) / kRight (notifications)
+constexpr UINT kMsgTestNotifCenter = WM_APP + 21;  // HALO_TEST=1: toggle the Notification Center
 constexpr UINT kMsgTestBounce = WM_APP + 30;  // HALO_TEST=1: wParam = dock item to bounce (no launch)
-constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
+constexpr UINT kGenieHoldMs = 620;  // dock stays up for the 320 ms scale effect + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
 constexpr UINT_PTR kPreviewTimer = 21;  // the pointer rested on a running app
@@ -154,8 +155,8 @@ private:
     void PointerLeave();
     void Reveal();
     void OpenLauncher();
-    void OpenNotifications() { Log(L"notifications: open (pending Notification Center)"); }
-    void ToggleNotifications() { OpenNotifications(); }
+    void OpenNotifications() { if (m_notif && !m_notif->IsOpen()) { if (m_cc) m_cc->Close(); m_notif->Open(); } }
+    void ToggleNotifications() { if (m_notif && m_notif->IsOpen()) m_notif->Close(); else OpenNotifications(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
     std::wstring LaunchTarget(RunningApp const& app) const;
     void LaunchRecent(std::wstring const& target);
@@ -188,7 +189,7 @@ private:
     std::wstring m_previewKey;      // the app the strip shows
     std::unique_ptr<halo::IntellihideDetector> m_intellihide;
     std::unique_ptr<halo::MultiMonitorFollower> m_multimon;
-    std::unique_ptr<halo::NotificationStack> m_notif;  // declared before m_cc: outlives it
+    std::unique_ptr<halo::NotificationCenter> m_notif;
     std::unique_ptr<halo::ControlCenter> m_cc;
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
@@ -314,9 +315,7 @@ bool Halo::Create(HINSTANCE inst) {
         Log(L"RegisterHotKey Ctrl+Win+Esc failed " + std::to_wstring(GetLastError()));
     Step(L"control center", [&] { m_cc = std::make_unique<halo::ControlCenter>(inst, m_hwnd, m_comp, m_gdev); });
     Step(L"notifications", [&] {
-        m_notif = std::make_unique<halo::NotificationStack>(inst, m_comp, m_gdev);
-        m_cc->onShown = m_cc->onResized = [this] { m_notif->Show(m_cc->PanelRectScreen()); };
-        m_cc->onHidden = [this] { m_notif->Hide(); };
+        m_notif = std::make_unique<halo::NotificationCenter>(inst, m_hwnd, m_comp, m_gdev);
     });
     if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
     else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
@@ -873,7 +872,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     }
     if (m == halo::winkey::ControlCenterMessage()) {  // Win+A (wParam 0) / Win+N (1)
         if (w) ToggleNotifications();
-        else if (m_cc) m_cc->Toggle();
+        else if (m_cc) { if (m_notif && !m_cc->IsOpen()) m_notif->Close(); m_cc->Toggle(); }
         return 0;
     }
     switch (m) {
@@ -900,6 +899,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case kMsgTestControlCenter: if (m_cc && _wgetenv(L"HALO_TEST")) m_cc->Toggle(); return 0;
+        case kMsgTestNotifCenter: if (m_notif && _wgetenv(L"HALO_TEST")) m_notif->Toggle(); return 0;
         case kMsgIntellihideChanged:
             if (w || l) {
                 if (!m_trackingMouse) StartHide();
@@ -917,7 +917,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case kMsgEdge:
             Log(w == halo::edge::kTop ? L"edge: top" : L"edge: right");
-            if (w == halo::edge::kTop) { if (m_cc && !m_cc->IsOpen()) m_cc->Open(); }
+            if (w == halo::edge::kTop) { if (m_cc && !m_cc->IsOpen()) { if (m_notif) m_notif->Close(); m_cc->Open(); } }
             else OpenNotifications();
             return 0;
         case WM_TIMER:
