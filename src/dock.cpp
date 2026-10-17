@@ -91,6 +91,7 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
         m_clusterDivider.Offset({0, m_m.bottom - (m_m.pillHeight + ch) / 2, 0});
         m_root.Children().InsertAtTop(m_clusterDivider);
         if (m_cluster->Visual()) {
+            m_cluster->Visual().Offset({0, m_m.bottom - m_m.pillHeight, 0});
             m_root.Children().InsertAtTop(m_cluster->Visual());
         }
     }
@@ -445,6 +446,29 @@ std::pair<float, float> Dock::MagnifiedIconCenterAndTop(size_t index) const {
     return {centerX, topY};
 }
 
+bool Dock::HitStart(float x, float y) const {
+    if (!m_cluster) return false;
+    std::vector<Entry const*> live;
+    for (auto const& e : m_entries) if (!e.leaving) live.push_back(&e);
+    const size_t n = live.size();
+    int d = -1;
+    for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
+    const float pitch = m_m.restSize + m_m.gap;
+    const float divider = d >= 0 ? m_m.gap : 0.0f;
+    // The pill's width as the expressions compute it, with every icon fully present.
+    const float restLeft = m_m.centerX + m_clusterOffset / 2 - (pitch * n + divider) / 2;
+    float total = divider;
+    for (size_t k = 0; k < n; k++) {
+        float center = restLeft + pitch * k + (d >= 0 && static_cast<int>(k) >= d ? divider : 0.0f) + pitch / 2;
+        float t = std::min(std::abs(m_pointerX - center) / m_m.radius, 1.0f);
+        total += pitch * (1 + (m_m.maxScale - 1) * (m_hovering ? 1.0f : 0.0f) * (std::cos(t * kPi) + 1) / 2);
+    }
+    const float pillWidth = m_clusterOffset + (n > 0 ? total - m_m.gap : 0.0f) + 2 * m_m.padding;
+    const float clusterLeft = m_m.centerX - pillWidth / 2 + m_m.padding;
+    const float top = m_m.bottom - m_m.pillHeight;
+    return y >= top && y <= m_m.bottom && m_cluster->HitTestStart(x - clusterLeft, y - top);
+}
+
 int Dock::HitTest(float x, float y) const {
     std::vector<Entry const*> live;
     for (auto const& e : m_entries) if (!e.leaving) live.push_back(&e);
@@ -462,23 +486,6 @@ int Dock::HitTest(float x, float y) const {
         float t = std::min(std::abs(m_pointerX - center) / m_m.radius, 1.0f);
         mag[k] = 1 + (m_m.maxScale - 1) * (m_hovering ? 1.0f : 0.0f) * (std::cos(t * kPi) + 1) / 2;
         total += pitch * mag[k];
-    }
-
-    // Check Left Cluster (Start button & status)
-    if (m_cluster) {
-        float pillWidth = m_clusterOffset + (n > 0 ? (total - m_m.gap) : 0.0f) + 2 * m_m.padding;
-        float pillLeft = m_m.centerX - pillWidth / 2;
-        float clusterLeft = pillLeft + m_m.padding;
-
-        if (x >= clusterLeft && x < clusterLeft + m_clusterWidth &&
-            y >= m_m.bottom - m_m.pillHeight && y <= m_m.bottom) {
-            float localX = x - clusterLeft;
-            float localY = y - (m_m.bottom - m_m.pillHeight);
-            if (m_cluster->HitTestStart(localX, localY)) {
-                DockCluster::TriggerStartMenu();
-            }
-            return -1;
-        }
     }
 
     if (n == 0) return -1;

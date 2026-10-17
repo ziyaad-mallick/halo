@@ -24,7 +24,6 @@ namespace {
 static constexpr GUID kGuidAcdcPowerSource = {0x5d3e9a59, 0xe9d5, 0x4b00, {0xa6, 0xbd, 0xff, 0x34, 0xff, 0x51, 0x65, 0x48}};
 static constexpr GUID kGuidBatteryPercentageRemaining = {0xa7ad8041, 0xb45a, 0x4cae, {0x87, 0xa3, 0xee, 0xcb, 0xb4, 0x68, 0xa9, 0xe1}};
 
-constexpr ULONG_PTR kHaloInputMarker = 0x48414C4F;  // "HALO"
 
 }  // namespace
 
@@ -34,9 +33,8 @@ DockCluster::DockCluster(winrt::Windows::UI::Composition::Compositor const& comp
                          float pillHeight,
                          float scale)
     : m_compositor(compositor), m_gdev(gdev), m_hwnd(hwnd), m_pillHeight(pillHeight), m_scale(scale) {
-    m_width = std::round(192.0f * m_scale);
-    m_startWidth = std::round(28.0f * m_scale);
-    m_startX = m_width - m_startWidth;
+    InitDirectWrite();
+    Layout();
 
     if (m_gdev) {
         m_surface = m_gdev.CreateDrawingSurface(
@@ -50,7 +48,6 @@ DockCluster::DockCluster(winrt::Windows::UI::Composition::Compositor const& comp
         m_visual.Brush(brush);
     }
 
-    InitDirectWrite();
     RegisterPowerNotifications();
     RegisterNetworkCallback();
     SetupClockTimer();
@@ -97,13 +94,6 @@ void DockCluster::InitDirectWrite() {
         L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, battTextSize,
         L"en-us", m_tfBattText.put()));
-
-    // Segoe Fluent Icons for Windows 11 Start logo
-    const float startSize = 16.0f * m_scale;
-    winrt::check_hresult(m_dwriteFactory->CreateTextFormat(
-        L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, startSize,
-        L"en-us", m_tfStart.put()));
 }
 
 void DockCluster::SetupClockTimer() {
@@ -161,29 +151,6 @@ bool DockCluster::HitTestStart(float localX, float localY) const {
            localY >= 0.0f && localY <= m_pillHeight;
 }
 
-void DockCluster::TriggerStartMenu() {
-    INPUT in[4] = {};
-    in[0].type = INPUT_KEYBOARD;
-    in[0].ki.wVk = VK_CONTROL;
-    in[0].ki.dwExtraInfo = kHaloInputMarker;
-
-    in[1].type = INPUT_KEYBOARD;
-    in[1].ki.wVk = VK_ESCAPE;
-    in[1].ki.dwExtraInfo = kHaloInputMarker;
-
-    in[2].type = INPUT_KEYBOARD;
-    in[2].ki.wVk = VK_ESCAPE;
-    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    in[2].ki.dwExtraInfo = kHaloInputMarker;
-
-    in[3].type = INPUT_KEYBOARD;
-    in[3].ki.wVk = VK_CONTROL;
-    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
-    in[3].ki.dwExtraInfo = kHaloInputMarker;
-
-    SendInput(4, in, sizeof(INPUT));
-}
-
 void DockCluster::OnTimer(UINT_PTR timerId) {
     if (timerId == kClockTimer) {
         KillTimer(m_hwnd, kClockTimer);
@@ -214,132 +181,115 @@ void DockCluster::OnNetworkChanged() {
     Render();
 }
 
+// A layout of `text` in `format`, vertically centered in the pill.
+winrt::com_ptr<IDWriteTextLayout> DockCluster::MakeLayout(std::wstring const& text, IDWriteTextFormat* format,
+                                                         float width) const {
+    winrt::com_ptr<IDWriteTextLayout> layout;
+    winrt::check_hresult(m_dwriteFactory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), format,
+                                                           width, m_pillHeight, layout.put()));
+    layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    if (m_typography) layout->SetTypography(m_typography.get(), {0, static_cast<UINT32>(text.size())});
+    return layout;
+}
+
+float DockCluster::TextWidth(std::wstring const& text, IDWriteTextFormat* format) const {
+    DWRITE_TEXT_METRICS tm{};
+    MakeLayout(text, format, 1000.0f)->GetMetrics(&tm);
+    return std::ceil(tm.widthIncludingTrailingWhitespace);
+}
+
+// Fixed slots sized for the widest content, so the dock never changes width
+// as the time or battery level ticks over: time | Wi-Fi | battery % | Start.
+void DockCluster::Layout() {
+    const float s = m_scale;
+    m_timeX = 4.0f * s;
+    m_timeW = TextWidth(L"88:88", m_tfTime.get());
+    m_wifiX = m_timeX + m_timeW + 10.0f * s;
+    m_iconW = std::max(TextWidth(L"\uE701", m_tfIcons.get()), TextWidth(L"\uEBAA", m_tfIcons.get()));
+    m_battX = m_wifiX + m_iconW + 8.0f * s;
+    m_battTextW = TextWidth(L"100%", m_tfBattText.get());
+    m_startWidth = std::round(28.0f * s);  // one rest-size icon slot
+    m_startX = m_battX + m_iconW + 3.0f * s + m_battTextW + 8.0f * s;
+    m_width = std::ceil(m_startX + m_startWidth);
+}
+
 void DockCluster::Render() {
     if (!m_surface || !m_dwriteFactory) return;
+    namespace conn = winrt::Windows::Networking::Connectivity;
 
     auto interop = m_surface.as<ICompositionDrawingSurfaceInterop>();
     winrt::com_ptr<ID2D1DeviceContext> dc;
     POINT offset{};
-    HRESULT hr = interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset);
-    if (FAILED(hr)) return;
+    if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset))) return;
 
     try {
+        const float ox = static_cast<float>(offset.x), oy = static_cast<float>(offset.y);
         dc->Clear(D2D1::ColorF(0, 0.0f));
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
-        winrt::com_ptr<ID2D1SolidColorBrush> whiteBrush;
-        winrt::com_ptr<ID2D1SolidColorBrush> dimBrush;
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), whiteBrush.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.40f), dimBrush.put());
+        winrt::com_ptr<ID2D1SolidColorBrush> white, dim;
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), white.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.40f), dim.put());
 
-        // 1. Time string formatted according to user settings ("9:41" / "17:40")
+        // Time, in the user's 12/24-hour setting, centered in its slot.
         SYSTEMTIME st;
         GetLocalTime(&st);
         int is24 = 0;
         GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_ITIME | LOCALE_RETURN_NUMBER,
                         reinterpret_cast<LPWSTR>(&is24), sizeof(is24) / sizeof(wchar_t));
         int hour = is24 ? st.wHour : (st.wHour % 12 == 0 ? 12 : st.wHour % 12);
-        wchar_t timeBuf[32];
-        swprintf(timeBuf, 32, is24 ? L"%02d:%02d" : L"%d:%02d", hour, st.wMinute);
+        wchar_t timeBuf[16];
+        swprintf(timeBuf, 16, is24 ? L"%02d:%02d" : L"%d:%02d", hour, st.wMinute);
+        auto time = MakeLayout(timeBuf, m_tfTime.get(), m_timeW);
+        time->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        dc->DrawTextLayout({ox + m_timeX, oy}, time.get(), white.get());
 
-        winrt::com_ptr<IDWriteTextLayout> timeLayout;
-        m_dwriteFactory->CreateTextLayout(
-            timeBuf, static_cast<UINT32>(wcslen(timeBuf)),
-            m_tfTime.get(), 1000.0f, m_pillHeight, timeLayout.put());
-        timeLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        if (m_typography) {
-            DWRITE_TEXT_RANGE range{0, static_cast<UINT32>(wcslen(timeBuf))};
-            timeLayout->SetTypography(m_typography.get(), range);
-        }
-        float timeX = 6.0f * m_scale;
-        dc->DrawTextLayout(D2D1::Point2F(offset.x + timeX, offset.y + 0), timeLayout.get(), whiteBrush.get());
-
-        // 2. Wi-Fi glyph (\uE701 connected, \uEB55 disconnected)
-        bool wifiConnected = false;
+        // Network: Wi-Fi or Ethernet glyph; dimmed Wi-Fi when offline.
+        wchar_t net = L'\uE701';
+        bool online = false;
         try {
-            auto profile = winrt::Windows::Networking::Connectivity::NetworkInformation::GetInternetConnectionProfile();
-            if (profile) {
-                wifiConnected = (profile.GetNetworkConnectivityLevel() ==
-                                 winrt::Windows::Networking::Connectivity::NetworkConnectivityLevel::InternetAccess);
+            if (auto profile = conn::NetworkInformation::GetInternetConnectionProfile()) {
+                online = profile.GetNetworkConnectivityLevel() == conn::NetworkConnectivityLevel::InternetAccess;
+                if (!profile.IsWlanConnectionProfile() && !profile.IsWwanConnectionProfile()) net = L'\uE839';
             }
         } catch (...) {}
-        wchar_t wifiGlyph[2] = { wifiConnected ? L'\uE701' : L'\uEB55', 0 };
-        winrt::com_ptr<IDWriteTextLayout> wifiLayout;
-        m_dwriteFactory->CreateTextLayout(
-            wifiGlyph, 1, m_tfIcons.get(), 1000.0f, m_pillHeight, wifiLayout.put());
-        wifiLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        float wifiX = 60.0f * m_scale;
-        dc->DrawTextLayout(D2D1::Point2F(offset.x + wifiX, offset.y + 0), wifiLayout.get(),
-                           wifiConnected ? whiteBrush.get() : dimBrush.get());
+        if (!online) net = L'\uE701';
+        auto netLayout = MakeLayout(std::wstring(1, net), m_tfIcons.get(), m_iconW);
+        netLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        dc->DrawTextLayout({ox + m_wifiX, oy}, netLayout.get(), online ? white.get() : dim.get());
 
-        // 3. Battery status
+        // Battery: Battery0..10 (EBA0..EBAA) or BatteryCharging0..10 (EBAB..EBB5), then the percentage.
         SYSTEM_POWER_STATUS sps{};
-        bool hasBattery = false;
-        int batteryPercent = 100;
-        bool acPlugged = false;
-        if (GetSystemPowerStatus(&sps)) {
-            hasBattery = !(sps.BatteryFlag & 128) && sps.BatteryLifePercent <= 100;
-            batteryPercent = sps.BatteryLifePercent;
-            acPlugged = (sps.ACLineStatus == 1);
+        if (GetSystemPowerStatus(&sps) && !(sps.BatteryFlag & 128) && sps.BatteryLifePercent <= 100) {
+            const int pct = sps.BatteryLifePercent;
+            const int level = std::clamp((pct + 5) / 10, 0, 10);
+            const wchar_t glyph = static_cast<wchar_t>((sps.ACLineStatus == 1 ? 0xEBAB : 0xEBA0) + level);
+            auto batt = MakeLayout(std::wstring(1, glyph), m_tfIcons.get(), m_iconW);
+            batt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            dc->DrawTextLayout({ox + m_battX, oy}, batt.get(), white.get());
+            wchar_t pctBuf[8];
+            swprintf(pctBuf, 8, L"%d%%", pct);
+            auto pctLayout = MakeLayout(pctBuf, m_tfBattText.get(), m_battTextW);
+            dc->DrawTextLayout({ox + m_battX + m_iconW + 3.0f * m_scale, oy}, pctLayout.get(), white.get());
         }
 
-        float battX = 82.0f * m_scale;
-        if (hasBattery) {
-            int level = std::clamp((batteryPercent + 5) / 10, 0, 10);
-            wchar_t battGlyph[2] = { static_cast<wchar_t>(0xEBA0 + level), 0 };
-            winrt::com_ptr<IDWriteTextLayout> battLayout;
-            m_dwriteFactory->CreateTextLayout(
-                battGlyph, 1, m_tfIcons.get(), 1000.0f, m_pillHeight, battLayout.put());
-            battLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            DWRITE_TEXT_METRICS bm{};
-            battLayout->GetMetrics(&bm);
-            dc->DrawTextLayout(D2D1::Point2F(offset.x + battX, offset.y + 0), battLayout.get(), whiteBrush.get());
-
-            battX += bm.widthIncludingTrailingWhitespace + 4.0f * m_scale;
-
-            wchar_t battTextBuf[16];
-            swprintf(battTextBuf, 16, L"%d%%", batteryPercent);
-            winrt::com_ptr<IDWriteTextLayout> battTextLayout;
-            m_dwriteFactory->CreateTextLayout(
-                battTextBuf, static_cast<UINT32>(wcslen(battTextBuf)),
-                m_tfBattText.get(), 1000.0f, m_pillHeight, battTextLayout.put());
-            battTextLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            if (m_typography) {
-                DWRITE_TEXT_RANGE range{0, static_cast<UINT32>(wcslen(battTextBuf))};
-                battTextLayout->SetTypography(m_typography.get(), range);
+        // Start: the Windows 11 logo, four panes under one blue gradient.
+        const float logo = std::round(17.0f * m_scale);
+        const float gap = std::max(1.0f, std::round(logo / 14.0f));
+        const float pane = (logo - gap) / 2;
+        const float lx = ox + m_startX + (m_startWidth - logo) / 2;
+        const float ly = oy + std::round((m_pillHeight - logo) / 2);
+        D2D1_GRADIENT_STOP stops[] = {{0.0f, D2D1::ColorF(0x5AD0FF)}, {1.0f, D2D1::ColorF(0x0A6CDA)}};
+        winrt::com_ptr<ID2D1GradientStopCollection> stopColl;
+        winrt::com_ptr<ID2D1LinearGradientBrush> blue;
+        dc->CreateGradientStopCollection(stops, 2, stopColl.put());
+        dc->CreateLinearGradientBrush({{lx, ly}, {lx + logo, ly + logo}}, stopColl.get(), blue.put());
+        const float r = std::max(0.5f, pane / 10.0f);
+        for (int row = 0; row < 2; row++)
+            for (int col = 0; col < 2; col++) {
+                const float x = lx + col * (pane + gap), y = ly + row * (pane + gap);
+                dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, y, x + pane, y + pane), r, r), blue.get());
             }
-            DWRITE_TEXT_METRICS btm{};
-            battTextLayout->GetMetrics(&btm);
-            dc->DrawTextLayout(D2D1::Point2F(offset.x + battX, offset.y + 0), battTextLayout.get(), whiteBrush.get());
-
-            battX += btm.widthIncludingTrailingWhitespace;
-
-            if (acPlugged) {
-                battX += 3.0f * m_scale;
-                wchar_t boltGlyph[2] = { L'\uEBB5', 0 };
-                winrt::com_ptr<IDWriteTextLayout> boltLayout;
-                m_dwriteFactory->CreateTextLayout(
-                    boltGlyph, 1, m_tfIcons.get(), 1000.0f, m_pillHeight, boltLayout.put());
-                boltLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                dc->DrawTextLayout(D2D1::Point2F(offset.x + battX, offset.y + 0), boltLayout.get(), whiteBrush.get());
-            }
-        } else if (acPlugged) {
-            wchar_t boltGlyph[2] = { L'\uEBB5', 0 };
-            winrt::com_ptr<IDWriteTextLayout> boltLayout;
-            m_dwriteFactory->CreateTextLayout(
-                boltGlyph, 1, m_tfIcons.get(), 1000.0f, m_pillHeight, boltLayout.put());
-            boltLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            dc->DrawTextLayout(D2D1::Point2F(offset.x + battX, offset.y + 0), boltLayout.get(), whiteBrush.get());
-        }
-
-        // 4. Start Button (\uE782 in Segoe Fluent Icons, centered in Start slot)
-        wchar_t startGlyph[2] = { L'\uE782', 0 };
-        winrt::com_ptr<IDWriteTextLayout> startLayout;
-        m_dwriteFactory->CreateTextLayout(
-            startGlyph, 1, m_tfStart.get(), m_startWidth, m_pillHeight, startLayout.put());
-        startLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        startLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        dc->DrawTextLayout(D2D1::Point2F(offset.x + m_startX, offset.y + 0), startLayout.get(), whiteBrush.get());
     } catch (...) {
         interop->EndDraw();
         throw;

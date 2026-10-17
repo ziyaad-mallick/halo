@@ -67,6 +67,7 @@ constexpr UINT kHideDelayMs = 500;        // cursor must stay away this long bef
 constexpr float kSpringDamping = 0.72f;   // < 1 overshoots slightly
 constexpr int kSpringPeriodMs = 55;       // lower = snappier
 constexpr int kHideDurationMs = 200;
+constexpr float kLabelRoom = 34;  // logical px above a magnified icon: a 6 px gap and the name label
 constexpr int kStripPx = 2;               // hit strip left on the screen edge while hidden
 
 constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
@@ -134,6 +135,7 @@ private:
     void PointerMove(float x, float y = 0.0f);
     void PointerLeave();
     void Reveal();
+    void OpenLauncher();
     LRESULT DockIconForWindow(HWND win, LPARAM op);
     void StartHide();
     RECT GetPillRectScreen() const;
@@ -161,6 +163,7 @@ private:
     std::unique_ptr<halo::MultiMonitorFollower> m_multimon;
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
+    bool m_pressedStart = false;  // the button went down on the Start logo
     bool m_autoHide = true;  // off under HALO_TEST
     UINT m_genieMsg = RegisterWindowMessageW(L"Halo.DockIconForWindow");
 
@@ -216,8 +219,8 @@ bool Halo::Create(HINSTANCE inst) {
     // fully off-screen; the dock itself sits a margin above it.
     int margin = m_scale.px(6);
     float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
-    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_metrics.restSize / 2 + m_scale.f(8))) +
-               margin;
+    // Above the peak: room for the hover name label (kLabelRoom).
+    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_scale.f(kLabelRoom))) + margin;
     m_metrics.bottom = static_cast<float>(m_height - margin);
     m_monitor = mi.rcMonitor;
     m_width = m_monitor.right - m_monitor.left;
@@ -540,7 +543,7 @@ void Halo::MigrateToMonitor(HMONITOR mon) {
     m_metrics.cornerRadius = m_scale.f(20);
     int margin = m_scale.px(6);
     float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
-    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_metrics.restSize / 2 + m_scale.f(8))) + margin;
+    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_scale.f(kLabelRoom))) + margin;
     m_metrics.bottom = static_cast<float>(m_height - margin);
     m_metrics.centerX = m_width / 2.0f;
 
@@ -612,6 +615,13 @@ void Halo::PointerLeave() {
             SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
         }
     }
+}
+
+// The Windows key and the Start logo: Command Palette over a revealed dock.
+// Not the real Start, which brings the hidden taskbar back with it.
+void Halo::OpenLauncher() {
+    Reveal();
+    halo::winkey::OpenPalette();
 }
 
 // Takes input over the whole dock at once and springs it up from wherever it is.
@@ -692,7 +702,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     if (m == m_genieMsg && m) return DockIconForWindow(reinterpret_cast<HWND>(w), l);
-    if (m == halo::winkey::Message()) { Reveal(); halo::winkey::OpenPalette(); return 0; }  // Win tapped alone
+    if (m == halo::winkey::Message()) { OpenLauncher(); return 0; }  // Win tapped alone
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_MOUSEMOVE:
@@ -743,6 +753,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_LBUTTONDOWN:
             if (m_dock && m_state == State::Shown) {
+                m_pressedStart = m_dock->HitStart(mx, my);
                 m_pressed = m_dock->HitTest(mx, my);
                 m_dock->SetPressed(m_pressed);
                 if (m_pressed >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
@@ -750,6 +761,8 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_LBUTTONUP:
         case WM_CAPTURECHANGED:
+            if (std::exchange(m_pressedStart, false) && m == WM_LBUTTONUP && m_dock && m_dock->HitStart(mx, my))
+                OpenLauncher();
             if (m_pressed >= 0 && m_dock) {
                 int pressed = std::exchange(m_pressed, -1);
                 m_dock->SetPressed(-1);

@@ -11,9 +11,9 @@
 
 // Status cluster on the left side of the Halo dock pill:
 // - Time: Segoe UI Variable Text (13pt tabular figures)
-// - Wi-Fi: Segoe Fluent Icons glyph (\uE701 connected, \uEB55 disconnected)
-// - Battery: Segoe Fluent Icons glyph (\uEBA0..\uEBAA) + percentage + bolt (\uEBB5)
-// - Start button: Windows 11 logo glyph (\uE782)
+// - Network: Segoe Fluent Icons Wi-Fi (\uE701, dimmed offline) or Ethernet (\uE839)
+// - Battery: Segoe Fluent Icons Battery0..10 / BatteryCharging0..10 + percentage
+// - Start button: the Windows 11 logo, drawn
 // Event-driven, 0 CPU idle architecture.
 class DockCluster {
 public:
@@ -33,8 +33,6 @@ public:
     // Hit-testing within cluster coordinates [0..Width, 0..PillHeight].
     bool HitTestStart(float localX, float localY) const;
 
-    // Injects Ctrl+Esc down/up with dwExtraInfo = 0x48414C4F to open Start menu.
-    static void TriggerStartMenu();
 
     // Event handlers
     void OnTimer(UINT_PTR timerId);
@@ -51,6 +49,9 @@ public:
 
 private:
     void InitDirectWrite();
+    void Layout();
+    winrt::com_ptr<IDWriteTextLayout> MakeLayout(std::wstring const& text, IDWriteTextFormat* format, float width) const;
+    float TextWidth(std::wstring const& text, IDWriteTextFormat* format) const;
     void SetupClockTimer();
     void RegisterPowerNotifications();
     void UnregisterPowerNotifications();
@@ -68,13 +69,13 @@ private:
     float m_width = 0.0f;
     float m_startX = 0.0f;
     float m_startWidth = 0.0f;
+    float m_timeX = 0.0f, m_timeW = 0.0f, m_wifiX = 0.0f, m_iconW = 0.0f, m_battX = 0.0f, m_battTextW = 0.0f;
 
     // DirectWrite objects
     winrt::com_ptr<IDWriteFactory> m_dwriteFactory;
     winrt::com_ptr<IDWriteTextFormat> m_tfTime;
     winrt::com_ptr<IDWriteTextFormat> m_tfIcons;
     winrt::com_ptr<IDWriteTextFormat> m_tfBattText;
-    winrt::com_ptr<IDWriteTextFormat> m_tfStart;
     winrt::com_ptr<IDWriteTypography> m_typography;
 
     // Power notifications

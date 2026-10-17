@@ -260,11 +260,11 @@ public:
             UpdateSurface(text);
         }
 
-        // Target placement ~10px above icon top
+        // Target placement 6px above icon top
         float targetW = m_visual.Size().x;
         float targetH = m_visual.Size().y;
         float targetX = iconCenterX - targetW / 2.0f;
-        float targetY = iconTopY - m_scale * 10.0f - targetH;
+        float targetY = iconTopY - m_scale * 6.0f - targetH;
 
         // Animate or reposition
         if (!m_visible) {
@@ -335,6 +335,8 @@ private:
 
         DWRITE_TEXT_METRICS tm{};
         layout->GetMetrics(&tm);
+        layout->SetMaxWidth(tm.widthIncludingTrailingWhitespace);  // centered in its own width, not 800 px
+        layout->SetMaxHeight(tm.height);
 
         // Padding: 10px horizontal, 4px vertical
         float padX = 10.0f * m_scale;

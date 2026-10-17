@@ -73,6 +73,9 @@ public:
     // in parent visual coordinates. Returns {centerX, topY}.
     std::pair<float, float> MagnifiedIconCenterAndTop(size_t index) const;
 
+    // Whether (x, y) is on the cluster's Start button.
+    bool HitStart(float x, float y) const;
+
     // Cluster event forwarding
     void OnClockTimer();
     void OnTimeChange();
