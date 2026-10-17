@@ -39,6 +39,7 @@ $sb = New-Object System.Text.StringBuilder 200
 [Sh]::GetWindowText([Sh]::GetForegroundWindow(), $sb, 200) | Out-Null
 if ($sb.ToString() -match 'Lock Screen') { "SKIPPED: the PC is locked ($sb)"; return }
 
+$script:CropX = 700               # left edge of the contact sheet's crop
 $top = 1000                       # screenshots cover the bottom 200 px
 function Shot($name) {
     $b = New-Object System.Drawing.Bitmap 1920, 200
@@ -66,7 +67,7 @@ function Distinct($frames, $max) {
     $kept = @(); $last = $null
     foreach ($f in $frames) {
         $d = 1e9
-        if ($last) { $d = 0; for ($y = 110; $y -lt 200; $y += 5) { for ($x = 700; $x -lt 1600; $x += 5) {
+        if ($last) { $d = 0; for ($y = 110; $y -lt 200; $y += 5) { for ($x = $script:CropX; $x -lt $script:CropX + 900; $x += 5) {
             $a = $f.Bmp.GetPixel($x, $y); $b = $last.Bmp.GetPixel($x, $y)
             $d += [math]::Abs($a.R - $b.R) + [math]::Abs($a.G - $b.G) + [math]::Abs($a.B - $b.B) } } }
         if ($d -gt 3000) { $kept += $f; $last = $f }
@@ -76,7 +77,7 @@ function Distinct($frames, $max) {
 }
 function Sheet($frames, $name) {
     $frames = Distinct $frames 30
-    $w = 900; $h = 90; $x0 = 700
+    $w = 900; $h = 90; $x0 = $script:CropX
     $sheet = New-Object System.Drawing.Bitmap $w, ($h * $frames.Count)
     $g = [System.Drawing.Graphics]::FromImage($sheet); $g.Clear([System.Drawing.Color]::FromArgb(40, 40, 40))
     $font = New-Object System.Drawing.Font 'Consolas', 9
@@ -99,10 +100,12 @@ if ($dock -eq [IntPtr]::Zero) { Stop-Process -Id $p.Id; throw 'dock window not f
 function PMove($x) { [Sh]::PostMessage($dock, 0x8002, [IntPtr]$x, [IntPtr]::Zero) | Out-Null }
 function Leave { [Sh]::PostMessage($dock, 0x8003, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
 function Mouse($msg, $x, $y) { [Sh]::PostMessage($dock, $msg, [IntPtr]($(if ($msg -eq 0x201) { 1 } else { 0 })), [IntPtr](($y -shl 16) -bor $x)) | Out-Null }
-# Centre of icon $Icon at rest, from the icon count in the log (pitch 56 px at 125%, centred on 960).
+# Centre of icon $i at rest: 47.5 px pitch at 125%, a 12.5 px divider slot before the unpinned icons, centred on 960.
 function IconX($i) {
-    $n = [int](([regex]::Match((Get-Content (Join-Path $out "$Tag.log") -Raw), '(\d+) icons').Groups[1].Value))
-    960 + (($i + 0.5) - $n / 2) * 56
+    $log = Get-Content (Join-Path $out "$Tag.log") -Raw
+    $n = [int]([regex]::Match($log, '(\d+) icons').Groups[1].Value)
+    $pinned = [int]([regex]::Match($log, '(\d+) apps').Groups[1].Value)
+    960 - ($n * 47.5 + 12.5) / 2 + 47.5 * ($i + 0.5) + $(if ($i -ge $pinned) { 12.5 } else { 0 })
 }
 try {
     switch ($Scenario) {
@@ -118,10 +121,10 @@ try {
                   Sheet $f 'close'; Shot 'after' }
         'press' { $ix = [int](IconX $Icon); PMove $ix; Start-Sleep -Milliseconds 600
                   Shot 'hover'
-                  Mouse 0x201 $ix 150; Start-Sleep -Milliseconds 300; Shot 'pressed'
+                  Mouse 0x201 $ix 85; Start-Sleep -Milliseconds 300; Shot 'pressed'
                   Mouse 0x202 0 0; Start-Sleep -Milliseconds 400; Shot 'released'; Leave }
-        'bounce' { $ix = [int](IconX $Icon)
-                  $f = Burst 3000 200 { Mouse 0x201 $ix 150; Mouse 0x202 $ix 150 }
+        'bounce' { $ix = [int](IconX $Icon); $script:CropX = [math]::Max(0, $ix - 150)
+                  $f = Burst 3000 200 { Mouse 0x201 $ix 85; Mouse 0x202 $ix 85 }
                   Sheet $f 'bounce' }
         default { throw "unknown scenario $Scenario" }
     }
