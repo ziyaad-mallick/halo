@@ -13,7 +13,7 @@ void Remove();
 UINT Message();               // registered window message posted to `target`
 UINT EscapeMessage();         // posted to `target` on each Esc press while WatchEscape(true); Esc is not swallowed
 void WatchEscape(bool on);
-UINT ControlCenterMessage();  // posted to `target` when Win+A is pressed (the keystroke is swallowed)
+UINT ControlCenterMessage();  // posted to `target` on Win+A (wParam 0) or Win+N (wParam 1); the key is swallowed
 void OpenPalette();           // sends Win+Alt+Space; call when Message() arrives
 
 // The decision logic, separate from the hook so it can be unit tested.

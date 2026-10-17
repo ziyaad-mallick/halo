@@ -40,6 +40,7 @@
 #include "multimon.h"
 #include "previews.h"
 #include "winkey.h"
+#include "edge.h"
 
 // Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
 struct ICompositorDesktopInterop : IUnknown {
@@ -83,6 +84,7 @@ constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 // Test hook (HALO_TEST=1): wParam 0 = open the launcher panel without Command Palette, 1 = close it, else Launcher::TestCommand.
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
+constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Control Center) / kRight (notifications)
 constexpr UINT kMsgTestBounce = WM_APP + 30;  // HALO_TEST=1: wParam = dock item to bounce (no launch)
 constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
@@ -152,6 +154,8 @@ private:
     void PointerLeave();
     void Reveal();
     void OpenLauncher();
+    void OpenNotifications() { Log(L"notifications: open (pending Notification Center)"); }
+    void ToggleNotifications() { OpenNotifications(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
     std::wstring LaunchTarget(RunningApp const& app) const;
     void LaunchRecent(std::wstring const& target);
@@ -316,6 +320,8 @@ bool Halo::Create(HINSTANCE inst) {
     });
     if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
     else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
+    if (!_wgetenv(L"HALO_TEST_NOHOOK") && !halo::edge::Start(inst, m_hwnd, kMsgEdge))
+        Log(L"edge mouse hook failed " + std::to_wstring(GetLastError()));
 
     ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     return ok;
@@ -865,7 +871,11 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         if (m_launcher) m_launcher->Hide();
         return 0;
     }
-    if (m == halo::winkey::ControlCenterMessage()) { if (m_cc) m_cc->Toggle(); return 0; }  // Win+A
+    if (m == halo::winkey::ControlCenterMessage()) {  // Win+A (wParam 0) / Win+N (1)
+        if (w) ToggleNotifications();
+        else if (m_cc) m_cc->Toggle();
+        return 0;
+    }
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_MOUSEMOVE:
@@ -903,6 +913,12 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_DISPLAYCHANGE:
             if (m_multimon) m_multimon->OnDisplayChange();
             if (m_cc) m_cc->OnDisplayChange();
+            halo::edge::OnDisplayChange();
+            return 0;
+        case kMsgEdge:
+            Log(w == halo::edge::kTop ? L"edge: top" : L"edge: right");
+            if (w == halo::edge::kTop) { if (m_cc && !m_cc->IsOpen()) m_cc->Open(); }
+            else OpenNotifications();
             return 0;
         case WM_TIMER:
             if (w == kHideTimer) {
@@ -976,6 +992,7 @@ int Halo::Run() {
         DispatchMessageW(&msg);
     }
     halo::winkey::Remove();
+    halo::edge::Stop();
     UnregisterHotKey(m_hwnd, kHotkeyQuit);
     return static_cast<int>(msg.wParam);
 }

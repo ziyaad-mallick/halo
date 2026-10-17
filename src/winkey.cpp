@@ -15,7 +15,7 @@ HWND g_target = nullptr;
 std::atomic<bool> g_watchEsc{false};  // the launcher panel is up: report Esc
 bool g_testMode = false;  // HALO_TEST_WINKEY=1: also handle injected input (tests drive it with SendInput)
 Tracker g_track;
-bool g_swallowA = false;  // Win+A went down and we swallowed it; swallow its repeats and release too
+DWORD g_swallow = 0;  // Win+A / Win+N went down and we swallowed it; swallow its repeats and release too
 
 void Key(INPUT& in, WORD vk, bool up) {
     in.type = INPUT_KEYBOARD;
@@ -39,18 +39,19 @@ LRESULT CALLBACK LowLevel(int code, WPARAM w, LPARAM l) {
             // press before the hook started), so also ask the async key state: that was the leak that let
             // the stock Quick Settings open behind the panel.
             const bool winHeld = g_track.winDown || ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000);
-            if (down && (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN)) g_swallowA = false;  // never stay stuck swallowing A
-            if (k->vkCode == 'A' && (g_swallowA || (down && winHeld))) {
-                if (down && !g_swallowA) {
-                    g_swallowA = true;
+            if (down && (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN)) g_swallow = 0;  // never stay stuck swallowing
+            const bool ours = k->vkCode == 'A' || k->vkCode == 'N';  // Win+N: Halo's Notification Center
+            if (ours && (g_swallow == k->vkCode || (down && winHeld && !g_swallow))) {
+                if (down && !g_swallow) {
+                    g_swallow = k->vkCode;
                     g_track.Feed(k->vkCode, true);
                     INPUT in[2] = {};
                     Key(in[0], kUnassigned, false);
                     Key(in[1], kUnassigned, true);
                     SendInput(2, in, sizeof(INPUT));
-                    PostMessageW(g_target, ControlCenterMessage(), 0, 0);
+                    PostMessageW(g_target, ControlCenterMessage(), k->vkCode == 'N', 0);
                 } else if (!down) {
-                    g_swallowA = false;
+                    g_swallow = 0;
                 }
                 return 1;
             }

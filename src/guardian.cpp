@@ -118,6 +118,7 @@ public:
         }
 
         Log(L"guardian started");
+        WatchTaskbar();
         TurnOn(L"startup");
 
         while (!quit_) {
@@ -175,6 +176,30 @@ private:
     DWORD hideAt_ = 0, relaunchAt_ = 0;
     std::vector<DWORD> crashes_;
     int exitCode_ = 0;
+
+    HWINEVENTHOOK showHook_ = nullptr;
+
+    // Explorer shows the hidden taskbar again on its own (Win+A / Win+N flyouts, an edge swipe, a
+    // fullscreen app exiting). Watch explorer's window-show events and hide it again a moment later.
+    // Scoped to explorer's process, so it costs nothing while other apps open windows.
+    void WatchTaskbar() {
+        if (showHook_) UnhookWinEvent(showHook_);
+        showHook_ = nullptr;
+        DWORD pid = 0;
+        if (HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr)) GetWindowThreadProcessId(tray, &pid);
+        if (!pid) return;
+        showHook_ = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, &Guardian::OnShow, pid, 0,
+                                    WINEVENT_OUTOFCONTEXT);
+    }
+
+    static void CALLBACK OnShow(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG child, DWORD, DWORD) {
+        if (obj != OBJID_WINDOW || child != CHILDID_SELF || !h || !g_self || !g_self->proc_ || !g_self->hidden_) return;
+        wchar_t cls[32] = {};
+        GetClassNameW(h, cls, 32);
+        if (wcscmp(cls, L"Shell_TrayWnd") != 0 && wcscmp(cls, L"Shell_SecondaryTrayWnd") != 0) return;
+        Log(L"taskbar shown by explorer; hiding it again");
+        SetTimer(g_self->hwnd_, kRehideTimer, 40, nullptr);
+    }
 
     static DWORD Remaining(DWORD at, DWORD now) {
         LONG d = static_cast<LONG>(at - now);
@@ -365,6 +390,7 @@ private:
     LRESULT WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (taskbarCreated_ != 0 && m == taskbarCreated_) {
             Log(L"TaskbarCreated (explorer restarted)");
+            WatchTaskbar();
             if (proc_ && hidden_) {
                 SafeHide();
                 SetTimer(h, kRehideTimer, 1500, nullptr);  // taskbar may finish creating after the broadcast
