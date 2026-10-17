@@ -5,8 +5,8 @@
 
 namespace halo::winkey {
 
-// Install the WH_KEYBOARD_LL hook on the calling (UI) thread. On a lone Win tap
-// the hook posts Message() to `target`.
+// Install the WH_KEYBOARD_LL hook on its own thread. On a lone Win tap the
+// hook posts Message() to `target`.
 bool Install(HWND target);
 void Remove();
 

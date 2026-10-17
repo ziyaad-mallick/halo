@@ -7,6 +7,8 @@ constexpr ULONG_PTR kMine = 0x48414C4F;  // "HALO": marks input we injected
 constexpr WORD kUnassigned = 0xE8;       // VK with no meaning; cancels the Start menu tap
 
 HHOOK g_hook = nullptr;
+HANDLE g_thread = nullptr;
+DWORD g_threadId = 0;
 HWND g_target = nullptr;
 bool g_testMode = false;  // HALO_TEST_WINKEY=1: also handle injected input (tests drive it with SendInput)
 Tracker g_track;
@@ -48,17 +50,35 @@ UINT Message() {
     return m;
 }
 
+// The hook gets its own thread: Windows makes every keystroke wait for a
+// low-level hook, so it must never sit behind a busy UI thread.
+DWORD WINAPI HookThread(LPVOID ready) {
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevel, GetModuleHandleW(nullptr), 0);
+    SetEvent(static_cast<HANDLE>(ready));
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
+    if (g_hook) UnhookWindowsHookEx(g_hook);
+    g_hook = nullptr;
+    return 0;
+}
+
 bool Install(HWND target) {
     g_target = target;
     wchar_t v[8] = {};
     g_testMode = GetEnvironmentVariableW(L"HALO_TEST_WINKEY", v, 8) && v[0] == L'1';
-    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevel, GetModuleHandleW(nullptr), 0);
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_thread = CreateThread(nullptr, 0, HookThread, ready, 0, &g_threadId);
+    if (g_thread) WaitForSingleObject(ready, 2000);
+    CloseHandle(ready);
     return g_hook != nullptr;
 }
 
 void Remove() {
-    if (g_hook) UnhookWindowsHookEx(g_hook);
-    g_hook = nullptr;
+    if (!g_thread) return;
+    PostThreadMessageW(g_threadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(g_thread, 2000);
+    CloseHandle(g_thread);
+    g_thread = nullptr;
 }
 
 void OpenPalette() {

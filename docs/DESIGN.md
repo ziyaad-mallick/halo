@@ -169,6 +169,20 @@ or clock pill on the dock (a menu bar may come later, separately).
 | Extras | App name label on hover; Recent apps (last 3, after the divider). No badges, no Recycle Bin for now |
 | Minimize / restore / maximize | Genie swoop into and out of the app's dock icon: a fork of the MIT "MacOS Minimize Animation" Windhawk mod (`mods/halo-genie.wh.cpp`) that asks Halo where the icon is; maximize gets a matching swoop |
 
+### Control Center and status (Ziyaad, 2026-10-17; supersedes the top-bar concept in CONTROL-CENTER.md)
+
+- **No menu bar.** The Control Center is a floating glass panel at the top right, opened with
+  **Win+A** (taken over from Quick Settings while Halo is ON) or by moving the cursor into the
+  top-right region of the screen, the way the dock reveals at the bottom. It floats over windows.
+- **Status lives in the dock**, at its far left next to the Windows (Start) button: Wi-Fi state
+  icon, battery icon + percentage, and the time. Glyphs are the stock Segoe Fluent icons.
+- **Tray icons:** the explorer tray hook stays off until it has run a week clean; until then tray
+  apps are reached from the Control Center panel.
+- Other CONTROL-CENTER.md defaults stand: keep Windows' notification banners, Do Not Disturb via
+  IQuietHoursSettings with a Settings fallback.
+- **Shortcuts:** Win+Alt+T toggles Halo and the Windows taskbar (guardian); the Windows key alone
+  opens PowerToys Command Palette and reveals the dock.
+
 ## Risks and open questions
 
 - **Blur behind a custom-shaped Win32 composition window.** The options are

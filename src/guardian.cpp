@@ -107,9 +107,14 @@ public:
             // On this Windows build something else owns Win+Alt+T (error 1409). A low-level hook sees the
             // keys first and can swallow the T, so use that instead (runs only on keystrokes).
             DWORD err = GetLastError();
-            hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &Guardian::KeyHook, GetModuleHandleW(nullptr), 0);
+            // On its own thread: Windows makes every keystroke wait for the hook, and this
+            // thread blocks for seconds while halo closes.
+            HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            hookThread_ = CreateThread(nullptr, 0, &Guardian::HookThread, ready, 0, &hookThreadId_);
+            if (hookThread_) WaitForSingleObject(ready, 2000);
+            CloseHandle(ready);
             Log(L"RegisterHotKey Win+Alt+T failed (error %lu, taken); %ls", err,
-                hook_ ? L"using a low-level keyboard hook instead" : L"hook failed too: toggle unavailable, use guardian.exe / --off");
+                hookOk_ ? L"using a low-level keyboard hook instead" : L"hook failed too: toggle unavailable, use guardian.exe / --off");
         }
 
         Log(L"guardian started");
@@ -150,14 +155,20 @@ public:
         }
         Shutdown(L"loop exit");
         if (hwnd_) UnregisterHotKey(hwnd_, kHotkeyToggle);
-        if (hook_) UnhookWindowsHookEx(hook_);
+        if (hookThread_) {
+            PostThreadMessageW(hookThreadId_, WM_QUIT, 0, 0);
+            WaitForSingleObject(hookThread_, 2000);
+            CloseHandle(hookThread_);
+        }
         return exitCode_;
     }
 
 private:
     static inline Guardian* g_self = nullptr;
     HWND hwnd_ = nullptr;
-    HHOOK hook_ = nullptr;
+    HANDLE hookThread_ = nullptr;
+    DWORD hookThreadId_ = 0;
+    static inline bool hookOk_ = false;
     UINT taskbarCreated_ = 0, cmdMsg_ = 0;
     Handle proc_;
     bool on_ = false, hidden_ = false, pendingHide_ = false, relaunchPending_ = false, quit_ = false, down_ = false;
@@ -302,6 +313,16 @@ private:
     }
 
     // Fallback for Win+Alt+T when RegisterHotKey is refused: swallow the T and post WM_HOTKEY.
+    static DWORD WINAPI HookThread(LPVOID ready) {
+        HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, &Guardian::KeyHook, GetModuleHandleW(nullptr), 0);
+        hookOk_ = hook != nullptr;
+        SetEvent(static_cast<HANDLE>(ready));
+        MSG m;
+        while (GetMessageW(&m, nullptr, 0, 0) > 0) DispatchMessageW(&m);
+        if (hook) UnhookWindowsHookEx(hook);
+        return 0;
+    }
+
     static LRESULT CALLBACK KeyHook(int code, WPARAM w, LPARAM l) {
         static bool win = false, alt = false, swallowed = false;
         if (code == HC_ACTION && g_self) {
