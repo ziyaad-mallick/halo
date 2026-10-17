@@ -266,16 +266,17 @@ public:
         float targetX = iconCenterX - targetW / 2.0f;
         float targetY = iconTopY - m_scale * 6.0f - targetH;
 
-        // Animate or reposition
         if (!m_visible) {
-            // Fade in and set initial position
+            // Fresh show (first time, or after a Hide): stop any slide still
+            // running, jump straight to the new icon, then fade in.
+            m_visual.StopAnimation(L"Offset");
             m_visual.Offset({targetX, targetY, 0.0f});
             AnimateOpacity(1.0f, 120);
             m_visible = true;
         } else {
-            // Already visible: smooth slide to new icon X
-            AnimateOffsetX(targetX, 90);
-            m_visual.Offset({m_visual.Offset().x, targetY, 0.0f});
+            // Already visible: slide the whole Offset to the new icon. Do not set
+            // Offset directly here; that would stop the running animation.
+            AnimateOffset({targetX, targetY, 0.0f}, 90);
         }
     }
 
@@ -333,15 +334,19 @@ private:
             text.c_str(), static_cast<UINT32>(text.length()), m_format.get(),
             800.0f * m_scale, 200.0f * m_scale, layout.put()));
 
+        // Names are always one line: never wrap, and leave 1px of slack so float
+        // rounding in the measured width cannot push the last word onto a new line.
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         DWRITE_TEXT_METRICS tm{};
         layout->GetMetrics(&tm);
-        layout->SetMaxWidth(tm.widthIncludingTrailingWhitespace);  // centered in its own width, not 800 px
+        float textW = std::ceil(tm.widthIncludingTrailingWhitespace) + 1.0f;
+        layout->SetMaxWidth(textW);  // centered in its own width, not 800 px
         layout->SetMaxHeight(tm.height);
 
         // Padding: 10px horizontal, 4px vertical
         float padX = 10.0f * m_scale;
         float padY = 4.0f * m_scale;
-        float pillW = std::ceil(tm.widthIncludingTrailingWhitespace + 2 * padX);
+        float pillW = textW + 2 * padX;
         float pillH = std::ceil(tm.height + 2 * padY);
         float radius = pillH / 2.0f;
 
@@ -400,11 +405,11 @@ private:
         m_visual.StartAnimation(L"Opacity", a);
     }
 
-    void AnimateOffsetX(float targetX, int ms) {
-        auto a = m_comp.CreateScalarKeyFrameAnimation();
-        a.InsertKeyFrame(1.0f, targetX, m_easeOut);
+    void AnimateOffset(winrt::Windows::Foundation::Numerics::float3 target, int ms) {
+        auto a = m_comp.CreateVector3KeyFrameAnimation();
+        a.InsertKeyFrame(1.0f, target, m_easeOut);
         a.Duration(std::chrono::milliseconds(ms));
-        m_visual.StartAnimation(L"Offset.X", a);
+        m_visual.StartAnimation(L"Offset", a);
     }
 
     wuc::Compositor m_comp{nullptr};
