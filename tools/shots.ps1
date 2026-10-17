@@ -5,10 +5,12 @@
 #   tools/shots.ps1 -Scenario rest|hover|open|close|press|bounce [-Tag name] [-X 960]
 #                   [-Icon 0] [-App notepad.exe]
 # rest/hover: one PNG each. open/close: a burst of frames while -App starts/exits.
-# press: a magnified frame with -Icon held down. bounce: a burst after clicking -Icon.
+# press: a magnified frame with -Icon held down. bounce: a burst after clicking -Icon
+# (-Prelaunch <exe> -PrelaunchMs N starts that app N ms before the click).
 # Output: build/<Tag>-*.png and build/<Tag>-sheet.png (a stacked contact sheet of a burst).
 param([string]$Scenario = 'hover', [string]$Tag = 'shots', [int]$X = 960, [int]$Icon = 0,
-      [string]$App = 'notepad.exe', [int]$Frames = 16, [int]$IntervalMs = 100)
+      [string]$App = 'notepad.exe', [int]$Frames = 16, [int]$IntervalMs = 100,
+      [string]$Prelaunch = '', [int]$PrelaunchMs = 0)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot
 $out = Join-Path $repo 'build'
@@ -124,7 +126,10 @@ try {
                   Mouse 0x201 $ix 85; Start-Sleep -Milliseconds 300; Shot 'pressed'
                   Mouse 0x202 0 0; Start-Sleep -Milliseconds 400; Shot 'released'; Leave }
         'bounce' { $ix = [int](IconX $Icon); $script:CropX = [math]::Max(0, $ix - 150)
-                  $f = Burst 3000 200 { Mouse 0x201 $ix 85; Mouse 0x202 $ix 85 }
+                  # -Prelaunch starts the app (a path) that long before the click: a slow starter then
+                  # shows its window early in the bounce, as a fast one would.
+                  $f = Burst 3000 200 { if ($Prelaunch) { [Diagnostics.Process]::Start($Prelaunch) | Out-Null; Start-Sleep -Milliseconds $PrelaunchMs }
+                                        Mouse 0x201 $ix 85; Mouse 0x202 $ix 85 }
                   Sheet $f 'bounce' }
         default { throw "unknown scenario $Scenario" }
     }
