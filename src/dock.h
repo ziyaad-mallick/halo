@@ -33,8 +33,16 @@ public:
          winrt::Windows::UI::Composition::ContainerVisual const& pill,
          DockMetrics const& metrics);
 
-    // One brush per icon, left to right. Rebuilds the icon visuals.
-    void SetIcons(std::vector<winrt::Windows::UI::Composition::CompositionBrush> const& icons);
+    struct Item {
+        winrt::Windows::UI::Composition::CompositionBrush brush;
+        bool running;  // gets a dot underneath
+    };
+    // One item per icon, left to right; a thin divider is drawn before item
+    // `divider` (none unless it is in 1..count-1). Rebuilds the icon visuals.
+    void SetIcons(std::vector<Item> const& items, size_t divider);
+
+    // Moves the dock's center (the window was resized).
+    void SetCenter(float x);
 
     // Pointer in the parent's coordinates. Move starts magnifying if needed.
     void OnPointerMove(float x);
@@ -48,6 +56,7 @@ public:
     float MaxWidth() const;
 
 private:
+    float DotSize() const;
     float RestCenter(size_t i) const;
     float MagnificationAt(float pointerX, size_t i) const;  // CPU mirror of the expression
     void AnimateIntensity(float to);
@@ -58,6 +67,9 @@ private:
     winrt::Windows::UI::Composition::ContainerVisual m_pill{nullptr};
     winrt::Windows::UI::Composition::CompositionPropertySet m_props{nullptr};
     std::vector<winrt::Windows::UI::Composition::SpriteVisual> m_icons;
+    std::vector<winrt::Windows::UI::Composition::Visual> m_dots;  // parallel to m_icons; null if not running
+    winrt::Windows::UI::Composition::SpriteVisual m_divider{nullptr};
+    size_t m_dividerAt = 0;
     DockMetrics m_m;
     bool m_hovering = false;
     float m_pointerX = 0.0f;

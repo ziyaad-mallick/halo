@@ -20,10 +20,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cmath>
+#include <map>
 #include <memory>
 #include <shellapi.h>
 #include <string>
 #include <vector>
+#include "apps.h"
 #include "dock.h"
 #include "effects.h"
 #include "icons.h"
@@ -58,6 +60,7 @@ constexpr int kSpringPeriodMs = 55;       // lower = snappier
 constexpr int kHideDurationMs = 200;
 constexpr int kStripPx = 2;               // hit strip left on the screen edge while hidden
 
+constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
 constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
@@ -108,6 +111,10 @@ private:
     void InitGraphics();
     wuc::ContainerVisual BuildPill();
     void BuildDock();
+    void RefreshDock();
+    void Layout(size_t icons);
+    wuc::CompositionBrush IconBrushFor(std::wstring const& path);
+    void Activate(size_t item);
     void Reveal();
     void StartHide();
     wuc::CompositionDrawingSurface MakeSurface(Size size);
@@ -118,13 +125,20 @@ private:
     int m_width{}, m_height{};
     DockMetrics m_metrics;
     std::vector<PinnedApp> m_apps;
+    struct Item {
+        std::wstring launch;  // .lnk to open when the app isn't running (empty for unpinned apps)
+        std::wstring key;     // the running app's key, empty if not running
+    };
+    std::vector<Item> m_items;  // what the dock shows, left to right
+    std::map<std::wstring, wuc::CompositionBrush> m_brushes;  // by icon source path, so rebuilds reuse them
+    std::unique_ptr<WindowTracker> m_tracker;
     std::unique_ptr<Dock> m_dock;
     bool m_trackingMouse = false;
 
     enum class State { Hidden, Shown, Hiding };
     State m_state = State::Shown;
     unsigned m_hideGen = 0;  // invalidates a hide batch that a reveal interrupted
-    RECT m_full{}, m_strip{};
+    RECT m_monitor{}, m_full{}, m_strip{};
     wuc::ContainerVisual m_slide{nullptr};  // the dock's parent; its Offset.Y slides the dock off-screen
 
     winrt::Windows::System::DispatcherQueueController m_dq{nullptr};
@@ -156,8 +170,8 @@ bool Halo::Create(HINSTANCE inst) {
 
     Step(L"pinned apps", [&] { m_apps = LoadPinnedApps(); });
 
-    // Metrics in physical px. The window is as wide as the dock can grow and
-    // tall enough for a fully magnified icon above the pill.
+    // Metrics in physical px. The window is tall enough for a fully
+    // magnified icon above the pill.
     m_metrics.restSize = m_scale.f(44);
     m_metrics.gap = m_scale.f(10);
     m_metrics.maxScale = 1.6f;
@@ -165,22 +179,15 @@ bool Halo::Create(HINSTANCE inst) {
     m_metrics.padding = m_scale.f(12);
     m_metrics.pillHeight = m_scale.f(64);
     m_metrics.cornerRadius = m_scale.f(20);
-    float pitch = m_metrics.restSize + m_metrics.gap;
-    float n = static_cast<float>(std::max<size_t>(m_apps.size(), 1));
-    float growth = 3.0f * pitch * (m_metrics.maxScale - 1);  // generous bound on how far the wave widens it
-    m_width = static_cast<int>(std::ceil(n * pitch + 2 * m_metrics.padding + growth + m_scale.f(40)));
     // The window reaches the monitor's bottom edge so a hiding dock slides
     // fully off-screen; the dock itself sits a margin above it.
     int margin = m_scale.px(8);
     m_height = static_cast<int>(
         std::ceil(m_metrics.pillHeight + m_metrics.restSize * (m_metrics.maxScale - 1) + m_scale.f(16))) + margin;
-    m_metrics.centerX = m_width / 2.0f;
     m_metrics.bottom = static_cast<float>(m_height - margin);
-
-    int x = mi.rcMonitor.left + ((mi.rcMonitor.right - mi.rcMonitor.left) - m_width) / 2;
-    int y = mi.rcMonitor.bottom - m_height;
-    m_full = {x, y, x + m_width, y + m_height};
-    m_strip = {x, mi.rcMonitor.bottom - kStripPx, x + m_width, mi.rcMonitor.bottom};
+    m_monitor = mi.rcMonitor;
+    Layout(m_apps.size());
+    int x = m_full.left, y = m_full.top;
     RECT const& first = kAutoHide ? m_strip : m_full;
     if (kAutoHide) m_state = State::Hidden;
 
@@ -317,21 +324,85 @@ wuc::ContainerVisual Halo::BuildPill() {
 void Halo::BuildDock() {
     auto pill = BuildPill();
     m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics);
+    m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
+    RefreshDock();
+}
 
-    std::vector<wuc::CompositionBrush> brushes;
-    std::vector<PinnedApp> shown;
-    float iconPx = m_metrics.restSize * m_metrics.maxScale;
-    for (auto const& app : m_apps) {
-        IconImage icon;
-        if (!LoadJumboIcon(app.linkPath, icon) || icon.width == 0) {
-            Log(L"no icon for " + app.name);
-            continue;
+// The icon for a .lnk or exe, loaded once. Null if it has none.
+wuc::CompositionBrush Halo::IconBrushFor(std::wstring const& path) {
+    auto it = m_brushes.find(path);
+    if (it != m_brushes.end()) return it->second;
+    wuc::CompositionBrush brush{nullptr};
+    IconImage icon;
+    if (LoadJumboIcon(path, icon) && icon.width != 0)
+        brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
+    else
+        Log(L"no icon for " + path);
+    m_brushes.insert_or_assign(path, brush);
+    return brush;
+}
+
+// Pinned apps first, then the running apps that aren't pinned.
+void Halo::RefreshDock() {
+    auto running = m_tracker->Apps();
+    std::vector<bool> pinned(running.size());
+    std::vector<Dock::Item> items;
+    m_items.clear();
+    for (auto const& pin : m_apps) {
+        auto brush = IconBrushFor(pin.linkPath);
+        if (!brush) continue;
+        Item item{pin.linkPath, {}};
+        for (size_t i = 0; i < running.size(); i++) {
+            auto const& r = running[i];
+            if ((!pin.aumid.empty() && !_wcsicmp(pin.aumid.c_str(), r.aumid.c_str())) ||
+                (!pin.targetPath.empty() && !_wcsicmp(pin.targetPath.c_str(), r.exe.c_str()))) {
+                pinned[i] = true;
+                if (item.key.empty()) item.key = r.key;
+            }
         }
-        brushes.push_back(MakeIconBrush(icon, iconPx));
-        shown.push_back(app);
+        items.push_back({brush, !item.key.empty()});
+        m_items.push_back(item);
     }
-    m_apps = std::move(shown);
-    m_dock->SetIcons(brushes);
+    size_t divider = items.size();
+    for (size_t i = 0; i < running.size(); i++) {
+        if (pinned[i] || running[i].exe.empty()) continue;
+        auto brush = IconBrushFor(running[i].exe);
+        if (!brush) continue;
+        items.push_back({brush, true});
+        m_items.push_back({{}, running[i].key});
+    }
+    Log(std::to_wstring(running.size()) + L" running apps, " + std::to_wstring(items.size()) + L" icons");
+    Layout(items.size());
+    m_dock->SetCenter(m_metrics.centerX);
+    m_dock->SetIcons(items, divider);
+}
+
+// Sizes the window for `icons` icons (it must hold the dock at full
+// magnification) and keeps it centered on the monitor.
+void Halo::Layout(size_t icons) {
+    float pitch = m_metrics.restSize + m_metrics.gap;
+    float n = static_cast<float>(std::max<size_t>(icons, 1));
+    float growth = 3.0f * pitch * (m_metrics.maxScale - 1);  // generous bound on how far the wave widens it
+    m_width = static_cast<int>(std::ceil(n * pitch + 2 * m_metrics.padding + growth + m_scale.f(40)));
+    m_metrics.centerX = m_width / 2.0f;
+    int x = m_monitor.left + ((m_monitor.right - m_monitor.left) - m_width) / 2;
+    int y = m_monitor.bottom - m_height;
+    m_full = {x, y, x + m_width, y + m_height};
+    m_strip = {x, m_monitor.bottom - kStripPx, x + m_width, m_monitor.bottom};
+    if (!m_hwnd) return;
+    RECT const& r = m_state == State::Hidden ? m_strip : m_full;
+    SetWindowPos(m_hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+}
+
+// macOS: a running app comes to the front (its most recent window,
+// restored if minimized); one that isn't running is launched.
+void Halo::Activate(size_t item) {
+    Item const& it = m_items[item];    if (HWND w = it.key.empty() ? nullptr : m_tracker->Front(it.key)) {
+        if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+        SetForegroundWindow(w);
+    } else if (!it.launch.empty()) {
+        ShellExecuteW(nullptr, L"open", it.launch.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
 }
 
 // Shows the full window at once and springs the dock up from wherever it is.
@@ -407,10 +478,11 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_LBUTTONUP:
             if (m_dock && m_state == State::Shown) {
                 int i = m_dock->HitTest(mx, my);
-                if (i >= 0 && i < static_cast<int>(m_apps.size())) {
-                    ShellExecuteW(nullptr, L"open", m_apps[i].linkPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                }
+                if (i >= 0 && i < static_cast<int>(m_items.size())) Activate(i);
             }
+            return 0;
+        case kMsgAppsChanged:
+            if (m_dock) RefreshDock();
             return 0;
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
