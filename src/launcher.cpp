@@ -64,6 +64,7 @@ constexpr float kSpringDamping = 0.72f;
 constexpr int kSpringPeriodMs = 55;
 constexpr int kFadeInMs = 180, kOutMs = 150;
 constexpr UINT_PTR kRefreshTimer = 1;
+constexpr UINT_PTR kStackTimer = 2;
 
 constexpr wchar_t kMenuItems[5][10] = {L"Sleep", L"Restart", L"Shut down", L"Lock", L"Sign out"};
 
@@ -417,6 +418,7 @@ void Launcher::Build() {
 
     float wl = std::min(kWidth, (m_anchor.monitor.right - m_anchor.monitor.left) / s - 2 * kScreenMargin);
     wl = std::clamp(wl, std::min(kMinWidth, wl), kMaxWidth);
+    if (m_stackW > 0) wl = m_stackW / s;  // the palette's exact width, when stacked or glued to it
     m_w = std::round(wl * s);
 
     // Recent apps: those that still have an icon.
@@ -463,11 +465,12 @@ void Launcher::Build() {
     m_hits.clear();
     m_appCells.clear();
     m_fileRows.clear();
-    const float gridW = 4 * kGridPitchX;
+    const float pitchX = std::clamp(wl * 0.44f / 4, kGridPitchX, 96.0f);
+    const float gridW = 4 * pitchX;
     const float sepX = kPad + gridW + 14;
     const float rightX = sepX + 18;
     for (size_t i = 0; i < m_apps.size(); i++) {
-        float x = kPad + (i % 4) * kGridPitchX + (kGridPitchX - iconSize) / 2;
+        float x = kPad + (i % 4) * pitchX + (pitchX - iconSize) / 2;
         float y = gridY + (i / 4) * pitchY + (pitchY - iconSize) / 2;
         m_appCells.push_back(R(x * s, y * s, (x + iconSize) * s, (y + iconSize) * s));
         m_hits.push_back({R((x - pad) * s, (y - pad) * s, (x + iconSize + pad) * s,
@@ -526,6 +529,10 @@ void Launcher::Build() {
     auto clip = m_comp.CreateRoundedRectangleGeometry();
     clip.CornerRadius({20 * s, 20 * s});
     clip.Size({m_w, m_h});
+    if (m_stackW > 0) {  // under the palette: square at the seam, rounded at the bottom
+        clip.Offset({0, -40 * s});
+        clip.Size({m_w, m_h + 40 * s});
+    }
     m_panel.Clip(m_comp.CreateGeometricClip(clip));
     m_root.Children().InsertAtTop(m_panel);
 
@@ -755,11 +762,7 @@ void Launcher::Show(LauncherAnchor const& anchor, bool standalone) {
     ++m_gen;
 
     // Everything slow (Recent files, their icons, the account picture) is cached; Refresh() updates it after the show.
-    if (HWND bar = PaletteWindow()) {
-        RECT r{};
-        GetWindowRect(bar, &r);
-        if (r.bottom > r.top) m_paletteBottom = static_cast<float>(r.bottom);
-    }
+    m_stackW = 0; m_glueTop = 0; m_paletteBottom = 0; m_palette = nullptr;  // learned again when the palette appears
     try {
         Build();
     } catch (winrt::hresult_error const& e) {
@@ -832,13 +835,7 @@ void Launcher::OnForeground(HWND fg) {
     if (pid == GetCurrentProcessId()) return;
     if (IsPalette(fg)) {
         m_sawPalette = true;
-        RECT r{};  // its bottom edge: the panel has to sit under it
-        if (GetWindowRect(fg, &r) && r.bottom > r.top && std::abs(m_paletteBottom - r.bottom) > 2) {
-            m_paletteBottom = static_cast<float>(r.bottom);
-            Log(L"palette bottom at " + std::to_wstring(r.bottom) + L", panel top at " +
-                std::to_wstring(m_anchor.bottom - static_cast<int>(m_h)));
-            Relayout();
-        }
+        if (!m_palette) Stack(GetAncestor(fg, GA_ROOT));
         return;
     }
     // Before the palette has taken focus, the previous window may still announce itself.
@@ -864,13 +861,51 @@ HWND Launcher::PaletteWindow() const {
     return f.found;
 }
 
+// Palette and panel as one Start menu: the panel takes the palette's width, and the palette is moved up so it
+// sits directly on the panel, the stack centred above the dock. Checked once after the move (the one-shot
+// kStackTimer): if PowerToys put the palette back, the panel is glued under the palette where it is instead.
+void Launcher::Stack(HWND palette) {
+    RECT wr{}, r{};  // the window rect includes the invisible shadow border; the frame bounds are what is seen
+    if (!palette || !GetWindowRect(palette, &wr) || wr.right <= wr.left) return;
+    if (FAILED(DwmGetWindowAttribute(palette, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, &r, sizeof(r))) || r.right <= r.left) r = wr;
+    m_palette = palette;
+    int pw = r.right - r.left, ph = r.bottom - r.top;
+    m_stackW = static_cast<float>(pw);
+    Relayout();
+    auto const& mon = m_anchor.monitor;
+    int fLeft = std::clamp(m_anchor.centerX - pw / 2, static_cast<int>(mon.left), static_cast<int>(mon.right) - pw);
+    int fTop = m_anchor.bottom - static_cast<int>(m_h) - ph;
+    if (fTop < mon.top + static_cast<int>(8 * m_s)) {  // no room above: glue under it where it is
+        Glue(r);
+        return;
+    }
+    int left = fLeft - (r.left - wr.left), top = fTop - (r.top - wr.top);
+    SetWindowPos(palette, nullptr, left, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    m_stackAt = {left, top};
+    Log(L"stacking: palette " + std::to_wstring(pw) + L"x" + std::to_wstring(ph) + L" frame from " + std::to_wstring(r.left) +
+        L"," + std::to_wstring(r.top) + L" to " + std::to_wstring(fLeft) + L"," + std::to_wstring(fTop));
+    SetTimer(m_hwnd, kStackTimer, 250, nullptr);
+}
+
+void Launcher::Glue(RECT const& r) {
+    m_stackW = static_cast<float>(r.right - r.left);
+    m_anchor.centerX = (r.left + r.right) / 2;
+    m_glueTop = r.bottom;
+    m_paletteBottom = static_cast<float>(r.bottom);
+    Log(L"glueing the panel under the palette at " + std::to_wstring(r.left) + L"," + std::to_wstring(r.bottom));
+    Relayout();
+}
+
 // Window position and size for the current layout; the test points are where a test can click (client px).
 void Launcher::Place() {
     int x = std::clamp(m_anchor.centerX - static_cast<int>(m_w) / 2, static_cast<int>(m_anchor.monitor.left),
                        static_cast<int>(m_anchor.monitor.right - m_w));
-    int top = m_anchor.bottom - static_cast<int>(m_h) - static_cast<int>(kTop * m_s);
-    SetWindowPos(m_hwnd, HWND_TOPMOST, x, top, static_cast<int>(m_w), static_cast<int>(m_h + kTop * m_s),
+    int margin = static_cast<int>(kTop * m_s);
+    int top = (m_glueTop > 0 ? m_glueTop : m_anchor.bottom - static_cast<int>(m_h)) - margin;
+    SetWindowPos(m_hwnd, HWND_TOPMOST, x, top, static_cast<int>(m_w), static_cast<int>(m_h) + margin,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // Under the palette the transparent margin would sit on top of its bottom edge: leave it out of the window.
+    SetWindowRgn(m_hwnd, m_stackW > 0 ? CreateRectRgn(0, margin, static_cast<int>(m_w), static_cast<int>(m_h) + margin) : nullptr, TRUE);
     if (EnvIs(L"HALO_TEST")) {
         auto mid = [&](D2D1_RECT_F const& r) {
             return std::to_wstring(static_cast<int>((r.left + r.right) / 2)) + L"," +
@@ -1110,6 +1145,17 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_TIMER:
+            if (w == kStackTimer) {
+                KillTimer(m_hwnd, kStackTimer);
+                RECT r{};
+                if (m_open && m_palette && GetWindowRect(m_palette, &r) &&
+                    (std::abs(r.left - m_stackAt.x) > 3 || std::abs(r.top - m_stackAt.y) > 3)) {
+                    Log(L"the palette is not where it was put, gluing under it");
+                    Glue(r);
+                } else if (m_open) {
+                    Log(L"stack holds");
+                }
+            }
             if (w == kRefreshTimer) {
                 KillTimer(m_hwnd, kRefreshTimer);
                 if (m_open) Refresh();

@@ -99,6 +99,8 @@ private:
     void Refresh();
     void Relayout();
     void Place();
+    void Stack(HWND palette);
+    void Glue(RECT const& r);
     HWND PaletteWindow() const;
     static std::wstring IconKey(std::wstring const& path);
     void LoadMru();
@@ -149,7 +151,11 @@ private:
     bool m_dryRun = false;
     float m_iconPx = 44;           // app icon size, logical px (shrinks under a tight palette)
     bool m_iconMiss = false;       // the last build lacked a file icon the cache didn't have yet
-    float m_paletteBottom = 0;     // Command Palette's bottom edge in screen px, once seen
+    float m_paletteBottom = 0;     // where the palette ends when the panel is glued under it
+    float m_stackW = 0;            // the palette's width in px once seen: the panel matches it
+    int m_glueTop = 0;             // screen y the panel hangs from when it could not be stacked
+    HWND m_palette = nullptr;
+    POINT m_stackAt{};
     D2D1_RECT_F m_vsep{};
 
     bool m_open = false;
