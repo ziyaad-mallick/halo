@@ -1,3 +1,12 @@
+> **Status (implemented, supersedes sections 2-8 where they differ).** Code: `src/control_center.{h,cpp}` (panel, drawing,
+> hot zone), `src/services.{h,cpp}` (audio, power, brightness, radios, DND, Now Playing), hook in `src/winkey.cpp`.
+> Differences from this spec: services bind on open and unbind on close (no listener while closed), foreign-thread
+> callbacks only `PostMessage`; the window and every composition/DirectWrite object are destroyed on close (no 60 s
+> timer); DND is the `NOC_GLOBAL_SETTING_TOASTS_ENABLED` registry value (the `IQuietHoursSettings` vtable was
+> unverifiable); brightness is WMI only (no DDC/CI), instances found by `__PATH`; Wi-Fi/Bluetooth are `Radio` toggles
+> (no network list yet); the hot zone is a 2 px strip on the right edge just below the caption-button row, so it never
+> covers a maximized window's close button. Test with `tools/cc-shots.ps1` (dry-run: `HALO_TEST_CC_DRYRUN=1`).
+
 # Halo Control Center MVP: Architecture & Implementation Specification
 
 *Document version: 1.0 (Task 4 MVP)*  
