@@ -424,8 +424,58 @@ void SetDarkMode(bool on) {
     RegSetValueExW(k, L"AppsUseLightTheme", 0, REG_DWORD, reinterpret_cast<BYTE const*>(&v), sizeof(v));
     RegSetValueExW(k, L"SystemUsesLightTheme", 0, REG_DWORD, reinterpret_cast<BYTE const*>(&v), sizeof(v));
     RegCloseKey(k);
+    Log(std::wstring(L"dark mode -> ") + (on ? L"on" : L"off") + L" (AppsUseLightTheme=" + std::to_wstring(v) + L")");
     DWORD_PTR r;
     SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"ImmersiveColorSet"), SMTO_ABORTIFHUNG, 200, &r);
+}
+
+// Night light lives in a CloudStore blob (undocumented). Observed on this build by toggling the real
+// Settings button and diffing: byte 18 is the payload length, payload starts at 19 ("43 42 01 00").
+//   off: len 0x13, payload  43 42 01 00 | D0 0A 02 | C6 14 <ts varint> ...
+//   on : len 0x15, payload  43 42 01 00 | 10 00 D0 0A 02 | C6 14 <ts varint> ...
+//   (schedule-active form: len 0x12, 10 00 then C6 14 directly, no D0 0A 02)
+// So "on" is the 10 00 pair at offset 23; the shell re-serializes the blob (timestamps) on its own.
+namespace {
+constexpr wchar_t kNightKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\"
+    L"default$windows.data.bluelightreduction.bluelightreductionstate\\windows.data.bluelightreduction.bluelightreductionstate";
+bool ReadNightBlob(std::vector<BYTE>& b) {
+    DWORD n = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kNightKey, L"Data", RRF_RT_REG_BINARY, nullptr, nullptr, &n) != ERROR_SUCCESS || n < 30) return false;
+    b.resize(n);
+    if (RegGetValueW(HKEY_CURRENT_USER, kNightKey, L"Data", RRF_RT_REG_BINARY, nullptr, b.data(), &n) != ERROR_SUCCESS) return false;
+    b.resize(n);
+    return n > 26 && b[19] == 0x43 && b[20] == 0x42;
+}
+}  // namespace
+
+bool ReadNightLight() {
+    std::vector<BYTE> b;
+    return ReadNightBlob(b) && b[23] == 0x10 && b[24] == 0x00;
+}
+
+void SetNightLight(bool on) {
+    if (DryRun()) return Log(std::wstring(L"DRYRUN night light -> ") + (on ? L"on" : L"off"));
+    std::vector<BYTE> b;
+    if (!ReadNightBlob(b)) return Log(L"night light: blob not found");
+    bool isOn = b[23] == 0x10 && b[24] == 0x00;
+    if (isOn == on) return;
+    if (on) {
+        b.insert(b.begin() + 23, {0x10, 0x00});
+        b[18] = static_cast<BYTE>(b[18] + 2);
+    } else if (b.size() > 27 && b[25] == 0xD0) {  // 10 00 D0 0A 02 -> D0 0A 02
+        b.erase(b.begin() + 23, b.begin() + 25);
+        b[18] = static_cast<BYTE>(b[18] - 2);
+    } else {  // schedule-active form: 10 00 -> D0 0A 02
+        b.erase(b.begin() + 23, b.begin() + 25);
+        b.insert(b.begin() + 23, {0xD0, 0x0A, 0x02});
+        b[18] = static_cast<BYTE>(b[18] + 1);
+    }
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kNightKey, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return Log(L"night light: cannot open key");
+    LSTATUS r = RegSetValueExW(k, L"Data", 0, REG_BINARY, b.data(), static_cast<DWORD>(b.size()));
+    RegCloseKey(k);
+    Log(std::wstring(L"night light -> ") + (on ? L"on" : L"off") + L" (reg " + std::to_wstring(r) + L")");
 }
 
 bool ReadEnergySaver() {
