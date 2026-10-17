@@ -58,6 +58,13 @@ void Logf(wchar_t const* fmt, ...) {
     if (g_log) { fputws(line, g_log); fflush(g_log); }
 }
 
+#ifndef DWM_E_COMPOSITIONDISABLED
+#define DWM_E_COMPOSITIONDISABLED ((HRESULT)0x80263001L)
+#endif
+#ifndef DWM_E_SOURCE_NOT_REGISTERED
+#define DWM_E_SOURCE_NOT_REGISTERED ((HRESULT)0x80263003L)
+#endif
+
 char const* HrName(HRESULT hr) {
     switch (hr) {
         case S_OK: return "S_OK";

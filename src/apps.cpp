@@ -154,6 +154,13 @@ HWND WindowTracker::Front(std::wstring const& key) const {
     return nullptr;
 }
 
+std::vector<HWND> WindowTracker::WindowsOf(std::wstring const& key) const {
+    std::vector<HWND> hwnds;
+    for (auto const& w : m_wins)
+        if (w.app.key == key) hwnds.push_back(w.hwnd);
+    return hwnds;
+}
+
 std::wstring WindowTracker::KeyOf(HWND hwnd) const {
     for (auto const& w : m_wins)
         if (w.hwnd == hwnd) return w.app.key;
