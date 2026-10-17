@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -24,7 +27,25 @@ constexpr int kZoomMs = 300;
 constexpr UINT_PTR kReleaseTimer = 1;
 constexpr UINT kReleaseTimeoutMs = 1000;
 
+// Temporary debug aid: HALO_GENIE_DEBUG=1 dumps the expression strings and stage timings
+// through OutputDebugString (tools/dbwin.ps1 reads them).
+bool const kDebug = std::getenv("HALO_GENIE_DEBUG") != nullptr;  // NOLINT: set once
+void Dbg(wchar_t const* fmt, ...) {
+    if (!kDebug) return;
+    wchar_t buf[3000];
+    va_list args;
+    va_start(args, fmt);
+    vswprintf(buf, 3000, fmt, args);
+    va_end(args);
+    std::wstring line = std::wstring(L"[genie.c] ") + buf + L"\n";
+    OutputDebugStringW(line.c_str());
+    fputws(line.c_str(), stderr);
+    fflush(stderr);
+}
+
 struct Rectf { float x, y, w, h; };
+
+ULONGLONG g_endTicks = 0;  // debug: when the last batch.End() ran
 
 std::wstring NameOf(unsigned long long id, wchar_t const* suffix = L"") {
     wchar_t buf[64];
@@ -106,8 +127,14 @@ void Genie::OnMessage(WPARAM op, LPARAM lid) {
 
 void Genie::Start(unsigned long long id) {
     // The mod's snapshot: header + pixels in a named file mapping.
+    ULONGLONG t0s = GetTickCount64();
+    int nStrips = 0;
+    Dbg(L"Start id=%llx", id);
     HANDLE map = OpenFileMappingW(FILE_MAP_READ, FALSE, NameOf(id).c_str());
-    if (!map) return;
+    if (!map) {
+        Dbg(L"no mapping");
+        return;
+    }
     auto* base = static_cast<uint8_t const*>(MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0));
     CloseHandle(map);
     if (!base) return;
@@ -185,6 +212,7 @@ void Genie::Start(unsigned long long id) {
         grow.InsertKeyFrame(1.0f, {to.w / W, to.h / H, 1}, ease);
         sprite.StartAnimation(L"Scale", grow);
     } else {
+        nStrips = 0;
         // The macOS lamp curve (Potassiumuncher's Direct2D genie engine in MacOS Minimize Animation,
         // MIT; the mod's CPU fallback has it as LampVertex), as strips of kStripPx rows of the snapshot (plus one row of overlap
         // so no seam opens). A strip's TransformMatrix is the affine map through its top-left,
@@ -196,6 +224,7 @@ void Genie::Start(unsigned long long id) {
             auto expr = m_comp.CreateExpressionAnimation(text);
             expr.SetReferenceParameter(L"g", g);
             g.StartAnimation(prop, expr);
+            Dbg(L"drive %ls: %ls", prop, text.c_str());
         };
         auto num = [](float v) { wchar_t b[32]; swprintf(b, 32, L"%.7g", v); return std::wstring(b); };
         float expand = to.y - win.y - win.h, dw = win.w - to.w;
@@ -239,13 +268,18 @@ void Genie::Start(unsigned long long id) {
                 X(0, t0) + L") / " + num(rows) + L", (" + Y(t1) + L" - " + Y(t0) + L") / " + num(rows) +
                 L", 0, 0, 0, 0, 1, 0, " + X(0, t0) + L", " + Y(t0) + L", 0, 1)");
             expr.SetReferenceParameter(L"g", g);
+            if (y0 == 0) Dbg(L"strip 0 expr: %ls", expr.Expression().c_str());
             sprite.StartAnimation(L"TransformMatrix", expr);
+            nStrips++;
         }
     }
     batch.End();
+    Dbg(L"End(): %d strips, %lu ms after Start() began", nStrips, GetTickCount64() - t0s);
+    g_endTicks = GetTickCount64();
     anim->needsRelease = kind != GenieKind::Minimize;
     batch.Completed([this, id](auto&&, auto&&) {
         // Back on the UI thread: tell the mod, and drop a minimize at once (its window is already gone).
+        Dbg(L"batch Completed %llu ms after End", GetTickCount64() - g_endTicks);
         auto it = m_anims.find(id);
         if (it == m_anims.end()) return;
         SetEvent(it->second->done);
