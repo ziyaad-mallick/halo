@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|all]
+# Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|framecap|all]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CXX="${HALO_CXX:-/c/Users/testi/Windhawk/Compiler/bin/clang++.exe}"
@@ -12,7 +12,7 @@ WINLIBS=(-lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldw
 
 build_halo() {
   echo "== halo.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/icons.cpp src/apps.cpp \
+  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/genie.cpp src/icons.cpp src/apps.cpp \
     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}"
 }
 
@@ -28,10 +28,16 @@ build_icons_test() {
     -lole32 -luuid -lshell32 -lcomctl32 -lwindowscodecs -lgdi32 -luser32
 }
 
+build_framecap() {
+  echo "== framecap.exe"
+  "$CXX" "${COMMON[@]}" tools/framecap.cpp -o build/framecap.exe -ld3d11 -ldxgi -luser32
+}
+
 case "${1:-halo}" in
   halo) build_halo ;;
   guardian) build_guardian ;;
   icons_test) build_icons_test ;;
+  framecap) build_framecap ;;
   all) build_halo; build_guardian; build_icons_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac

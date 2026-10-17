@@ -30,23 +30,10 @@
 #include "apps.h"
 #include "dock.h"
 #include "effects.h"
+#include "genie.h"
 #include "icons.h"
+#include "interop.h"
 
-// Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
-struct ICompositorDesktopInterop : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE CreateDesktopWindowTarget(HWND hwnd, BOOL isTopmost, void** target) = 0;
-    virtual HRESULT STDMETHODCALLTYPE EnsureOnThread(DWORD threadId) = 0;
-};
-__CRT_UUID_DECL(ICompositorDesktopInterop, 0x29E691FA, 0x4567, 0x4DCA, 0xB3, 0x19, 0xD0, 0xF2, 0x07, 0xEB, 0x68, 0x07)
-struct ICompositionDrawingSurfaceInterop : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE BeginDraw(RECT const* updateRect, REFIID iid, void** updateObject, POINT* offset) = 0;
-    virtual HRESULT STDMETHODCALLTYPE EndDraw() = 0;
-    virtual HRESULT STDMETHODCALLTYPE Resize(SIZE size) = 0;
-    virtual HRESULT STDMETHODCALLTYPE Scroll(RECT const* scrollRect, RECT const* clipRect, int dx, int dy) = 0;
-    virtual HRESULT STDMETHODCALLTYPE ResumeDraw() = 0;
-    virtual HRESULT STDMETHODCALLTYPE SuspendDraw() = 0;
-};
-__CRT_UUID_DECL(ICompositionDrawingSurfaceInterop, 0xFD04E6E3, 0xFE0C, 0x4C3C, 0xAB, 0x19, 0xA0, 0x76, 0x01, 0xA5, 0x76, 0xEE)
 extern "C" HRESULT WINAPI D2D1CreateDevice(IDXGIDevice*, D2D1_CREATION_PROPERTIES const*, ID2D1Device**);
 
 namespace wuc = winrt::Windows::UI::Composition;
@@ -65,7 +52,7 @@ constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
 // Test hook (HALO_TEST=1): simulate the pointer without touching the real one.
 constexpr UINT kMsgTestMove = WM_APP + 2;   // wParam = pointer x, client px
 constexpr UINT kMsgTestLeave = WM_APP + 3;
-constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
+constexpr UINT kGenieHoldMs = 900;  // dock stays up for the 500 ms genie + a margin (src/genie.cpp)
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
 constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
@@ -146,6 +133,7 @@ private:
     int m_pressed = -1;  // the icon the mouse button went down on
     bool m_autoHide = true;  // off under HALO_TEST
     UINT m_genieMsg = RegisterWindowMessageW(L"Halo.DockIconForWindow");
+    UINT m_genieOpMsg = RegisterWindowMessageW(L"Halo.Genie");  // src/genie.h
 
     enum class State { Hidden, Shown, Hiding };
     State m_state = State::Shown;
@@ -161,6 +149,7 @@ private:
     winrt::com_ptr<ID3D11Device> m_d3d;
     winrt::com_ptr<ID2D1Device> m_d2d;
     wuc::CompositionGraphicsDevice m_gdev{nullptr};
+    std::unique_ptr<Genie> m_genie;
 };
 
 bool Halo::Create(HINSTANCE inst) {
@@ -225,6 +214,7 @@ bool Halo::Create(HINSTANCE inst) {
     bool ok = Step(L"composition", [&] { InitComposition(); });
     if (ok) {
         Step(L"graphics device", [&] { InitGraphics(); });
+        Step(L"genie", [&] { m_genie = std::make_unique<Genie>(m_comp, m_gdev, m_hwnd); });
         ok = Step(L"dock", [&] { BuildDock(); });
     }
     if (!RegisterHotKey(m_hwnd, kHotkeyQuit, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_ESCAPE))
@@ -574,6 +564,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     if (m == m_genieMsg && m) return DockIconForWindow(reinterpret_cast<HWND>(w), l);
+    if (m == m_genieOpMsg && m && m_genie) { m_genie->OnMessage(w, l); return 0; }
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_MOUSEMOVE:
