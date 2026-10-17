@@ -28,9 +28,13 @@
 #include <utility>
 #include <vector>
 #include "apps.h"
+#include "cluster.h"
 #include "dock.h"
 #include "effects.h"
 #include "icons.h"
+#include "intellihide.h"
+#include "label.h"
+#include "multimon.h"
 #include "winkey.h"
 
 // Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
@@ -39,6 +43,8 @@ struct ICompositorDesktopInterop : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE EnsureOnThread(DWORD threadId) = 0;
 };
 __CRT_UUID_DECL(ICompositorDesktopInterop, 0x29E691FA, 0x4567, 0x4DCA, 0xB3, 0x19, 0xD0, 0xF2, 0x07, 0xEB, 0x68, 0x07)
+#ifndef HALO_COMPOSITION_INTEROP_DEFINED
+#define HALO_COMPOSITION_INTEROP_DEFINED
 struct ICompositionDrawingSurfaceInterop : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE BeginDraw(RECT const* updateRect, REFIID iid, void** updateObject, POINT* offset) = 0;
     virtual HRESULT STDMETHODCALLTYPE EndDraw() = 0;
@@ -48,6 +54,7 @@ struct ICompositionDrawingSurfaceInterop : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE SuspendDraw() = 0;
 };
 __CRT_UUID_DECL(ICompositionDrawingSurfaceInterop, 0xFD04E6E3, 0xFE0C, 0x4C3C, 0xAB, 0x19, 0xA0, 0x76, 0x01, 0xA5, 0x76, 0xEE)
+#endif
 extern "C" HRESULT WINAPI D2D1CreateDevice(IDXGIDevice*, D2D1_CREATION_PROPERTIES const*, ID2D1Device**);
 
 namespace wuc = winrt::Windows::UI::Composition;
@@ -66,6 +73,8 @@ constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
 // Test hook (HALO_TEST=1): simulate the pointer without touching the real one.
 constexpr UINT kMsgTestMove = WM_APP + 2;   // wParam = pointer x, client px
 constexpr UINT kMsgTestLeave = WM_APP + 3;
+constexpr UINT kMsgIntellihideChanged = WM_APP + 5;  // wParam = overlap, lParam = fullscreen
+constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
@@ -122,11 +131,13 @@ private:
     void UpdateRegion();
     wuc::CompositionBrush IconBrushFor(std::wstring const& path);
     void Activate(size_t item);
-    void PointerMove(float x);
+    void PointerMove(float x, float y = 0.0f);
     void PointerLeave();
     void Reveal();
     LRESULT DockIconForWindow(HWND win, LPARAM op);
     void StartHide();
+    RECT GetPillRectScreen() const;
+    void MigrateToMonitor(HMONITOR mon);
     wuc::CompositionDrawingSurface MakeSurface(Size size);
     wuc::CompositionBrush MakeIconBrush(IconImage const& icon, float size);
 
@@ -140,9 +151,14 @@ private:
         std::wstring key;     // the running app's key, empty if not running
     };
     std::vector<Item> m_items;  // what the dock shows, left to right
+    std::vector<std::wstring> m_appNames;  // friendly display names for hover labels
     std::map<std::wstring, wuc::CompositionBrush> m_brushes;  // by icon source path, so rebuilds reuse them
     std::unique_ptr<WindowTracker> m_tracker;
     std::unique_ptr<Dock> m_dock;
+    std::unique_ptr<DockCluster> m_cluster;
+    std::unique_ptr<halo::AppLabel> m_label;
+    std::unique_ptr<halo::IntellihideDetector> m_intellihide;
+    std::unique_ptr<halo::MultiMonitorFollower> m_multimon;
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
     bool m_autoHide = true;  // off under HALO_TEST
@@ -151,6 +167,7 @@ private:
     enum class State { Hidden, Shown, Hiding };
     State m_state = State::Shown;
     unsigned m_hideGen = 0;  // invalidates a hide batch that a reveal interrupted
+    HMONITOR m_currentMon = nullptr;
     RECT m_monitor{}, m_full{};
     wuc::ContainerVisual m_slide{nullptr};  // the dock's parent; its Offset.Y slides the dock off-screen
 
@@ -176,6 +193,7 @@ bool Halo::Create(HINSTANCE inst) {
     if (!RegisterClassExW(&wc)) return false;
 
     HMONITOR mon = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    m_currentMon = mon;
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(mon, &mi);
     UINT dpiX = 96, dpiY = 96;
@@ -227,6 +245,20 @@ bool Halo::Create(HINSTANCE inst) {
     if (ok) {
         Step(L"graphics device", [&] { InitGraphics(); });
         ok = Step(L"dock", [&] { BuildDock(); });
+        if (ok) {
+            Step(L"app label", [&] {
+                m_label = std::make_unique<halo::AppLabel>(m_comp, m_slide, m_gdev, m_scale.v);
+            });
+            Step(L"intellihide", [&] {
+                m_intellihide = std::make_unique<halo::IntellihideDetector>(m_hwnd, kMsgIntellihideChanged);
+                m_intellihide->SetMonitor(m_currentMon, m_monitor);
+                m_intellihide->SetDockRect(GetPillRectScreen());
+            });
+            Step(L"multi-monitor", [&] {
+                m_multimon = std::make_unique<halo::MultiMonitorFollower>(m_hwnd, kMsgMonitorSwitch);
+                m_multimon->SetCurrentMonitor(m_currentMon);
+            });
+        }
     }
     if (!RegisterHotKey(m_hwnd, kHotkeyQuit, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_ESCAPE))
         Log(L"RegisterHotKey Ctrl+Win+Esc failed " + std::to_wstring(GetLastError()));
@@ -404,7 +436,8 @@ wuc::ContainerVisual Halo::BuildPill() {
 
 void Halo::BuildDock() {
     auto pill = BuildPill();
-    m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics);
+    m_cluster = std::make_unique<DockCluster>(m_comp, m_gdev, m_hwnd, m_metrics.pillHeight, m_scale.v);
+    m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics, m_cluster.get());
     m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
     RefreshDock();
 }
@@ -432,6 +465,7 @@ void Halo::RefreshDock() {
     std::vector<bool> pinned(running.size());
     std::vector<Dock::Item> items;
     m_items.clear();
+    m_appNames.clear();
     for (auto const& pin : m_apps) {
         auto brush = IconBrushFor(pin.linkPath);
         if (!brush) continue;
@@ -446,6 +480,7 @@ void Halo::RefreshDock() {
         }
         items.push_back({L"p:" + pin.linkPath, brush, !item.key.empty(), false});
         m_items.push_back(item);
+        m_appNames.push_back(pin.name);
     }
     for (size_t i = 0; i < running.size(); i++) {
         if (pinned[i] || running[i].exe.empty()) continue;
@@ -456,10 +491,74 @@ void Halo::RefreshDock() {
         if (!brush) continue;
         items.push_back({L"u:" + running[i].key, brush, true, true});
         m_items.push_back({{}, running[i].key});
+
+        std::wstring name;
+        if (!running[i].aumid.empty()) {
+            name = halo::AppNameResolver::Instance().Resolve(L"shell:AppsFolder\\" + running[i].aumid);
+        }
+        if (name.empty()) {
+            name = halo::AppNameResolver::Instance().Resolve(running[i].key, running[i].exe);
+        }
+        m_appNames.push_back(name);
     }
     Log(std::to_wstring(running.size()) + L" running apps, " + std::to_wstring(items.size()) + L" icons");
     m_dock->SetItems(items);
     UpdateRegion();
+}
+
+RECT Halo::GetPillRectScreen() const {
+    if (!m_dock) return m_full;
+    float half = m_dock->RestWidth() / 2.0f;
+    int pillLeft = m_full.left + static_cast<int>(m_metrics.centerX - half);
+    int pillRight = m_full.left + static_cast<int>(std::ceil(m_metrics.centerX + half));
+    int pillTop = m_full.bottom - static_cast<int>(m_metrics.pillHeight + m_scale.px(6));
+    int pillBottom = m_full.bottom;
+    return RECT{pillLeft, pillTop, pillRight, pillBottom};
+}
+
+void Halo::MigrateToMonitor(HMONITOR mon) {
+    if (!mon || mon == m_currentMon) return;
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(mon, &mi)) return;
+
+    UINT dpiX = 96, dpiY = 96;
+    GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+    float newScale = dpiX / 96.0f;
+    bool dpiChanged = std::abs(m_scale.v - newScale) > 0.001f;
+
+    m_currentMon = mon;
+    m_monitor = mi.rcMonitor;
+    m_width = m_monitor.right - m_monitor.left;
+    m_scale.v = newScale;
+
+    m_metrics.restSize = m_scale.f(28);
+    m_metrics.gap = m_scale.f(10);
+    m_metrics.maxScale = 1.57f;
+    m_metrics.radius = m_scale.f(100);
+    m_metrics.padding = m_scale.f(10);
+    m_metrics.pillHeight = m_scale.f(50);
+    m_metrics.cornerRadius = m_scale.f(20);
+    int margin = m_scale.px(6);
+    float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
+    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_metrics.restSize / 2 + m_scale.f(8))) + margin;
+    m_metrics.bottom = static_cast<float>(m_height - margin);
+    m_metrics.centerX = m_width / 2.0f;
+
+    int x = m_monitor.left, y = m_monitor.bottom - m_height;
+    m_full = {x, y, x + m_width, y + m_height};
+
+    SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, m_width, m_height, SWP_NOACTIVATE);
+
+    if (m_multimon) m_multimon->SetCurrentMonitor(mon);
+    if (m_label) m_label->SetScale(m_scale.v);
+    if (m_intellihide) {
+        m_intellihide->SetMonitor(mon, m_monitor);
+        m_intellihide->SetDockRect(GetPillRectScreen());
+    }
+
+    UpdateRegion();
+    if (dpiChanged) RefreshDock();
+    Reveal();
 }
 
 // Limits the window's input to the dock (and the bar of it a hidden dock
@@ -472,6 +571,7 @@ void Halo::UpdateRegion() {
     int left = std::max(0, static_cast<int>(m_metrics.centerX - half));
     int right = std::min(m_width, static_cast<int>(std::ceil(m_metrics.centerX + half)));
     SetWindowRgn(m_hwnd, CreateRectRgn(left, hidden ? m_height - kStripPx : 0, right, m_height), TRUE);
+    if (m_intellihide) m_intellihide->SetDockRect(GetPillRectScreen());
     Log(L"input region x " + std::to_wstring(left) + L".." + std::to_wstring(right) + (hidden ? L" (strip)" : L""));
 }
 
@@ -490,14 +590,28 @@ void Halo::Activate(size_t item) {
     }
 }
 
-void Halo::PointerMove(float x) {
+void Halo::PointerMove(float x, float y) {
     if (m_autoHide) Reveal();
     if (m_dock) m_dock->OnPointerMove(x);
+    if (m_dock && m_label) {
+        int hit = m_dock->HitTest(x, y);
+        if (hit >= 0 && hit < static_cast<int>(m_appNames.size()) && !m_appNames[hit].empty()) {
+            auto [cx, topY] = m_dock->MagnifiedIconCenterAndTop(hit);
+            m_label->Show(m_appNames[hit], cx, topY);
+        } else {
+            m_label->Hide();
+        }
+    }
 }
 
 void Halo::PointerLeave() {
+    if (m_label) m_label->Hide();
     if (m_dock) m_dock->OnPointerLeave();
-    if (m_autoHide && m_state == State::Shown) SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
+    if (m_autoHide && m_state == State::Shown) {
+        if (!m_intellihide || m_intellihide->HasOverlap() || m_intellihide->IsFullscreen()) {
+            SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
+        }
+    }
 }
 
 // Takes input over the whole dock at once and springs it up from wherever it is.
@@ -518,6 +632,7 @@ void Halo::Reveal() {
 void Halo::StartHide() {
     if (m_state != State::Shown) return;
     m_state = State::Hiding;
+    if (m_label) m_label->Hide();
     if (m_dock) m_dock->OnPointerLeave();  // magnification relaxes as the dock drops
     unsigned gen = ++m_hideGen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
@@ -585,19 +700,46 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, m_hwnd, 0};
                 m_trackingMouse = TrackMouseEvent(&tme);
             }
-            PointerMove(mx);
+            PointerMove(mx, my);
             return 0;
         case WM_MOUSELEAVE:
             m_trackingMouse = false;
             PointerLeave();
             return 0;
-        case kMsgTestMove: PointerMove(static_cast<float>(w)); return 0;
+        case kMsgTestMove: PointerMove(static_cast<float>(w), m_metrics.bottom - m_metrics.pillHeight / 2.0f); return 0;
         case kMsgTestLeave: PointerLeave(); return 0;
+        case kMsgIntellihideChanged:
+            if (w || l) {
+                if (!m_trackingMouse) StartHide();
+            } else {
+                Reveal();
+            }
+            return 0;
+        case kMsgMonitorSwitch:
+            MigrateToMonitor(reinterpret_cast<HMONITOR>(w));
+            return 0;
+        case WM_DISPLAYCHANGE:
+            if (m_multimon) m_multimon->OnDisplayChange();
+            return 0;
         case WM_TIMER:
             if (w == kHideTimer) {
                 KillTimer(m_hwnd, kHideTimer);
                 StartHide();
+            } else if (w == DockCluster::kClockTimer) {
+                if (m_dock) m_dock->OnClockTimer();
             }
+            return 0;
+        case WM_TIMECHANGE:
+            if (m_dock) m_dock->OnTimeChange();
+            return 0;
+        case WM_SETTINGCHANGE:
+            if (m_dock) m_dock->OnSettingChange();
+            return 0;
+        case WM_POWERBROADCAST:
+            if (m_dock) m_dock->OnPowerBroadcast(w, l);
+            return 0;
+        case DockCluster::kMsgNetworkChanged:
+            if (m_dock) m_dock->OnNetworkChanged();
             return 0;
         case WM_LBUTTONDOWN:
             if (m_dock && m_state == State::Shown) {

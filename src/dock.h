@@ -8,6 +8,7 @@
 // every frame, so a busy UI thread can't drop a dock frame. Icon brushes
 // sample surfaces as large as a fully magnified icon, so scaling stays sharp.
 
+#include <windows.h>
 #include <chrono>
 #include <string>
 #include <utility>
@@ -28,6 +29,8 @@ struct DockMetrics {
     float centerX = 0.0f;      // x of the dock's center in the parent
 };
 
+class DockCluster;
+
 class Dock {
 public:
     // `pill` is the background (its layers should size relative to it); the
@@ -35,7 +38,8 @@ public:
     Dock(winrt::Windows::UI::Composition::Compositor const& compositor,
          winrt::Windows::UI::Composition::ContainerVisual const& parent,
          winrt::Windows::UI::Composition::ContainerVisual const& pill,
-         DockMetrics const& metrics);
+         DockMetrics const& metrics,
+         DockCluster* cluster = nullptr);
 
     struct Item {
         std::wstring key;  // identity across calls
@@ -64,6 +68,17 @@ public:
     // Where icon `index` (into the last SetItems) is centered with the dock at
     // rest (no magnification), in the parent's coordinates.
     std::pair<float, float> RestIconCenter(size_t index) const;
+
+    // Where icon `index` is centered and top edge under current magnification,
+    // in parent visual coordinates. Returns {centerX, topY}.
+    std::pair<float, float> MagnifiedIconCenterAndTop(size_t index) const;
+
+    // Cluster event forwarding
+    void OnClockTimer();
+    void OnTimeChange();
+    void OnSettingChange();
+    void OnPowerBroadcast(WPARAM w, LPARAM l);
+    void OnNetworkChanged();
 
     // Width of the pill at rest and at full magnification (with every icon
     // still on its way out counted), for sizing the window's input region.
@@ -104,4 +119,10 @@ private:
     DockMetrics m_m;
     bool m_hovering = false;
     float m_pointerX = 0.0f;
+
+    DockCluster* m_cluster = nullptr;
+    winrt::Windows::UI::Composition::SpriteVisual m_clusterDivider{nullptr};
+    float m_clusterWidth = 0.0f;
+    float m_dividerWidth = 0.0f;
+    float m_clusterOffset = 0.0f;
 };

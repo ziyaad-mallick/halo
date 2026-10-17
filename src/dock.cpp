@@ -1,4 +1,5 @@
 #include "dock.h"
+#include "cluster.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,8 +58,9 @@ float WidthAtRest(DockMetrics const& m, size_t count, bool divider) {
 }  // namespace
 
 Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
-           ContainerVisual const& pill, DockMetrics const& metrics)
-    : m_compositor(compositor), m_pill(pill), m_m(metrics) {
+           ContainerVisual const& pill, DockMetrics const& metrics,
+           DockCluster* cluster)
+    : m_compositor(compositor), m_pill(pill), m_m(metrics), m_cluster(cluster) {
     m_root = m_compositor.CreateContainerVisual();
     m_root.RelativeSizeAdjustment({1.0f, 1.0f});
     parent.Children().InsertAtTop(m_root);
@@ -75,6 +77,24 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
     m_props.InsertScalar(L"Padding", m_m.padding);
     m_props.InsertScalar(L"Center", m_m.centerX);
 
+    if (m_cluster) {
+        m_clusterWidth = m_cluster->Width();
+        m_dividerWidth = m_m.gap;
+        m_clusterOffset = m_clusterWidth + m_dividerWidth;
+
+        // A 1px subtle divider between the left cluster and the app icons
+        const float cw = std::max(1.0f, std::round(m_m.restSize / 28));
+        const float ch = m_m.pillHeight * 0.6f;
+        m_clusterDivider = m_compositor.CreateSpriteVisual();
+        m_clusterDivider.Size({cw, ch});
+        m_clusterDivider.Brush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x33, 0xFF, 0xFF, 0xFF)));
+        m_clusterDivider.Offset({0, m_m.bottom - (m_m.pillHeight + ch) / 2, 0});
+        m_root.Children().InsertAtTop(m_clusterDivider);
+        if (m_cluster->Visual()) {
+            m_root.Children().InsertAtTop(m_cluster->Visual());
+        }
+    }
+
     // A 1px line, 60% of the pill high, in a slot one gap wide: a full gap
     // each side. Its slot and opacity animate when the first unpinned icon
     // arrives and the last one leaves.
@@ -88,7 +108,7 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
     m_divider.Properties().InsertScalar(L"Slot", 0.0f);
     m_root.Children().InsertAtTop(m_divider);
 
-    m_pill.Size({WidthAtRest(m_m, 0, false), m_m.pillHeight});
+    m_pill.Size({m_clusterOffset + WidthAtRest(m_m, 0, false), m_m.pillHeight});
     m_pill.Offset({m_m.centerX - m_pill.Size().x / 2, m_m.bottom - m_m.pillHeight, 0});
     auto clipShape = m_compositor.CreateRoundedRectangleGeometry();
     clipShape.CornerRadius({m_m.cornerRadius, m_m.cornerRadius});
@@ -109,7 +129,7 @@ float Dock::RestWidth() const {
         n++;
         extra |= e.extra && n > 1;
     }
-    return WidthAtRest(m_m, n, extra);
+    return m_clusterOffset + WidthAtRest(m_m, n, extra);
 }
 
 float Dock::MaxWidth() const {
@@ -119,7 +139,7 @@ float Dock::MaxWidth() const {
     for (float d = -m_m.radius; d <= m_m.radius; d += pitch) {
         growth += (m_m.maxScale - 1) * (std::cos(std::abs(d) / m_m.radius * kPi) + 1) / 2;
     }
-    return WidthAtRest(m_m, m_entries.size(), true) + (growth + 1) * pitch;
+    return m_clusterOffset + WidthAtRest(m_m, m_entries.size(), true) + (growth + 1) * pitch;
 }
 
 void Dock::AnimateTo(CompositionObject const& target, wchar_t const* property, float to, int ms) {
@@ -292,10 +312,12 @@ void Dock::BuildExpressions() {
         for (size_t j = 0; j < n; j++) a.SetReferenceParameter(Param(j), m_entries[j].icon.Properties());
     };
 
+    std::wstring clusterShift = m_clusterOffset > 0.0f ? (L" + " + std::to_wstring(m_clusterOffset / 2)) : L"";
+
     for (size_t i = 0; i < n; i++) {
         const std::wstring me = Param(i);
         // Icon i's center at rest, where the wave measures its distance from.
-        std::wstring rest = L"(p.Center - " + total(L"P") + L" / 2 + " + start(i, L"P") + L" + p.Pitch * " + me +
+        std::wstring rest = L"(p.Center" + clusterShift + L" - " + total(L"P") + L" / 2 + " + start(i, L"P") + L" + p.Pitch * " + me +
                             L".P / 2)";
         auto s = m_compositor.CreateExpressionAnimation(
             me + L".P * (1 + (p.MaxScale - 1) * p.Intensity * (Cos(Clamp(Abs(p.PointerX - " + rest +
@@ -310,7 +332,7 @@ void Dock::BuildExpressions() {
 
         // Slots packed around the dock's center; the icon sits centered in
         // its slot (Offset is its top-left before scaling).
-        const std::wstring slotCenter = L"p.Center - " + total(L"S") + L" / 2 + " + start(i, L"S") + L" + p.Pitch * " +
+        const std::wstring slotCenter = L"p.Center" + clusterShift + L" - " + total(L"S") + L" / 2 + " + start(i, L"S") + L" + p.Pitch * " +
                                         me + L".S / 2";
         auto x = m_compositor.CreateExpressionAnimation(slotCenter + L" - p.Rest / 2");
         bind(x);
@@ -322,17 +344,32 @@ void Dock::BuildExpressions() {
     }
 
     if (d >= 0) {
-        auto dx = m_compositor.CreateExpressionAnimation(L"p.Center - " + total(L"S") + L" / 2 + p.Pitch * " +
+        auto dx = m_compositor.CreateExpressionAnimation(L"p.Center" + clusterShift + L" - " + total(L"S") + L" / 2 + p.Pitch * " +
                                                          sum(d, L"S") + L" + dv.Slot / 2 - " +
                                                          std::to_wstring(m_divider.Size().x / 2));
         bind(dx);
         Start(m_divider, L"Offset.X", dx, L"divider x");
     }
 
+    if (m_cluster && m_clusterDivider) {
+        auto clusterX = m_compositor.CreateExpressionAnimation(L"pill.Offset.X + p.Padding");
+        clusterX.SetReferenceParameter(L"pill", m_pill);
+        clusterX.SetReferenceParameter(L"p", m_props);
+        Start(m_cluster->Visual(), L"Offset.X", clusterX, L"cluster x");
+
+        auto clusterDivX = m_compositor.CreateExpressionAnimation(
+            L"pill.Offset.X + p.Padding + " + std::to_wstring(m_clusterWidth + m_dividerWidth / 2 - m_clusterDivider.Size().x / 2));
+        clusterDivX.SetReferenceParameter(L"pill", m_pill);
+        clusterDivX.SetReferenceParameter(L"p", m_props);
+        Start(m_clusterDivider, L"Offset.X", clusterDivX, L"cluster divider x");
+    }
+
     // The pill wraps the slots: it grows with the icons instead of letting
     // the outer ones slide off.
-    if (n > 0) {
-        auto width = m_compositor.CreateExpressionAnimation(total(L"S") + L" - p.Gap + 2 * p.Padding");
+    if (n > 0 || m_cluster) {
+        std::wstring widthExpr = (m_clusterOffset > 0.0f ? (std::to_wstring(m_clusterOffset) + L" + ") : L"") +
+                                 total(L"S") + L" - p.Gap + 2 * p.Padding";
+        auto width = m_compositor.CreateExpressionAnimation(widthExpr);
         bind(width);
         Start(m_pill, L"Size.X", width, L"pill width");
 
@@ -372,22 +409,22 @@ std::pair<float, float> Dock::RestIconCenter(size_t index) const {
     const float pitch = m_m.restSize + m_m.gap;
     const float divider = d >= 0 ? m_m.gap : 0.0f;
     // The rest layout HitTest uses, with every icon fully present.
-    const float left = m_m.centerX - (pitch * n + divider) / 2;
+    const float left = m_m.centerX + m_clusterOffset / 2 - (pitch * n + divider) / 2;
     const float x = left + pitch * index + (d >= 0 && static_cast<int>(index) >= d ? divider : 0.0f) + pitch / 2;
     return {x, IconY() + m_m.restSize / 2};
 }
 
-int Dock::HitTest(float x, float y) const {
+std::pair<float, float> Dock::MagnifiedIconCenterAndTop(size_t index) const {
     std::vector<Entry const*> live;
     for (auto const& e : m_entries) if (!e.leaving) live.push_back(&e);
     const size_t n = live.size();
-    if (n == 0) return -1;
+    if (index >= n) return {0.0f, 0.0f};
+
     int d = -1;
     for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
     const float pitch = m_m.restSize + m_m.gap;
     const float divider = d >= 0 ? m_m.gap : 0.0f;
-    // The same layout the expressions compute, with every icon fully present.
-    const float restLeft = m_m.centerX - (pitch * n + divider) / 2;
+    const float restLeft = m_m.centerX + m_clusterOffset / 2 - (pitch * n + divider) / 2;
     std::vector<float> mag(n);
     float total = divider;
     for (size_t k = 0; k < n; k++) {
@@ -396,7 +433,57 @@ int Dock::HitTest(float x, float y) const {
         mag[k] = 1 + (m_m.maxScale - 1) * (m_hovering ? 1.0f : 0.0f) * (std::cos(t * kPi) + 1) / 2;
         total += pitch * mag[k];
     }
-    float left = m_m.centerX - total / 2;
+    float left = m_m.centerX + m_clusterOffset / 2 - total / 2;
+    for (size_t k = 0; k < index; k++) {
+        if (static_cast<int>(k) == d) left += divider;
+        left += pitch * mag[k];
+    }
+    if (static_cast<int>(index) == d) left += divider;
+    float slot = pitch * mag[index];
+    float centerX = left + slot / 2;
+    float topY = m_m.bottom - (m_m.pillHeight - m_m.restSize) / 2 - m_m.restSize * mag[index];
+    return {centerX, topY};
+}
+
+int Dock::HitTest(float x, float y) const {
+    std::vector<Entry const*> live;
+    for (auto const& e : m_entries) if (!e.leaving) live.push_back(&e);
+    const size_t n = live.size();
+
+    int d = -1;
+    for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
+    const float pitch = m_m.restSize + m_m.gap;
+    const float divider = d >= 0 ? m_m.gap : 0.0f;
+    const float restLeft = m_m.centerX + m_clusterOffset / 2 - (pitch * n + divider) / 2;
+    std::vector<float> mag(n);
+    float total = divider;
+    for (size_t k = 0; k < n; k++) {
+        float center = restLeft + pitch * k + (d >= 0 && static_cast<int>(k) >= d ? divider : 0.0f) + pitch / 2;
+        float t = std::min(std::abs(m_pointerX - center) / m_m.radius, 1.0f);
+        mag[k] = 1 + (m_m.maxScale - 1) * (m_hovering ? 1.0f : 0.0f) * (std::cos(t * kPi) + 1) / 2;
+        total += pitch * mag[k];
+    }
+
+    // Check Left Cluster (Start button & status)
+    if (m_cluster) {
+        float pillWidth = m_clusterOffset + (n > 0 ? (total - m_m.gap) : 0.0f) + 2 * m_m.padding;
+        float pillLeft = m_m.centerX - pillWidth / 2;
+        float clusterLeft = pillLeft + m_m.padding;
+
+        if (x >= clusterLeft && x < clusterLeft + m_clusterWidth &&
+            y >= m_m.bottom - m_m.pillHeight && y <= m_m.bottom) {
+            float localX = x - clusterLeft;
+            float localY = y - (m_m.bottom - m_m.pillHeight);
+            if (m_cluster->HitTestStart(localX, localY)) {
+                DockCluster::TriggerStartMenu();
+            }
+            return -1;
+        }
+    }
+
+    if (n == 0) return -1;
+
+    float left = m_m.centerX + m_clusterOffset / 2 - total / 2;
     for (size_t k = 0; k < n; k++) {
         if (static_cast<int>(k) == d) left += divider;
         float slot = pitch * mag[k];
@@ -472,4 +559,24 @@ void Dock::Settle(Entry& e) {
     a.InsertKeyFrame(1.0f, IconY(), BounceDown(m_compositor));
     a.Duration(std::chrono::milliseconds(std::max(1, static_cast<int>((1 - phase) * kBounceMs))));
     Start(e.icon, L"Offset.Y", a, L"settle");
+}
+
+void Dock::OnClockTimer() {
+    if (m_cluster) m_cluster->OnTimer(DockCluster::kClockTimer);
+}
+
+void Dock::OnTimeChange() {
+    if (m_cluster) m_cluster->OnTimeChange();
+}
+
+void Dock::OnSettingChange() {
+    if (m_cluster) m_cluster->OnSettingChange();
+}
+
+void Dock::OnPowerBroadcast(WPARAM w, LPARAM l) {
+    if (m_cluster) m_cluster->OnPowerBroadcast(w, l);
+}
+
+void Dock::OnNetworkChanged() {
+    if (m_cluster) m_cluster->OnNetworkChanged();
 }

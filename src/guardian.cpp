@@ -442,13 +442,25 @@ int Autostart(const wchar_t* arg) {
 // Hand a command to the running guardian. False if its window does not answer.
 bool SendCommand(WPARAM cmd) {
     UINT msg = RegisterWindowMessageW(L"HaloGuardian.Command");
+    HDESK defDesk = nullptr;
     for (int i = 0; i < 20; ++i) {  // the first instance may still be creating its window
-        if (HWND w = FindWindowW(kWndClass, nullptr)) {
+        HWND w = FindWindowW(kWndClass, nullptr);
+        if (!w && !defDesk) {
+            defDesk = OpenDesktopW(L"Default", 0, FALSE, GENERIC_ALL);
+            if (defDesk) {
+                SetThreadDesktop(defDesk);
+                w = FindWindowW(kWndClass, nullptr);
+            }
+        }
+        if (w) {
             DWORD_PTR res = 0;
-            return SendMessageTimeoutW(w, msg, cmd, 0, SMTO_ABORTIFHUNG, 10000, &res) != 0;
+            BOOL ok = SendMessageTimeoutW(w, msg, cmd, 0, SMTO_ABORTIFHUNG, 10000, &res);
+            if (defDesk) CloseDesktop(defDesk);
+            return ok != 0;
         }
         Sleep(100);
     }
+    if (defDesk) CloseDesktop(defDesk);
     return false;
 }
 
