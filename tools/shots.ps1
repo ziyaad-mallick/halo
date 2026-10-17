@@ -1,0 +1,120 @@
+# Screenshot the dock without touching the real mouse. Launches build/halo.exe with
+# HALO_TEST=1 (starts shown, no auto-hide), then drives it with posted messages:
+# WM_APP+2 (wParam = pointer x) simulates a pointer move, WM_APP+3 a leave, and
+# posted WM_LBUTTONDOWN/UP simulate clicks. Refuses to run on the lock screen.
+#   tools/shots.ps1 -Scenario rest|hover|open|close|press|bounce [-Tag name] [-X 960]
+#                   [-Icon 0] [-App notepad.exe]
+# rest/hover: one PNG each. open/close: a burst of frames while -App starts/exits.
+# press: a magnified frame with -Icon held down. bounce: a burst after clicking -Icon.
+# Output: build/<Tag>-*.png and build/<Tag>-sheet.png (a stacked contact sheet of a burst).
+param([string]$Scenario = 'hover', [string]$Tag = 'shots', [int]$X = 960, [int]$Icon = 0,
+      [string]$App = 'notepad.exe', [int]$Frames = 16, [int]$IntervalMs = 60)
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path $PSScriptRoot
+$out = Join-Path $repo 'build'
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System; using System.Text; using System.Runtime.InteropServices;
+public static class Sh {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  // The dock window of a process (FindWindow by class alone misses it).
+  public static IntPtr DockWindow(uint target) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, l) => { uint pid; GetWindowThreadProcessId(h, out pid);
+      var sb = new StringBuilder(64); GetClassName(h, sb, 64);
+      if (pid == target && sb.ToString() == "HaloDockWindow") { found = h; return false; } return true; }, IntPtr.Zero);
+    return found;
+  }
+}
+'@
+[Sh]::SetProcessDPIAware() | Out-Null
+$sb = New-Object System.Text.StringBuilder 200
+[Sh]::GetWindowText([Sh]::GetForegroundWindow(), $sb, 200) | Out-Null
+if ($sb.ToString() -match 'Lock Screen') { "SKIPPED: the PC is locked ($sb)"; return }
+
+$top = 1000                       # screenshots cover the bottom 200 px
+function Shot($name) {
+    $b = New-Object System.Drawing.Bitmap 1920, 200
+    $g = [System.Drawing.Graphics]::FromImage($b)
+    $g.CopyFromScreen(0, $top, 0, 0, $b.Size)
+    $p = Join-Path $out "$Tag-$name.png"; $b.Save($p); $g.Dispose(); $b.Dispose(); $p
+}
+# Frames as fast as the screen grab allows for $ms, calling $action once after $afterMs.
+function Burst($ms, $afterMs, $action) {
+    $frames = @(); $sw = [Diagnostics.Stopwatch]::StartNew(); $fired = $false
+    while ($sw.ElapsedMilliseconds -lt $ms) {
+        if (-not $fired -and $sw.ElapsedMilliseconds -ge $afterMs) { & $action; $fired = $true }
+        $b = New-Object System.Drawing.Bitmap 1920, 200
+        $g = [System.Drawing.Graphics]::FromImage($b)
+        $g.CopyFromScreen(0, $top, 0, 0, $b.Size); $g.Dispose()
+        $frames += [pscustomobject]@{ T = $sw.ElapsedMilliseconds; Bmp = $b }
+        $left = $IntervalMs - ($sw.ElapsedMilliseconds - $frames[-1].T)
+        if ($left -gt 0) { Start-Sleep -Milliseconds $left }
+    }
+    $frames
+}
+# Stacks the middle 1000 px of each frame (labelled with its time) into one image.
+function Sheet($frames, $name) {
+    $w = 1000; $h = 150; $x0 = 460
+    $sheet = New-Object System.Drawing.Bitmap $w, ($h * $frames.Count)
+    $g = [System.Drawing.Graphics]::FromImage($sheet); $g.Clear([System.Drawing.Color]::FromArgb(40, 40, 40))
+    $font = New-Object System.Drawing.Font 'Consolas', 9
+    for ($i = 0; $i -lt $frames.Count; $i++) {
+        $g.DrawImage($frames[$i].Bmp, [System.Drawing.Rectangle]::new(0, $i * $h, $w, $h),
+                     [System.Drawing.Rectangle]::new($x0, 200 - $h, $w, $h), [System.Drawing.GraphicsUnit]::Pixel)
+        $g.DrawString("$($frames[$i].T) ms", $font, [System.Drawing.Brushes]::Yellow, 4, $i * $h + 2)
+        $frames[$i].Bmp.Save((Join-Path $out ("{0}-{1}-f{2:D2}.png" -f $Tag, $name, $i)))
+        $frames[$i].Bmp.Dispose()
+    }
+    $p = Join-Path $out "$Tag-$name-sheet.png"; $sheet.Save($p); $g.Dispose(); $sheet.Dispose(); $p
+}
+
+$env:HALO_TEST = '1'
+$p = Start-Process (Join-Path $out 'halo.exe') -PassThru -RedirectStandardError (Join-Path $out "$Tag.log")
+Remove-Item Env:HALO_TEST
+Start-Sleep -Seconds 3
+$dock = [Sh]::DockWindow([uint32]$p.Id)
+if ($dock -eq [IntPtr]::Zero) { Stop-Process -Id $p.Id; throw 'dock window not found' }
+function PMove($x) { [Sh]::PostMessage($dock, 0x8002, [IntPtr]$x, [IntPtr]::Zero) | Out-Null }
+function Leave { [Sh]::PostMessage($dock, 0x8003, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
+function Mouse($msg, $x, $y) { [Sh]::PostMessage($dock, $msg, [IntPtr]($(if ($msg -eq 0x201) { 1 } else { 0 })), [IntPtr](($y -shl 16) -bor $x)) | Out-Null }
+# Centre of icon $Icon at rest, from the icon count in the log (pitch 56 px at 125%, centred on 960).
+function IconX($i) {
+    $n = [int](([regex]::Match((Get-Content (Join-Path $out "$Tag.log") -Raw), '(\d+) icons').Groups[1].Value))
+    960 + (($i + 0.5) - $n / 2) * 56
+}
+try {
+    switch ($Scenario) {
+        'rest'  { Shot 'rest' }
+        'hover' { Shot 'rest'; PMove $X; Start-Sleep -Milliseconds 600; Shot 'hover'; Leave }
+        'open'  { Shot 'before'
+                  $f = Burst 2600 400 { $script:started = Start-Process $App -PassThru }
+                  Sheet $f 'open'; Start-Sleep -Seconds 1; Shot 'after'
+                  Get-Process | Where-Object { $_.Id -eq $started.Id } | ForEach-Object { $_.CloseMainWindow() | Out-Null } }
+        'close' { $started = Start-Process $App -PassThru; Start-Sleep -Seconds 4; Shot 'before'
+                  $f = Burst 2000 300 { $started.CloseMainWindow() | Out-Null
+                                         Start-Sleep -Milliseconds 200
+                                         if (-not $started.HasExited) { Stop-Process -Id $started.Id -ErrorAction SilentlyContinue } }
+                  Sheet $f 'close'; Shot 'after' }
+        'press' { $ix = [int](IconX $Icon); PMove $ix; Start-Sleep -Milliseconds 600
+                  Shot 'hover'
+                  Mouse 0x201 $ix 150; Start-Sleep -Milliseconds 300; Shot 'pressed'
+                  Mouse 0x202 0 0; Start-Sleep -Milliseconds 400; Shot 'released'; Leave }
+        'bounce' { $ix = [int](IconX $Icon)
+                  $f = Burst 3000 200 { Mouse 0x201 $ix 150; Mouse 0x202 $ix 150 }
+                  Sheet $f 'bounce' }
+        default { throw "unknown scenario $Scenario" }
+    }
+} finally {
+    [Sh]::PostMessage($dock, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Seconds 1
+    if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $p.Id; 'halo did not close on WM_CLOSE; killed' } else { 'halo closed' }
+}
+Get-Content (Join-Path $out "$Tag.log") | Select-Object -Last 6

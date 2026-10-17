@@ -53,7 +53,6 @@ using winrt::Windows::Foundation::Size;
 namespace {
 
 // Settings
-constexpr bool kAutoHide = true;
 constexpr UINT kHideDelayMs = 500;        // cursor must stay away this long before hiding
 constexpr float kSpringDamping = 0.72f;   // < 1 overshoots slightly
 constexpr int kSpringPeriodMs = 55;       // lower = snappier
@@ -61,6 +60,9 @@ constexpr int kHideDurationMs = 200;
 constexpr int kStripPx = 2;               // hit strip left on the screen edge while hidden
 
 constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
+// Test hook (HALO_TEST=1): simulate the pointer without touching the real one.
+constexpr UINT kMsgTestMove = WM_APP + 2;   // wParam = pointer x, client px
+constexpr UINT kMsgTestLeave = WM_APP + 3;
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
 constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
@@ -115,6 +117,8 @@ private:
     void Layout(size_t icons);
     wuc::CompositionBrush IconBrushFor(std::wstring const& path);
     void Activate(size_t item);
+    void PointerMove(float x);
+    void PointerLeave();
     void Reveal();
     void StartHide();
     wuc::CompositionDrawingSurface MakeSurface(Size size);
@@ -134,6 +138,7 @@ private:
     std::unique_ptr<WindowTracker> m_tracker;
     std::unique_ptr<Dock> m_dock;
     bool m_trackingMouse = false;
+    bool m_autoHide = true;  // off under HALO_TEST
 
     enum class State { Hidden, Shown, Hiding };
     State m_state = State::Shown;
@@ -153,6 +158,7 @@ private:
 
 bool Halo::Create(HINSTANCE inst) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    m_autoHide = !_wgetenv(L"HALO_TEST");
 
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = WndProc;
@@ -188,8 +194,8 @@ bool Halo::Create(HINSTANCE inst) {
     m_monitor = mi.rcMonitor;
     Layout(m_apps.size());
     int x = m_full.left, y = m_full.top;
-    RECT const& first = kAutoHide ? m_strip : m_full;
-    if (kAutoHide) m_state = State::Hidden;
+    RECT const& first = m_autoHide ? m_strip : m_full;
+    if (m_autoHide) m_state = State::Hidden;
 
     m_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
                              wc.lpszClassName, L"Halo", WS_POPUP, first.left, first.top, first.right - first.left,
@@ -231,7 +237,7 @@ void Halo::InitComposition() {
     m_target.Root(m_root);
     m_slide = m_comp.CreateContainerVisual();
     m_slide.RelativeSizeAdjustment({1, 1});
-    if (kAutoHide) m_slide.Offset({0, static_cast<float>(m_height), 0});
+    if (m_autoHide) m_slide.Offset({0, static_cast<float>(m_height), 0});
     m_root.Children().InsertAtTop(m_slide);
 }
 
@@ -409,6 +415,16 @@ void Halo::Activate(size_t item) {
     }
 }
 
+void Halo::PointerMove(float x) {
+    if (m_autoHide) Reveal();
+    if (m_dock) m_dock->OnPointerMove(x);
+}
+
+void Halo::PointerLeave() {
+    if (m_dock) m_dock->OnPointerLeave();
+    if (m_autoHide && m_state == State::Shown) SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
+}
+
 // Shows the full window at once and springs the dock up from wherever it is.
 void Halo::Reveal() {
     KillTimer(m_hwnd, kHideTimer);
@@ -465,14 +481,14 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, m_hwnd, 0};
                 m_trackingMouse = TrackMouseEvent(&tme);
             }
-            if (kAutoHide) Reveal();
-            if (m_dock) m_dock->OnPointerMove(mx);
+            PointerMove(mx);
             return 0;
         case WM_MOUSELEAVE:
             m_trackingMouse = false;
-            if (m_dock) m_dock->OnPointerLeave();
-            if (kAutoHide && m_state == State::Shown) SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
+            PointerLeave();
             return 0;
+        case kMsgTestMove: PointerMove(static_cast<float>(w)); return 0;
+        case kMsgTestLeave: PointerLeave(); return 0;
         case WM_TIMER:
             if (w == kHideTimer) {
                 KillTimer(m_hwnd, kHideTimer);
