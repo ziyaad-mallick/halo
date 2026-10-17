@@ -110,6 +110,7 @@ int wmain() {
         for (std::size_t i = 0; i < apps.size(); ++i) {
             const PinnedApp& app = apps[i];
             std::wprintf(L"[%02zu] %ls\n", i, app.name.c_str());
+            std::wprintf(L"     aumid:  %ls\n", app.aumid.empty() ? L"(none)" : app.aumid.c_str());
             std::wprintf(L"     link:   %ls\n", app.linkPath.c_str());
             std::wprintf(L"     target: %ls\n", app.targetPath.empty() ? L"(none)" : app.targetPath.c_str());
 
