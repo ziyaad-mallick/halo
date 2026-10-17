@@ -58,6 +58,7 @@ std::wstring NameOf(unsigned long long id, wchar_t const* suffix = L"") {
 struct Genie::Anim {
     HANDLE ready{}, done{};
     wuc::ContainerVisual root{nullptr};
+    wuc::CompositionPropertySet props{nullptr};
     bool needsRelease = false;
     ~Anim() {
         if (ready) CloseHandle(ready);
@@ -191,8 +192,23 @@ void Genie::Start(unsigned long long id) {
     int ms = zoom ? kZoomMs : kGenieMs;
 
     anim->root = m_comp.CreateContainerVisual();
+    m_root.Children().InsertAtTop(anim->root);
+    SetWindowPos(m_overlay, m_dock, m_virtual.left, m_virtual.top, m_virtual.right - m_virtual.left,
+                 m_virtual.bottom - m_virtual.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
     auto strips = anim->root.Children();
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    anim->needsRelease = kind != GenieKind::Minimize;
+    batch.Completed([this, id](auto&&, auto&&) {
+        // Back on the UI thread: tell the mod, and drop a minimize at once (its window is already gone).
+        Dbg(L"batch Completed %llu ms after End", GetTickCount64() - g_endTicks);
+        auto it = m_anims.find(id);
+        if (it == m_anims.end()) return;
+        SetEvent(it->second->done);
+        if (it->second->needsRelease) SetTimer(m_overlay, kReleaseTimer, kReleaseTimeoutMs, nullptr);
+        else Finish(id);
+    });
+
     if (zoom) {
         // One visual: the snapshot swoops from the window's rect to the target rect.
         auto sprite = m_comp.CreateSpriteVisual();
@@ -219,6 +235,7 @@ void Genie::Start(unsigned long long id) {
         // top-right and bottom-left corners under the warp, so neighbours join exactly. DWM
         // evaluates the matrices every frame from one linearly animated time value g.t.
         auto g = m_comp.CreatePropertySet();
+        anim->props = g;
         for (auto name : {L"t", L"e", L"k", L"j", L"f", L"hh", L"s0", L"s1", L"u", L"k7"}) g.InsertScalar(name, 0.0f);
         auto drive = [&](wchar_t const* prop, std::wstring const& text) {
             auto expr = m_comp.CreateExpressionAnimation(text);
@@ -276,20 +293,6 @@ void Genie::Start(unsigned long long id) {
     batch.End();
     Dbg(L"End(): %d strips, %lu ms after Start() began", nStrips, GetTickCount64() - t0s);
     g_endTicks = GetTickCount64();
-    anim->needsRelease = kind != GenieKind::Minimize;
-    batch.Completed([this, id](auto&&, auto&&) {
-        // Back on the UI thread: tell the mod, and drop a minimize at once (its window is already gone).
-        Dbg(L"batch Completed %llu ms after End", GetTickCount64() - g_endTicks);
-        auto it = m_anims.find(id);
-        if (it == m_anims.end()) return;
-        SetEvent(it->second->done);
-        if (it->second->needsRelease) SetTimer(m_overlay, kReleaseTimer, kReleaseTimeoutMs, nullptr);
-        else Finish(id);
-    });
-
-    m_root.Children().InsertAtTop(anim->root);
-    SetWindowPos(m_overlay, m_dock, m_virtual.left, m_virtual.top, m_virtual.right - m_virtual.left,
-                 m_virtual.bottom - m_virtual.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     HANDLE ready = nullptr;
     DuplicateHandle(GetCurrentProcess(), anim->ready, GetCurrentProcess(), &ready, 0, FALSE, DUPLICATE_SAME_ACCESS);
     m_anims[id] = std::move(anim);
