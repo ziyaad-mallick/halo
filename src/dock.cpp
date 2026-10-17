@@ -359,6 +359,20 @@ void Dock::OnPointerLeave() {
     AnimateTo(m_props, L"Intensity", 0.0f, kFocusMs);
 }
 
+std::pair<float, float> Dock::RestIconCenter(size_t index) const {
+    std::vector<Entry const*> live;
+    for (auto const& e : m_entries) if (!e.leaving) live.push_back(&e);
+    const size_t n = live.size();
+    int d = -1;
+    for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
+    const float pitch = m_m.restSize + m_m.gap;
+    const float divider = d >= 0 ? m_m.gap : 0.0f;
+    // The rest layout HitTest uses, with every icon fully present.
+    const float left = m_m.centerX - (pitch * n + divider) / 2;
+    const float x = left + pitch * index + (d >= 0 && static_cast<int>(index) >= d ? divider : 0.0f) + pitch / 2;
+    return {x, IconY() + m_m.restSize / 2};
+}
+
 int Dock::HitTest(float x, float y) const {
     std::vector<Entry const*> live;
     for (auto const& e : m_entries) if (!e.leaving) live.push_back(&e);

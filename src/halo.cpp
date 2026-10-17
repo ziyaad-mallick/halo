@@ -65,6 +65,7 @@ constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
 // Test hook (HALO_TEST=1): simulate the pointer without touching the real one.
 constexpr UINT kMsgTestMove = WM_APP + 2;   // wParam = pointer x, client px
 constexpr UINT kMsgTestLeave = WM_APP + 3;
+constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
 constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
@@ -123,6 +124,7 @@ private:
     void PointerMove(float x);
     void PointerLeave();
     void Reveal();
+    LRESULT DockIconForWindow(HWND win, LPARAM op);
     void StartHide();
     wuc::CompositionDrawingSurface MakeSurface(Size size);
     wuc::CompositionBrush MakeIconBrush(IconImage const& icon, float size);
@@ -143,6 +145,7 @@ private:
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
     bool m_autoHide = true;  // off under HALO_TEST
+    UINT m_genieMsg = RegisterWindowMessageW(L"Halo.DockIconForWindow");
 
     enum class State { Hidden, Shown, Hiding };
     State m_state = State::Shown;
@@ -475,7 +478,8 @@ void Halo::UpdateRegion() {
 void Halo::Activate(size_t item) {
     Item const& it = m_items[item];
     if (HWND w = it.key.empty() ? nullptr : m_tracker->Front(it.key)) {
-        if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+        // Sent, not ShowWindow'd, so the restore runs in the app and the genie mod can animate it.
+        if (IsIconic(w)) SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
         SetForegroundWindow(w);
     } else if (!it.launch.empty()) {
         ShellExecuteW(nullptr, L"open", it.launch.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -527,6 +531,34 @@ void Halo::StartHide() {
     });
 }
 
+// Cross-process protocol with the Halo Genie Windhawk mod (mods/halo-genie.wh.cpp),
+// which asks where a window's dock icon is so minimize/restore can swoop into it.
+//   message: registered "Halo.DockIconForWindow", sent to the HaloDockWindow
+//   wParam:  the HWND being animated; lParam: 1 minimize, 2 restore, 3 query only
+//   result:  0 = no dock icon for that window, else the icon's rest position
+//            (dock shown, not slid off) in physical screen px, 48 bits:
+//              bits  0..15 icon size (square, unsigned)
+//              bits 16..31 centre x (signed 16-bit; negative on monitors left of the primary)
+//              bits 32..47 centre y (signed 16-bit)
+//   On 1 and 2 the dock is also revealed and held for kGenieHoldMs so the swoop lands on a visible icon.
+LRESULT Halo::DockIconForWindow(HWND win, LPARAM op) {
+    if (!m_dock || !m_tracker) return 0;
+    std::wstring key = m_tracker->KeyOf(win);
+    if (key.empty()) return 0;
+    for (size_t i = 0; i < m_items.size(); i++) {
+        if (m_items[i].key != key) continue;
+        if (op != 3) {
+            Reveal();
+            if (!m_trackingMouse) SetTimer(m_hwnd, kHideTimer, kGenieHoldMs, nullptr);
+        }
+        auto [x, y] = m_dock->RestIconCenter(i);
+        auto pack = [](float v) { return static_cast<ULONGLONG>(static_cast<uint16_t>(static_cast<int16_t>(std::lround(v)))); };
+        ULONGLONG size = static_cast<ULONGLONG>(std::lround(m_metrics.restSize)) & 0xFFFF;
+        return static_cast<LRESULT>(size | pack(x + m_full.left) << 16 | pack(y + m_full.top) << 32);
+    }
+    return 0;
+}
+
 LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) {
         auto* cs = reinterpret_cast<CREATESTRUCTW*>(l);
@@ -541,6 +573,7 @@ LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
+    if (m == m_genieMsg && m) return DockIconForWindow(reinterpret_cast<HWND>(w), l);
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_MOUSEMOVE:

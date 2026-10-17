@@ -154,6 +154,12 @@ HWND WindowTracker::Front(std::wstring const& key) const {
     return nullptr;
 }
 
+std::wstring WindowTracker::KeyOf(HWND hwnd) const {
+    for (auto const& w : m_wins)
+        if (w.hwnd == hwnd) return w.app.key;
+    return {};
+}
+
 void WindowTracker::OnEvent(DWORD event, HWND hwnd) {
     if (event == EVENT_OBJECT_DESTROY) return Remove(hwnd);
     if (GetAncestor(hwnd, GA_PARENT) != GetDesktopWindow()) return;  // controls and other children

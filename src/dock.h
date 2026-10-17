@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <winrt/Windows.Foundation.Numerics.h>
@@ -59,6 +60,10 @@ public:
 
     // Bounces icon `index` three times, or until it is running.
     void Bounce(int index);
+
+    // Where icon `index` (into the last SetItems) is centered with the dock at
+    // rest (no magnification), in the parent's coordinates.
+    std::pair<float, float> RestIconCenter(size_t index) const;
 
     // Width of the pill at rest and at full magnification (with every icon
     // still on its way out counted), for sizing the window's input region.
