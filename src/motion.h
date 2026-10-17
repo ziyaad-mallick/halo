@@ -29,19 +29,24 @@ using winrt::Windows::Foundation::Numerics::float2;
 using winrt::Windows::Foundation::Numerics::float3;
 }  // namespace detail
 
+// Spring animations take IReference<float3> for their start / end values.
+inline winrt::Windows::Foundation::IReference<detail::float3> Ref(detail::float3 v) {
+    return winrt::Windows::Foundation::IReference<detail::float3>(v);
+}
+
 inline void In(detail::wuc::Compositor const& c, detail::wuc::Visual const& v, detail::float3 rest,
                detail::float2 anchor, detail::float2 travel) {
     using namespace std::chrono;
     v.CenterPoint({anchor.x, anchor.y, 0});
     auto slide = c.CreateSpringVector3Animation();
-    slide.InitialValue({rest.x + travel.x, rest.y + travel.y, rest.z});
-    slide.FinalValue(rest);
+    slide.InitialValue(Ref({rest.x + travel.x, rest.y + travel.y, rest.z}));
+    slide.FinalValue(Ref(rest));
     slide.DampingRatio(kDamping);
     slide.Period(milliseconds(kPeriodMs));
     v.StartAnimation(L"Offset", slide);
     auto scale = c.CreateSpringVector3Animation();
-    scale.InitialValue({0.92f, 0.92f, 1.0f});
-    scale.FinalValue({1.0f, 1.0f, 1.0f});
+    scale.InitialValue(Ref({0.92f, 0.92f, 1.0f}));
+    scale.FinalValue(Ref({1.0f, 1.0f, 1.0f}));
     scale.DampingRatio(kDamping);
     scale.Period(milliseconds(kPeriodMs));
     v.StartAnimation(L"Scale", scale);

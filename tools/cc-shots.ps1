@@ -5,7 +5,7 @@
 #   tools/cc-shots.ps1 -Steps open|click|slide|out [-Scale 1.5] [-Tag cc]
 # Clicks are posted straight to the panel window in logical px (x Scale = client px).
 # Output: build/<Tag>-*.png (top-right 460x900 of the primary screen) and build/<Tag>.log.
-param([string]$Exe = '', [string]$Tag = 'cc', [string]$Steps = 'open', [double]$Scale = 1.0)
+param([string]$Exe = '', [string]$Tag = 'cc', [string]$Steps = 'open', [double]$Scale = 1.0, [switch]$Real)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot
 if (!$Exe) { $Exe = Join-Path $repo 'build\halo-cc.exe' }
@@ -17,6 +17,11 @@ public static class T {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   public delegate bool EP(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EP p, IntPtr l);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
@@ -27,7 +32,7 @@ public static class T {
 }
 '@
 [T]::SetProcessDPIAware() | Out-Null
-$env:HALO_TEST = '1'; $env:HALO_TEST_NOHOOK = '1'; $env:HALO_TEST_CC_DRYRUN = '1'
+$env:HALO_TEST = '1'; $env:HALO_TEST_NOHOOK = '1'; if (-not $Real) { $env:HALO_TEST_CC_DRYRUN = '1' } else { Remove-Item Env:HALO_TEST_CC_DRYRUN -ErrorAction SilentlyContinue }
 $p = Start-Process $Exe -PassThru -RedirectStandardError "$Out.log" -WindowStyle Hidden
 Start-Sleep -Seconds 2
 $dock = [T]::Find($p.Id, 'HaloDockWindow')
@@ -56,15 +61,57 @@ try {
   $panel = [T]::Find($p.Id, 'HaloControlCenter')
   "panel=$panel foreground=$([T]::GetForegroundWindow())"
   Shot 'open'
+  # Coordinates are client px of the panel window = panel logical + motion::kPad (16) of margin.
   if ($Steps -match 'click') {
-    Click $panel 80 110; Click $panel 80 144; Click $panel 80 178; Click $panel 80 212; Click $panel 250 120; Click $panel 216 200; Click $panel 40 281; Click $panel 107 281; Click $panel 280 58
+    Click $panel 60 60; Click $panel 221 60; Click $panel 62 134; Click $panel 124 134; Click $panel 186 134; Click $panel 248 134; Click $panel 310 134
     Shot 'clicked'
   }
-  if ($Steps -match 'slide') { Click $panel 150 360; Click $panel 100 438; Shot 'slid' }
-  if ($Steps -match 'wifi') { Click $panel 136 110; Start-Sleep -Seconds 3; Shot 'wifi'; Start-Sleep -Seconds 6; Shot 'wifi2' }
-  if ($Steps -match 'bt') { Click $panel 136 110; Click $panel 136 144; Start-Sleep -Seconds 4; Shot 'bt' }
-  if ($Steps -match 'out') { Click $panel 250 422; Shot 'outs' }
-  if ($Steps -match 'chord') { Click $panel 174 281; Click $panel 240 281; Click $panel 300 281 }
+  if ($Steps -match 'slide') { Click $panel 150 224; Click $panel 100 302; Shot 'slid' }
+  if ($Steps -match 'wifi') { Click $panel 116 60; Start-Sleep -Seconds 3; Shot 'wifi' }
+  if ($Steps -match 'bt') { Click $panel 286 60; Start-Sleep -Seconds 4; Shot 'bt' }
+  if ($Steps -match 'out') { Click $panel 276 271; Shot 'outs' }
+  if ($Steps -match 'chord') { Click $panel 63 465; Click $panel 139 465; Click $panel 215 465; Click $panel 300 465 }
+  if ($Steps -match 'night') {   # -Real only: toggles Night light twice and prints the CloudStore blob each time
+    $nk = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate'
+    function Blob { ((Get-ItemProperty $nk).Data | ForEach-Object { $_.ToString('X2') }) -join ' ' }
+    "night before : $(Blob)"
+    Click $panel 186 134; Start-Sleep -Milliseconds 1500; Shot 'night1'; "night toggle 1: $(Blob)"
+    Click $panel 186 134; Start-Sleep -Milliseconds 1500; Shot 'night2'; "night toggle 2: $(Blob)"
+  }
+  if ($Steps -match 'nightone') { Click $panel 186 134; Start-Sleep -Milliseconds 1500 }   # -Real only: one Night light toggle
+  if ($Steps -match 'darkmode') {   # -Real only
+    $tk = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+    function Theme { $v = Get-ItemProperty $tk; "Apps=$($v.AppsUseLightTheme) System=$($v.SystemUsesLightTheme)" }
+    "dark before : $(Theme)"
+    Click $panel 248 134; Start-Sleep -Milliseconds 1500; Shot 'dark1'; "dark toggle 1: $(Theme)"
+    Click $panel 248 134; Start-Sleep -Milliseconds 1500; Shot 'dark2'; "dark toggle 2: $(Theme)"
+  }
+  if ($Steps -match 'hover') {   # hover the Night light circle, press it without releasing, then hover the Cast tile
+    # WM_MOUSELEAVE fires at once for a synthetic move unless the real cursor is over the window, so park it there.
+    $r = New-Object T+RECT; [T]::GetWindowRect($panel, [ref]$r) | Out-Null; $cp = New-Object T+POINT; [T]::GetCursorPos([ref]$cp) | Out-Null
+    function At($lx, $ly) { [T]::SetCursorPos($r.L + [int]($lx * $Scale), $r.T + [int]($ly * $Scale)) | Out-Null; $l = [IntPtr](([int]($ly * $Scale) -shl 16) -bor [int]($lx * $Scale)); $l }
+    $l = At 186 134
+    [T]::PostMessage($panel, 0x200, [IntPtr]0, $l) | Out-Null; Start-Sleep -Milliseconds 400; Shot 'hover'
+    [T]::PostMessage($panel, 0x201, [IntPtr]1, $l) | Out-Null; Start-Sleep -Milliseconds 250; Shot 'press'
+    [T]::PostMessage($panel, 0x202, [IntPtr]0, $l) | Out-Null; Start-Sleep -Milliseconds 400
+    $l2 = At 139 465
+    [T]::PostMessage($panel, 0x200, [IntPtr]0, $l2) | Out-Null; Start-Sleep -Milliseconds 400; Shot 'hover2'
+    [T]::SetCursorPos($cp.X, $cp.Y) | Out-Null
+  }
+  if ($Steps -match 'anim') {   # frames of the close bounce, then of the open bounce
+    [T]::PostMessage($dock, 0x8000 + 20, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    foreach ($ms in 40, 50, 60, 70) { Start-Sleep -Milliseconds $ms; Shot "close$ms" }
+    Start-Sleep -Milliseconds 600
+    [T]::PostMessage($dock, 0x8000 + 20, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    foreach ($ms in 30, 40, 60, 80) { Start-Sleep -Milliseconds $ms; Shot "open$ms" }
+    Start-Sleep -Milliseconds 600
+  }
+  if ($Steps -match 'reopen') {   # open/close cycles in one process: the latency log shows cold vs warm opens
+    1..5 | ForEach-Object {
+      [T]::PostMessage($dock, 0x8000 + 20, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null; Start-Sleep -Milliseconds 700
+      [T]::PostMessage($dock, 0x8000 + 20, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null; Start-Sleep -Milliseconds 700
+    }
+  }
   $mem1 = (Get-Process -Id $p.Id).PrivateMemorySize64 / 1MB
   if ($Steps -match 'esc') {
     [T]::PostMessage($panel, 0x100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null

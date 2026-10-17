@@ -100,6 +100,8 @@ std::wstring ConnectedSsid();  // empty when not on Wi-Fi
 // ---- Quick toggles ------------------------------------------------------------------------
 bool ReadDarkMode();
 void SetDarkMode(bool on);  // apps + system theme, then broadcasts the change
+bool ReadNightLight();      // CloudStore blob; see services.cpp
+void SetNightLight(bool on);
 bool ReadEnergySaver();     // battery saver active (toggling is the Settings page: ms-settings:batterysaver)
 bool HotspotAvailable();
 bool ReadHotspot();
