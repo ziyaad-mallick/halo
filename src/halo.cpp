@@ -10,6 +10,7 @@
 #include <dispatcherqueue.h>
 #include <windows.ui.composition.interop.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.h>
@@ -24,6 +25,7 @@
 #include <memory>
 #include <shellapi.h>
 #include <string>
+#include <utility>
 #include <vector>
 #include "apps.h"
 #include "dock.h"
@@ -53,7 +55,6 @@ using winrt::Windows::Foundation::Size;
 namespace {
 
 // Settings
-constexpr bool kAutoHide = true;
 constexpr UINT kHideDelayMs = 500;        // cursor must stay away this long before hiding
 constexpr float kSpringDamping = 0.72f;   // < 1 overshoots slightly
 constexpr int kSpringPeriodMs = 55;       // lower = snappier
@@ -61,6 +62,9 @@ constexpr int kHideDurationMs = 200;
 constexpr int kStripPx = 2;               // hit strip left on the screen edge while hidden
 
 constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
+// Test hook (HALO_TEST=1): simulate the pointer without touching the real one.
+constexpr UINT kMsgTestMove = WM_APP + 2;   // wParam = pointer x, client px
+constexpr UINT kMsgTestLeave = WM_APP + 3;
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
 constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
@@ -110,11 +114,14 @@ private:
     void InitComposition();
     void InitGraphics();
     wuc::ContainerVisual BuildPill();
+    wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
     void RefreshDock();
-    void Layout(size_t icons);
+    void UpdateRegion();
     wuc::CompositionBrush IconBrushFor(std::wstring const& path);
     void Activate(size_t item);
+    void PointerMove(float x);
+    void PointerLeave();
     void Reveal();
     void StartHide();
     wuc::CompositionDrawingSurface MakeSurface(Size size);
@@ -134,11 +141,13 @@ private:
     std::unique_ptr<WindowTracker> m_tracker;
     std::unique_ptr<Dock> m_dock;
     bool m_trackingMouse = false;
+    int m_pressed = -1;  // the icon the mouse button went down on
+    bool m_autoHide = true;  // off under HALO_TEST
 
     enum class State { Hidden, Shown, Hiding };
     State m_state = State::Shown;
     unsigned m_hideGen = 0;  // invalidates a hide batch that a reveal interrupted
-    RECT m_monitor{}, m_full{}, m_strip{};
+    RECT m_monitor{}, m_full{};
     wuc::ContainerVisual m_slide{nullptr};  // the dock's parent; its Offset.Y slides the dock off-screen
 
     winrt::Windows::System::DispatcherQueueController m_dq{nullptr};
@@ -153,6 +162,7 @@ private:
 
 bool Halo::Create(HINSTANCE inst) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    m_autoHide = !_wgetenv(L"HALO_TEST");
 
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = WndProc;
@@ -170,30 +180,33 @@ bool Halo::Create(HINSTANCE inst) {
 
     Step(L"pinned apps", [&] { m_apps = LoadPinnedApps(); });
 
-    // Metrics in physical px. The window is tall enough for a fully
-    // magnified icon above the pill.
-    m_metrics.restSize = m_scale.f(44);
+    // Metrics in physical px. The window is as wide as the monitor and tall
+    // enough for a fully magnified, bouncing icon above the pill; only the
+    // dock's part of it takes input (UpdateRegion), so it never has to resize.
+    m_metrics.restSize = m_scale.f(28);
     m_metrics.gap = m_scale.f(10);
-    m_metrics.maxScale = 1.6f;
-    m_metrics.radius = m_scale.f(130);
-    m_metrics.padding = m_scale.f(12);
-    m_metrics.pillHeight = m_scale.f(64);
+    m_metrics.maxScale = 1.57f;
+    m_metrics.radius = m_scale.f(100);
+    m_metrics.padding = m_scale.f(10);
+    m_metrics.pillHeight = m_scale.f(50);
     m_metrics.cornerRadius = m_scale.f(20);
     // The window reaches the monitor's bottom edge so a hiding dock slides
     // fully off-screen; the dock itself sits a margin above it.
-    int margin = m_scale.px(8);
-    m_height = static_cast<int>(
-        std::ceil(m_metrics.pillHeight + m_metrics.restSize * (m_metrics.maxScale - 1) + m_scale.f(16))) + margin;
+    int margin = m_scale.px(6);
+    float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
+    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_metrics.restSize / 2 + m_scale.f(8))) +
+               margin;
     m_metrics.bottom = static_cast<float>(m_height - margin);
     m_monitor = mi.rcMonitor;
-    Layout(m_apps.size());
-    int x = m_full.left, y = m_full.top;
-    RECT const& first = kAutoHide ? m_strip : m_full;
-    if (kAutoHide) m_state = State::Hidden;
+    m_width = m_monitor.right - m_monitor.left;
+    m_metrics.centerX = m_width / 2.0f;
+    int x = m_monitor.left, y = m_monitor.bottom - m_height;
+    m_full = {x, y, x + m_width, y + m_height};
+    if (m_autoHide) m_state = State::Hidden;
 
     m_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                             wc.lpszClassName, L"Halo", WS_POPUP, first.left, first.top, first.right - first.left,
-                             first.bottom - first.top, nullptr, nullptr, inst, this);
+                             wc.lpszClassName, L"Halo", WS_POPUP, x, y, m_width, m_height, nullptr, nullptr, inst,
+                             this);
     if (!m_hwnd) {
         Log(L"CreateWindowEx failed " + std::to_wstring(GetLastError()));
         return false;
@@ -231,7 +244,7 @@ void Halo::InitComposition() {
     m_target.Root(m_root);
     m_slide = m_comp.CreateContainerVisual();
     m_slide.RelativeSizeAdjustment({1, 1});
-    if (kAutoHide) m_slide.Offset({0, static_cast<float>(m_height), 0});
+    if (m_autoHide) m_slide.Offset({0, static_cast<float>(m_height), 0});
     m_root.Children().InsertAtTop(m_slide);
 }
 
@@ -291,8 +304,42 @@ wuc::CompositionBrush Halo::MakeIconBrush(IconImage const& icon, float size) {
     return brush;
 }
 
-// The frosted glass: blurred host backdrop, a dark tint and a 1px top rim.
-// Layers size relative to the container, which the dock resizes and clips.
+// Grayscale noise, drawn once, for the glass's grain.
+wuc::CompositionBrush Halo::MakeNoiseBrush(int w, int h) {
+    auto surface = MakeSurface({static_cast<float>(w), static_cast<float>(h)});
+    auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
+    winrt::com_ptr<ID2D1DeviceContext> dc;
+    POINT offset{};
+    winrt::check_hresult(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset));
+    try {
+        std::vector<uint32_t> px(static_cast<size_t>(w) * h);
+        uint32_t seed = 0x2545F491;
+        for (auto& p : px) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;  // xorshift32
+            uint32_t g = seed & 0xFF;
+            p = 0xFF000000 | g << 16 | g << 8 | g;
+        }
+        winrt::com_ptr<ID2D1Bitmap> bitmap;
+        D2D1_BITMAP_PROPERTIES props =
+            D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, &props, bitmap.put()));
+        D2D1_RECT_F dest = D2D1::RectF(static_cast<float>(offset.x), static_cast<float>(offset.y),
+                                       static_cast<float>(offset.x + w), static_cast<float>(offset.y + h));
+        dc->DrawBitmap(bitmap.get(), &dest, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr, nullptr);
+    } catch (...) {
+        interop->EndDraw();
+        throw;
+    }
+    winrt::check_hresult(interop->EndDraw());
+    auto brush = m_comp.CreateSurfaceBrush(surface);
+    brush.Stretch(wuc::CompositionStretch::None);
+    return brush;
+}
+
+// Quiet Dock's glass: blurred host backdrop, a #16161A tint at 50%, 2.5%
+// grain and a 1px rim whose vertical gradient is bright on top and faintly
+// bright again at the bottom. Layers size relative to the container, which
+// the dock resizes and clips.
 wuc::ContainerVisual Halo::BuildPill() {
     auto pill = m_comp.CreateContainerVisual();
 
@@ -300,7 +347,7 @@ wuc::ContainerVisual Halo::BuildPill() {
     glass.RelativeSizeAdjustment({1, 1});
     Step(L"blur effect brush", [&] {
         auto backdrop = m_comp.CreateHostBackdropBrush();
-        auto blur = winrt::make<halo::GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), 30.0f);
+        auto blur = winrt::make<halo::GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), 40.0f);
         auto factory = m_comp.CreateEffectFactory(blur.as<winrt::Windows::Graphics::Effects::IGraphicsEffect>());
         auto brush = factory.CreateBrush();
         brush.SetSourceParameter(L"backdrop", backdrop);
@@ -313,10 +360,39 @@ wuc::ContainerVisual Halo::BuildPill() {
     tint.Brush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x80, 0x16, 0x16, 0x1A)));
     pill.Children().InsertAtTop(tint);
 
-    auto rim = m_comp.CreateSpriteVisual();
-    rim.RelativeSizeAdjustment({1, 0});
-    rim.Size({0, std::max(1.0f, m_scale.f(1))});
-    rim.Brush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x4D, 0xFF, 0xFF, 0xFF)));
+    Step(L"noise", [&] {
+        auto noise = m_comp.CreateSpriteVisual();
+        noise.RelativeSizeAdjustment({1, 1});
+        noise.Opacity(0.025f);
+        noise.Brush(MakeNoiseBrush(m_monitor.right - m_monitor.left, static_cast<int>(std::ceil(m_metrics.pillHeight))));
+        pill.Children().InsertAtTop(noise);
+    });
+
+    // The rim is a stroke inset by half its width, so it stays inside the clip.
+    const float t = m_scale.f(1);
+    const float r = m_metrics.cornerRadius - t / 2;
+    auto rimShape = m_comp.CreateRoundedRectangleGeometry();
+    rimShape.Offset({t / 2, t / 2});
+    rimShape.CornerRadius({r, r});
+    auto rimSize = m_comp.CreateExpressionAnimation(
+        L"Vector2(pill.Size.X - " + std::to_wstring(t) + L", pill.Size.Y - " + std::to_wstring(t) + L")");
+    rimSize.SetReferenceParameter(L"pill", pill);
+    rimShape.StartAnimation(L"Size", rimSize);
+    auto gradient = m_comp.CreateLinearGradientBrush();
+    gradient.MappingMode(wuc::CompositionMappingMode::Relative);
+    gradient.StartPoint({0, 0});
+    gradient.EndPoint({0, 1});
+    auto stop = [&](float at, uint8_t a) {
+        gradient.ColorStops().Append(
+            m_comp.CreateColorGradientStop(at, winrt::Windows::UI::ColorHelper::FromArgb(a, 0xFF, 0xFF, 0xFF)));
+    };
+    stop(0.0f, 0x70); stop(0.35f, 0x18); stop(0.7f, 0x0A); stop(1.0f, 0x26);
+    auto rimSprite = m_comp.CreateSpriteShape(rimShape);
+    rimSprite.StrokeBrush(gradient);
+    rimSprite.StrokeThickness(t);
+    auto rim = m_comp.CreateShapeVisual();
+    rim.RelativeSizeAdjustment({1, 1});
+    rim.Shapes().Append(rimSprite);
     pill.Children().InsertAtTop(rim);
     return pill;  // the dock places it in the tree
 }
@@ -344,6 +420,9 @@ wuc::CompositionBrush Halo::IconBrushFor(std::wstring const& path) {
 
 // Pinned apps first, then the running apps that aren't pinned.
 void Halo::RefreshDock() {
+    // A new window (Paint, say) can land above us in the topmost band; take the top back
+    // before the slow part, loading its icon.
+    SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     auto running = m_tracker->Apps();
     std::vector<bool> pinned(running.size());
     std::vector<Dock::Item> items;
@@ -360,10 +439,9 @@ void Halo::RefreshDock() {
                 if (item.key.empty()) item.key = r.key;
             }
         }
-        items.push_back({brush, !item.key.empty()});
+        items.push_back({L"p:" + pin.linkPath, brush, !item.key.empty(), false});
         m_items.push_back(item);
     }
-    size_t divider = items.size();
     for (size_t i = 0; i < running.size(); i++) {
         if (pinned[i] || running[i].exe.empty()) continue;
         // Packaged apps' exes often carry no icon; their Start entry has the logo.
@@ -371,30 +449,25 @@ void Halo::RefreshDock() {
         if (!running[i].aumid.empty()) brush = IconBrushFor(L"shell:AppsFolder\\" + running[i].aumid);
         if (!brush) brush = IconBrushFor(running[i].exe);
         if (!brush) continue;
-        items.push_back({brush, true});
+        items.push_back({L"u:" + running[i].key, brush, true, true});
         m_items.push_back({{}, running[i].key});
     }
     Log(std::to_wstring(running.size()) + L" running apps, " + std::to_wstring(items.size()) + L" icons");
-    Layout(items.size());
-    m_dock->SetCenter(m_metrics.centerX);
-    m_dock->SetIcons(items, divider);
+    m_dock->SetItems(items);
+    UpdateRegion();
 }
 
-// Sizes the window for `icons` icons (it must hold the dock at full
-// magnification) and keeps it centered on the monitor.
-void Halo::Layout(size_t icons) {
-    float pitch = m_metrics.restSize + m_metrics.gap;
-    float n = static_cast<float>(std::max<size_t>(icons, 1));
-    float growth = 3.0f * pitch * (m_metrics.maxScale - 1);  // generous bound on how far the wave widens it
-    m_width = static_cast<int>(std::ceil(n * pitch + 2 * m_metrics.padding + growth + m_scale.f(40)));
-    m_metrics.centerX = m_width / 2.0f;
-    int x = m_monitor.left + ((m_monitor.right - m_monitor.left) - m_width) / 2;
-    int y = m_monitor.bottom - m_height;
-    m_full = {x, y, x + m_width, y + m_height};
-    m_strip = {x, m_monitor.bottom - kStripPx, x + m_width, m_monitor.bottom};
-    if (!m_hwnd) return;
-    RECT const& r = m_state == State::Hidden ? m_strip : m_full;
-    SetWindowPos(m_hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+// Limits the window's input to the dock (and the bar of it a hidden dock
+// leaves on the screen edge); clicks anywhere else on the bottom of the
+// screen reach the windows underneath. Takes the width the dock can grow to.
+void Halo::UpdateRegion() {
+    if (!m_dock || !m_hwnd) return;
+    bool hidden = m_state == State::Hidden;
+    float half = (hidden ? m_dock->RestWidth() : m_dock->MaxWidth()) / 2;
+    int left = std::max(0, static_cast<int>(m_metrics.centerX - half));
+    int right = std::min(m_width, static_cast<int>(std::ceil(m_metrics.centerX + half)));
+    SetWindowRgn(m_hwnd, CreateRectRgn(left, hidden ? m_height - kStripPx : 0, right, m_height), TRUE);
+    Log(L"input region x " + std::to_wstring(left) + L".." + std::to_wstring(right) + (hidden ? L" (strip)" : L""));
 }
 
 // macOS: a running app comes to the front (its most recent window,
@@ -406,17 +479,27 @@ void Halo::Activate(size_t item) {
         SetForegroundWindow(w);
     } else if (!it.launch.empty()) {
         ShellExecuteW(nullptr, L"open", it.launch.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        m_dock->Bounce(static_cast<int>(item));
     }
 }
 
-// Shows the full window at once and springs the dock up from wherever it is.
+void Halo::PointerMove(float x) {
+    if (m_autoHide) Reveal();
+    if (m_dock) m_dock->OnPointerMove(x);
+}
+
+void Halo::PointerLeave() {
+    if (m_dock) m_dock->OnPointerLeave();
+    if (m_autoHide && m_state == State::Shown) SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
+}
+
+// Takes input over the whole dock at once and springs it up from wherever it is.
 void Halo::Reveal() {
     KillTimer(m_hwnd, kHideTimer);
     if (m_state == State::Shown) return;
-    if (m_state == State::Hidden)
-        SetWindowPos(m_hwnd, HWND_TOPMOST, m_full.left, m_full.top, m_full.right - m_full.left,
-                     m_full.bottom - m_full.top, SWP_NOACTIVATE);
+    bool wasHidden = m_state == State::Hidden;
     m_state = State::Shown;
+    if (wasHidden) UpdateRegion();
     ++m_hideGen;
     auto spring = m_comp.CreateSpringScalarAnimation();
     spring.FinalValue(0.0f);
@@ -428,6 +511,7 @@ void Halo::Reveal() {
 void Halo::StartHide() {
     if (m_state != State::Shown) return;
     m_state = State::Hiding;
+    if (m_dock) m_dock->OnPointerLeave();  // magnification relaxes as the dock drops
     unsigned gen = ++m_hideGen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     auto slide = m_comp.CreateScalarKeyFrameAnimation();
@@ -439,8 +523,7 @@ void Halo::StartHide() {
     batch.Completed([this, gen](auto&&, auto&&) {
         if (gen != m_hideGen || m_state != State::Hiding) return;  // a reveal took over
         m_state = State::Hidden;
-        SetWindowPos(m_hwnd, HWND_TOPMOST, m_strip.left, m_strip.top, m_strip.right - m_strip.left,
-                     m_strip.bottom - m_strip.top, SWP_NOACTIVATE);
+        UpdateRegion();
     });
 }
 
@@ -465,24 +548,38 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, m_hwnd, 0};
                 m_trackingMouse = TrackMouseEvent(&tme);
             }
-            if (kAutoHide) Reveal();
-            if (m_dock) m_dock->OnPointerMove(mx);
+            PointerMove(mx);
             return 0;
         case WM_MOUSELEAVE:
             m_trackingMouse = false;
-            if (m_dock) m_dock->OnPointerLeave();
-            if (kAutoHide && m_state == State::Shown) SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
+            PointerLeave();
             return 0;
+        case kMsgTestMove: PointerMove(static_cast<float>(w)); return 0;
+        case kMsgTestLeave: PointerLeave(); return 0;
         case WM_TIMER:
             if (w == kHideTimer) {
                 KillTimer(m_hwnd, kHideTimer);
                 StartHide();
             }
             return 0;
-        case WM_LBUTTONUP:
+        case WM_LBUTTONDOWN:
             if (m_dock && m_state == State::Shown) {
-                int i = m_dock->HitTest(mx, my);
-                if (i >= 0 && i < static_cast<int>(m_items.size())) Activate(i);
+                m_pressed = m_dock->HitTest(mx, my);
+                m_dock->SetPressed(m_pressed);
+                if (m_pressed >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
+            }
+            return 0;
+        case WM_LBUTTONUP:
+        case WM_CAPTURECHANGED:
+            if (m_pressed >= 0 && m_dock) {
+                int pressed = std::exchange(m_pressed, -1);
+                m_dock->SetPressed(-1);
+                if (m == WM_LBUTTONUP) {
+                    ReleaseCapture();
+                    if (m_state == State::Shown && m_dock->HitTest(mx, my) == pressed &&
+                        pressed < static_cast<int>(m_items.size()))
+                        Activate(pressed);
+                }
             }
             return 0;
         case kMsgAppsChanged:
