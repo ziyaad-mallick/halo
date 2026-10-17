@@ -30,6 +30,7 @@
 #include "apps.h"
 #include "cluster.h"
 #include "control_center.h"
+#include "notifications.h"
 #include "dock.h"
 #include "effects.h"
 #include "icons.h"
@@ -170,6 +171,7 @@ private:
     std::unique_ptr<halo::Launcher> m_launcher;
     std::unique_ptr<halo::IntellihideDetector> m_intellihide;
     std::unique_ptr<halo::MultiMonitorFollower> m_multimon;
+    std::unique_ptr<halo::NotificationStack> m_notif;  // declared before m_cc: outlives it
     std::unique_ptr<halo::ControlCenter> m_cc;
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
@@ -285,6 +287,11 @@ bool Halo::Create(HINSTANCE inst) {
     if (!RegisterHotKey(m_hwnd, kHotkeyQuit, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_ESCAPE))
         Log(L"RegisterHotKey Ctrl+Win+Esc failed " + std::to_wstring(GetLastError()));
     Step(L"control center", [&] { m_cc = std::make_unique<halo::ControlCenter>(inst, m_hwnd, m_comp, m_gdev); });
+    Step(L"notifications", [&] {
+        m_notif = std::make_unique<halo::NotificationStack>(inst, m_comp, m_gdev);
+        m_cc->onShown = m_cc->onResized = [this] { m_notif->Show(m_cc->PanelRectScreen()); };
+        m_cc->onHidden = [this] { m_notif->Hide(); };
+    });
     if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
     else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
 
@@ -851,7 +858,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
             return 0;
-        case WM_CLOSE: m_cc.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
+        case WM_CLOSE: m_cc.reset(); m_notif.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);
