@@ -1,6 +1,8 @@
-// Notification stack: Windows toast notifications as floating glass cards under the Control Center.
-// Reads them with UserNotificationListener (works unpackaged; see tools/notif_spike.cpp), refreshes when
-// the notification database changes (file change notification, no polling), lives only while shown.
+// Notification Center: a standalone macOS-style panel that slides in from the right edge of the primary
+// monitor: a header ("Notifications" + Clear), floating glass cards grouped by app, and a calendar.
+// Notifications are read with UserNotificationListener (works unpackaged; see tools/notif_spike.cpp) and
+// refreshed when the notification database changes (file change notification, no polling). Everything
+// except that one waiting thread exists only while the panel is open.
 #pragma once
 #include <windows.h>
 #include <winrt/Windows.UI.Composition.h>
@@ -8,13 +10,15 @@
 
 namespace halo {
 
-class NotificationStack {
+class NotificationCenter {
 public:
-    NotificationStack(HINSTANCE inst, winrt::Windows::UI::Composition::Compositor comp,
-                      winrt::Windows::UI::Composition::CompositionGraphicsDevice gdev);
-    ~NotificationStack();
-    void Show(RECT panelScreen);  // idempotent; places the stack under the panel
-    void Hide();
+    NotificationCenter(HINSTANCE inst, HWND owner, winrt::Windows::UI::Composition::Compositor comp,
+                       winrt::Windows::UI::Composition::CompositionGraphicsDevice gdev);
+    ~NotificationCenter();
+    void Toggle();
+    void Open();
+    void Close();
+    bool IsOpen() const;
 
 private:
     struct Impl;

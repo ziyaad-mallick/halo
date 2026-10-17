@@ -83,6 +83,7 @@ constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 // Test hook (HALO_TEST=1): wParam 0 = open the launcher panel without Command Palette, 1 = close it, else Launcher::TestCommand.
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
+constexpr UINT kMsgTestNotifCenter = WM_APP + 21;  // HALO_TEST=1: toggle the Notification Center
 constexpr UINT kMsgTestBounce = WM_APP + 30;  // HALO_TEST=1: wParam = dock item to bounce (no launch)
 constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
@@ -184,7 +185,7 @@ private:
     std::wstring m_previewKey;      // the app the strip shows
     std::unique_ptr<halo::IntellihideDetector> m_intellihide;
     std::unique_ptr<halo::MultiMonitorFollower> m_multimon;
-    std::unique_ptr<halo::NotificationStack> m_notif;  // declared before m_cc: outlives it
+    std::unique_ptr<halo::NotificationCenter> m_notif;
     std::unique_ptr<halo::ControlCenter> m_cc;
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
@@ -310,9 +311,7 @@ bool Halo::Create(HINSTANCE inst) {
         Log(L"RegisterHotKey Ctrl+Win+Esc failed " + std::to_wstring(GetLastError()));
     Step(L"control center", [&] { m_cc = std::make_unique<halo::ControlCenter>(inst, m_hwnd, m_comp, m_gdev); });
     Step(L"notifications", [&] {
-        m_notif = std::make_unique<halo::NotificationStack>(inst, m_comp, m_gdev);
-        m_cc->onShown = m_cc->onResized = [this] { m_notif->Show(m_cc->PanelRectScreen()); };
-        m_cc->onHidden = [this] { m_notif->Hide(); };
+        m_notif = std::make_unique<halo::NotificationCenter>(inst, m_hwnd, m_comp, m_gdev);
     });
     if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
     else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
@@ -890,6 +889,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case kMsgTestControlCenter: if (m_cc && _wgetenv(L"HALO_TEST")) m_cc->Toggle(); return 0;
+        case kMsgTestNotifCenter: if (m_notif && _wgetenv(L"HALO_TEST")) m_notif->Toggle(); return 0;
         case kMsgIntellihideChanged:
             if (w || l) {
                 if (!m_trackingMouse) StartHide();

@@ -3,8 +3,11 @@
 #include <d2d1_1.h>
 #include <dwmapi.h>
 #include <dwrite.h>
+#include <knownfolders.h>
 #include <shellapi.h>
 #include <shellscalingapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 #include <wincodec.h>
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -14,6 +17,7 @@
 #include <winrt/Windows.UI.Composition.Desktop.h>
 #include <winrt/Windows.UI.Notifications.Management.h>
 #include <winrt/Windows.UI.Notifications.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 #include <winrt/Windows.UI.h>
 #include <algorithm>
 #include <atomic>
@@ -25,6 +29,8 @@
 #include <vector>
 
 #include "effects.h"
+#include "icons.h"
+#include "motion.h"
 #include "services.h"
 
 #ifndef HALO_COMPOSITION_INTEROP_DEFINED
@@ -49,19 +55,30 @@ namespace wuc = winrt::Windows::UI::Composition;
 namespace wun = winrt::Windows::UI::Notifications;
 using namespace std::chrono_literals;
 using D2D1::ColorF;
+using winrt::Windows::Foundation::Numerics::float2;
+using winrt::Windows::Foundation::Numerics::float3;
 
 namespace halo {
 namespace {
 
 // Logical px; everything is scaled by the monitor DPI.
-constexpr float kPad = 14, kIcon = 36, kTextX = kPad + kIcon + 10, kRadius = 18, kGap = 8, kBelowPanel = 10, kPeek = 10;
-constexpr float kHeaderY = 12, kTitleY = 29, kBodyY = 47, kLine = 15, kMinH = 62, kCollapseH = 28;
-constexpr int kMaxRows = 7;
+constexpr float kW = 360;             // panel width
+constexpr float kEdge = 10;           // gap to the screen edge (right and top)
+constexpr float kPad = 14, kIcon = 32, kTextX = kPad + kIcon + 10, kRadius = 18, kGap = 10, kPeek = 10;
+constexpr float kHeaderY = 12, kTitleY = 30, kBodyY = 48, kLine = 15, kMinH = 62, kCollapseH = 28;
+constexpr float kHeadH = 38, kMoreH = 28, kEmptyH = 56;
+constexpr float kCalHead = 74, kCalNav = 26, kCalDow = 18, kCalRow = 26, kCalH = kCalHead + kCalNav + 4 + kCalDow + 2 + 6 * kCalRow + 12;
+constexpr int kMaxCards = 6;
 constexpr UINT kMsgData = WM_APP + 1;
 constexpr UINT_PTR kTimerGone = 1, kTimerClose = 2;
 constexpr wchar_t kClass[] = L"HaloNotifications", kMsgClass[] = L"HaloNotificationsMsg";
 
 const D2D1_COLOR_F kText = ColorF(1, 1, 1, 0.94f), kDim = ColorF(1, 1, 1, 0.58f);
+
+struct IconPx {
+    UINT w = 0, h = 0;
+    std::vector<uint32_t> px;  // premultiplied BGRA
+};
 
 struct Notif {
     UINT id = 0;
@@ -70,17 +87,18 @@ struct Notif {
 };
 struct Snapshot {
     std::vector<Notif> items;
-    std::map<std::wstring, std::vector<uint8_t>> logos;  // appKey -> encoded image, first sight only
+    std::map<std::wstring, IconPx> icons;  // appKey -> icon, first sight only
     bool ok = false;
     std::wstring error;
 };
 
+enum class K { Header, Notif, Group, Collapse, More, Empty, Calendar };
+
 // What one card shows.
 struct Row {
     std::wstring key;
-    bool collapse = false;  // the "Show less" pill under an expanded group
-    bool group = false;     // collapsed group head (stack peeks under it)
-    int count = 1;
+    K kind = K::Notif;
+    int count = 1;  // Group: notifications in it. More: how many are not shown.
     std::wstring groupKey;
     std::vector<UINT> ids;  // what the x removes
     Notif n;
@@ -99,9 +117,9 @@ std::wstring Rel(LONGLONG ft) {
     LONGLONG now = (static_cast<LONGLONG>(n.dwHighDateTime) << 32) | n.dwLowDateTime;
     LONGLONG sec = std::max<LONGLONG>(0, (now - ft) / 10000000);
     if (sec < 60) return L"now";
-    if (sec < 3600) return std::to_wstring(sec / 60) + L"m ago";
-    if (sec < 86400) return std::to_wstring(sec / 3600) + L"h ago";
-    return std::to_wstring(sec / 86400) + L"d ago";
+    if (sec < 3600) return std::to_wstring(sec / 60) + L"m";
+    if (sec < 86400) return std::to_wstring(sec / 3600) + L"h";
+    return std::to_wstring(sec / 86400) + L"d";
 }
 
 // Decodes an encoded image to premultiplied BGRA.
@@ -123,14 +141,95 @@ bool Decode(std::vector<uint8_t> const& png, UINT& w, UINT& h, std::vector<uint3
     return SUCCEEDED(cv->CopyPixels(nullptr, w * 4, static_cast<UINT>(px.size() * 4), reinterpret_cast<BYTE*>(px.data())));
 }
 
-struct IconPx {
-    UINT w = 0, h = 0;
-    std::vector<uint32_t> px;
-};
+// Box-filters an icon down to at most 64 px so the card draws it without aliasing.
+void Shrink(IconPx& ic) {
+    if (ic.w <= 64 && ic.h <= 64) return;
+    const UINT nw = std::min<UINT>(ic.w, 64), nh = std::min<UINT>(ic.h, 64);
+    std::vector<uint32_t> out(static_cast<size_t>(nw) * nh);
+    for (UINT y = 0; y < nh; ++y)
+        for (UINT x = 0; x < nw; ++x) {
+            UINT x0 = x * ic.w / nw, x1 = std::max(x0 + 1, (x + 1) * ic.w / nw);
+            UINT y0 = y * ic.h / nh, y1 = std::max(y0 + 1, (y + 1) * ic.h / nh);
+            uint64_t a = 0, r = 0, g = 0, b = 0, n = 0;
+            for (UINT yy = y0; yy < y1; ++yy)
+                for (UINT xx = x0; xx < x1; ++xx) {
+                    uint32_t p = ic.px[static_cast<size_t>(yy) * ic.w + xx];
+                    a += p >> 24; r += (p >> 16) & 0xFF; g += (p >> 8) & 0xFF; b += p & 0xFF; ++n;
+                }
+            out[static_cast<size_t>(y) * nw + x] = static_cast<uint32_t>(a / n) << 24 | static_cast<uint32_t>(r / n) << 16 |
+                                                  static_cast<uint32_t>(g / n) << 8 | static_cast<uint32_t>(b / n);
+        }
+    ic.w = nw; ic.h = nh; ic.px = std::move(out);
+}
+
+// (2) The shell's own AppsFolder item for the AUMID: what Start and the taskbar show.
+bool ShellIcon(std::wstring const& aumid, IconPx& out) {
+    winrt::com_ptr<IShellItem> item;
+    if (FAILED(SHCreateItemInKnownFolder(FOLDERID_AppsFolder, 0, aumid.c_str(), IID_PPV_ARGS(item.put())))) return false;
+    auto factory = item.try_as<IShellItemImageFactory>();
+    if (!factory) return false;
+    HBITMAP hb = nullptr;
+    if (FAILED(factory->GetImage(SIZE{64, 64}, SIIGBF_ICONONLY, &hb)) || !hb) return false;
+    BITMAP bm{};
+    bool ok = false;
+    if (GetObjectW(hb, sizeof bm, &bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
+        const int w = bm.bmWidth, h = bm.bmHeight;
+        HDC dc = CreateCompatibleDC(nullptr);
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4);
+        if (dc && GetDIBits(dc, hb, 0, static_cast<UINT>(h), px.data(), &bmi, DIB_RGB_COLORS)) {
+            bool hasAlpha = false, straight = false;
+            for (size_t i = 0; i + 3 < px.size(); i += 4) {
+                if (px[i + 3]) hasAlpha = true;
+                if (px[i] > px[i + 3] || px[i + 1] > px[i + 3] || px[i + 2] > px[i + 3]) straight = true;
+            }
+            for (size_t i = 0; i + 3 < px.size(); i += 4) {
+                if (!hasAlpha) px[i + 3] = 255;  // an opaque bitmap
+                else if (straight)
+                    for (int c = 0; c < 3; ++c) px[i + c] = static_cast<uint8_t>((px[i + c] * px[i + 3] + 127) / 255);
+            }
+            out.w = w; out.h = h;
+            out.px.resize(static_cast<size_t>(w) * h);
+            memcpy(out.px.data(), px.data(), px.size());
+            ok = true;
+        }
+        if (dc) DeleteDC(dc);
+    }
+    DeleteObject(hb);
+    return ok;
+}
+
+// (3) icons.cpp: the unplated logo from the app's package, else the shell's jumbo icon.
+bool PackagedIcon(std::wstring const& aumid, IconPx& out) {
+    IconImage im;
+    if (!LoadJumboIcon(L"shell:AppsFolder\\" + aumid, im, true) || im.width <= 0 || im.height <= 0) return false;
+    out.w = im.width; out.h = im.height;
+    out.px.resize(static_cast<size_t>(im.width) * im.height);
+    memcpy(out.px.data(), im.bgra.data(), out.px.size() * 4);
+    Shrink(out);
+    return true;
+}
+
+// A few system toasts use a pseudo AUMID that has no AppsFolder entry; map them to the app that owns them.
+std::wstring Alias(std::wstring const& aumid) {
+    if (aumid == L"Windows.Defender.SecurityCenter") return L"Microsoft.SecHealthUI_8wekyb3d8bbwe!SecHealthUI";
+    return aumid;
+}
+
+int DaysIn(int y, int m) {
+    static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    return m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 29 : d[m - 1];
+}
 
 }  // namespace
 
-struct NotificationStack::Impl {
+struct NotificationCenter::Impl {
     HINSTANCE inst;
     wuc::Compositor comp;
     wuc::CompositionGraphicsDevice gdev;
@@ -149,7 +248,7 @@ struct NotificationStack::Impl {
     HANDLE evStop{}, evReq{};
     std::atomic<bool> visible{false};
 
-    // ---- window + cards (exist only while shown) ----
+    // ---- window + cards (exist only while open) ----
     struct Card {
         Row row;
         std::wstring sig;
@@ -161,42 +260,56 @@ struct NotificationStack::Impl {
     };
     enum class St { Closed, Open, Closing } st = St::Closed;
     HWND hwnd{};
-    float s = 1, W = 336;
-    RECT panel{};
+    float s = 1;
+    RECT work{};
+    float availH = 800;  // logical px a column of content may use
     wuc::Desktop::DesktopWindowTarget target{nullptr};
-    wuc::ContainerVisual root{nullptr};
+    wuc::ContainerVisual root{nullptr}, panelVis{nullptr};
     wuc::CompositionBrush noise{nullptr};
     std::vector<Card> cards;
     std::vector<Card> dying;
-    float totalH = 0;
-    int hoverCard = -1;
-    bool hoverClose = false, tracking = false;
+    float totalH = 0, winH = 0;
+    int hoverCard = -1, hoverPart = 0;
+    bool tracking = false;
+
+    // calendar
+    SYSTEMTIME today{};
+    int calYear = 0, calMonth = 0;
+    D2D1_COLOR_F accent = ColorF(0.04f, 0.52f, 1.0f, 1);
 
     winrt::com_ptr<IDWriteFactory> dw;
-    winrt::com_ptr<IDWriteTextFormat> fApp, fTime, fTitle, fBody, fPill, fCount;
+    winrt::com_ptr<IDWriteTextFormat> fApp, fTime, fTitle, fBody, fPill, fCount, fHead, fClear, fBig, fCalDow, fNav, fDay, fDayB, fDow;
 
     Impl(HINSTANCE i, wuc::Compositor c, wuc::CompositionGraphicsDevice g) : inst(i), comp(std::move(c)), gdev(std::move(g)) {}
 
     void Start();
     void Stop();
     void Worker();
-    Snapshot Query(std::set<std::wstring>& logoDone);
+    Snapshot Query(std::set<std::wstring>& iconDone);
     void OnSnapshot(Snapshot& snap);
 
-    void Show(RECT p);
-    void Hide();
+    void Open();
+    void Close();
     void Teardown();
+    void Focus();
     void BuildFonts();
     std::vector<Row> BuildRows();
     void Update(bool firstShow);
     void CreateCard(Card& c);
-    void Draw(Card& c, bool hover, bool closeHover);
+    void Draw(Card& c, bool hover, int part);
+    void DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, bool hover, bool closeHover);
+    void DrawHeader(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, int part);
+    void DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, int part);
     void Place();
+    float2 Anchor() const { return {(kW + motion::kPad) * s, (totalH / 2 + motion::kPad) * s}; }
     void AnimateIn(Card& c, int order);
     void AnimateOut(Card& c);
-    int CardAt(float x, float y, bool* onClose);
+    int CardAt(float x, float y, int* part);
+    int Visible() const;
     void Dismiss(Row const& r);
     void Activate(Row const& r);
+    void ClearAll();
+    void ShiftMonth(int d);
     float MeasureBody(std::wstring& body, float width, int* lines);
     wuc::CompositionBrush NoiseBrush(int w, int h);
 
@@ -208,10 +321,10 @@ struct NotificationStack::Impl {
 // ---------------------------------------------------------------------------------------------
 // worker: listener queries, woken by a change notification on the notification database folder
 
-Snapshot NotificationStack::Impl::Query(std::set<std::wstring>& logoDone) {
+Snapshot NotificationCenter::Impl::Query(std::set<std::wstring>& iconDone) {
     Snapshot snap;
     try {
-            auto l = wun::Management::UserNotificationListener::Current();
+        auto l = wun::Management::UserNotificationListener::Current();
         if (l.GetAccessStatus() != wun::Management::UserNotificationListenerAccessStatus::Allowed) {
             auto a = l.RequestAccessAsync().get();
             if (a != wun::Management::UserNotificationListenerAccessStatus::Allowed) {
@@ -219,8 +332,8 @@ Snapshot NotificationStack::Impl::Query(std::set<std::wstring>& logoDone) {
                 return snap;
             }
         }
-            auto list = l.GetNotificationsAsync(wun::NotificationKinds::Toast).get();
-            for (auto const& un : list) {
+        auto list = l.GetNotificationsAsync(wun::NotificationKinds::Toast).get();
+        for (auto const& un : list) {
             Notif n;
             n.id = un.Id();
             auto info = un.AppInfo();
@@ -231,7 +344,7 @@ Snapshot NotificationStack::Impl::Query(std::set<std::wstring>& logoDone) {
                 FILETIME f = winrt::clock::to_file_time(un.CreationTime());
                 n.ft = (static_cast<LONGLONG>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
             }
-                    std::vector<std::wstring> texts;
+            std::vector<std::wstring> texts;
             try {
                 auto vis = un.Notification().Visual();
                 auto b = vis.GetBinding(L"ToastGeneric");
@@ -244,13 +357,18 @@ Snapshot NotificationStack::Impl::Query(std::set<std::wstring>& logoDone) {
             } catch (...) {}
             if (!texts.empty()) n.title = texts[0];
             for (size_t i = 1; i < texts.size(); ++i) n.body += (i > 1 ? L"\n" : L"") + texts[i];
-                    snap.items.push_back(std::move(n));
-            auto const& k = snap.items.back().appKey;
-            if (!logoDone.count(k)) {
-                logoDone.insert(k);
-                try {
-                                    auto ref = info.DisplayInfo().GetLogo({72, 72});
-                    if (!ref) continue;  // some apps (Windows Security) have no logo: null, not an error
+            snap.items.push_back(std::move(n));
+            auto const& cur = snap.items.back();
+            if (iconDone.count(cur.appKey)) continue;
+            iconDone.insert(cur.appKey);
+
+            // Icon sources, in order: (1) AppInfo logo, (2) the shell's AppsFolder item, (3) the package's
+            // own logo; only then does the card draw a letter tile. Cached per app key.
+            IconPx ic;
+            const wchar_t* src = nullptr;
+            try {
+                auto ref = info.DisplayInfo().GetLogo({72, 72});  // null for some apps (Windows Security)
+                if (ref) {
                     auto stream = ref.OpenReadAsync().get();
                     winrt::Windows::Storage::Streams::DataReader rd(stream);
                     auto size = static_cast<uint32_t>(stream.Size());
@@ -258,10 +376,20 @@ Snapshot NotificationStack::Impl::Query(std::set<std::wstring>& logoDone) {
                         rd.LoadAsync(size).get();
                         std::vector<uint8_t> bytes(size);
                         rd.ReadBytes(bytes);
-                        snap.logos[k] = std::move(bytes);
+                        if (Decode(bytes, ic.w, ic.h, ic.px)) src = L"AppInfo.GetLogo";
                     }
-                } catch (...) {}
+                }
+            } catch (...) {}
+            if (!src && !cur.aumid.empty()) {
+                ic = {};
+                if (ShellIcon(Alias(cur.aumid), ic)) src = L"shell AppsFolder GetImage";
             }
+            if (!src && !cur.aumid.empty()) {
+                ic = {};
+                if (PackagedIcon(Alias(cur.aumid), ic)) src = L"packaged logo (icons.cpp)";
+            }
+            svc::Log(L"notifications: icon key=" + cur.appKey + L" app=" + cur.app + L" source=" + (src ? src : L"NONE (letter tile)"));
+            if (src) snap.icons[cur.appKey] = std::move(ic);
         }
         snap.ok = true;
     } catch (winrt::hresult_error const& e) {
@@ -270,36 +398,34 @@ Snapshot NotificationStack::Impl::Query(std::set<std::wstring>& logoDone) {
     return snap;
 }
 
-void NotificationStack::Impl::Worker() {
+// The thread sleeps on the folder watch; a change while the panel is closed is re-armed and ignored.
+void NotificationCenter::Impl::Worker() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     wchar_t local[MAX_PATH] = L"";
     GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
     std::wstring dir = std::wstring(local) + L"\\Microsoft\\Windows\\Notifications";
     HANDLE watch = FindFirstChangeNotificationW(dir.c_str(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
     if (watch == INVALID_HANDLE_VALUE) { svc::Log(L"notifications: cannot watch " + dir); watch = nullptr; }
-    std::set<std::wstring> logoDone;
-    bool prefetch = true;  // one read at startup so the first open is instant
+    std::set<std::wstring> iconDone;
     HANDLE h[3] = {evStop, evReq, watch};
     for (;;) {
-        DWORD r = prefetch ? WAIT_OBJECT_0 + 1 : WaitForMultipleObjects(watch ? 3 : 2, h, FALSE, INFINITE);
-        bool pf = prefetch;
-        prefetch = false;
+        DWORD r = WaitForMultipleObjects(watch ? 3 : 2, h, FALSE, INFINITE);
         if (r == WAIT_OBJECT_0) break;
         if (r == WAIT_OBJECT_0 + 2) {
             FindNextChangeNotification(watch);
-            if (!visible) continue;  // the next Show asks for a fresh read anyway
+            if (!visible) continue;  // the next Open asks for a fresh read anyway
             // The database writes in bursts; settle first.
             for (int i = 0; i < 10 && WaitForSingleObject(watch, 250) == WAIT_OBJECT_0; ++i) FindNextChangeNotification(watch);
             svc::Log(L"notifications: database changed");
         }
         if (!visible) continue;
-            auto* snap = new Snapshot(Query(logoDone));
+        auto* snap = new Snapshot(Query(iconDone));
         if (!msgWnd || !PostMessageW(msgWnd, kMsgData, 0, reinterpret_cast<LPARAM>(snap))) delete snap;
     }
     if (watch) FindCloseChangeNotification(watch);
 }
 
-void NotificationStack::Impl::Start() {
+void NotificationCenter::Impl::Start() {
     dry = _wgetenv(L"HALO_TEST") || _wgetenv(L"HALO_NOTIF_DRYRUN");
     WNDCLASSEXW wc{sizeof(wc)};
     wc.hInstance = inst;
@@ -316,7 +442,7 @@ void NotificationStack::Impl::Start() {
     worker = std::thread([this] { Worker(); });
 }
 
-void NotificationStack::Impl::Stop() {
+void NotificationCenter::Impl::Stop() {
     Teardown();
     SetEvent(evStop);
     if (worker.joinable()) worker.join();
@@ -327,7 +453,7 @@ void NotificationStack::Impl::Stop() {
     CloseHandle(evReq);
 }
 
-LRESULT CALLBACK NotificationStack::Impl::MsgThunk(HWND h, UINT m, WPARAM w, LPARAM l) {
+LRESULT CALLBACK NotificationCenter::Impl::MsgThunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     if (m == kMsgData) {
@@ -338,12 +464,9 @@ LRESULT CALLBACK NotificationStack::Impl::MsgThunk(HWND h, UINT m, WPARAM w, LPA
     return DefWindowProcW(h, m, w, l);
 }
 
-void NotificationStack::Impl::OnSnapshot(Snapshot& snap) {
+void NotificationCenter::Impl::OnSnapshot(Snapshot& snap) {
     if (!snap.ok) { svc::Log(L"notifications: read failed: " + snap.error); return; }
-    for (auto& [k, bytes] : snap.logos) {
-        IconPx ic;
-        if (Decode(bytes, ic.w, ic.h, ic.px)) icons[k] = std::move(ic);
-    }
+    for (auto& [k, ic] : snap.icons) icons[k] = std::move(ic);
     std::sort(snap.items.begin(), snap.items.end(), [](Notif const& a, Notif const& b) { return a.ft > b.ft; });
     all = std::move(snap.items);
     std::set<UINT> present;
@@ -357,7 +480,14 @@ void NotificationStack::Impl::OnSnapshot(Snapshot& snap) {
 // ---------------------------------------------------------------------------------------------
 // view model
 
-std::vector<Row> NotificationStack::Impl::BuildRows() {
+int NotificationCenter::Impl::Visible() const {
+    int n = 0;
+    for (auto const& x : all) n += hidden.count(x.id) ? 0 : 1;
+    return n;
+}
+
+// Notification rows only (header, "more" and calendar are added by Update).
+std::vector<Row> NotificationCenter::Impl::BuildRows() {
     // Groups ordered by their newest notification.
     std::vector<std::wstring> order;
     std::map<std::wstring, std::vector<Notif const*>> groups;
@@ -382,14 +512,14 @@ std::vector<Row> NotificationStack::Impl::BuildRows() {
             if (g.size() > 1) {
                 Row r;
                 r.key = L"c" + k;
-                r.collapse = true;
+                r.kind = K::Collapse;
                 r.groupKey = k;
                 rows.push_back(std::move(r));
             }
         } else {
             Row r;
             r.key = L"g" + k;
-            r.group = true;
+            r.kind = K::Group;
             r.groupKey = k;
             r.count = static_cast<int>(g.size());
             for (auto* n : g) r.ids.push_back(n->id);
@@ -400,7 +530,7 @@ std::vector<Row> NotificationStack::Impl::BuildRows() {
     return rows;
 }
 
-float NotificationStack::Impl::MeasureBody(std::wstring& body, float width, int* lines) {
+float NotificationCenter::Impl::MeasureBody(std::wstring& body, float width, int* lines) {
     *lines = 0;
     if (body.empty() || !fBody) return 0;
     for (int guard = 0; guard < 40; ++guard) {
@@ -423,52 +553,83 @@ float NotificationStack::Impl::MeasureBody(std::wstring& body, float width, int*
     return kLine * 2;
 }
 
+void NotificationCenter::Impl::ShiftMonth(int d) {
+    int m = calMonth + d, y = calYear;
+    if (m < 1) { m = 12; --y; }
+    if (m > 12) { m = 1; ++y; }
+    calYear = y; calMonth = m;
+    for (auto& c : cards)
+        if (c.row.kind == K::Calendar) Draw(c, false, 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // window
 
-LRESULT CALLBACK NotificationStack::Impl::Thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
+LRESULT CALLBACK NotificationCenter::Impl::Thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     return self ? self->Proc(h, m, w, l) : DefWindowProcW(h, m, w, l);
 }
 
-int NotificationStack::Impl::CardAt(float x, float y, bool* onClose) {
-    if (onClose) *onClose = false;
+// x, y in panel coordinates (logical). part: 0 body, 1 x, 2 Clear, 3 prev month, 4 next month, 5 month label, -1 inert.
+int NotificationCenter::Impl::CardAt(float x, float y, int* part) {
+    if (part) *part = -1;
     for (size_t i = 0; i < cards.size(); ++i) {
         auto const& r = cards[i].row;
-        if (x < 0 || x >= W || y < r.y || y >= r.y + r.h) continue;
-        if (onClose && !r.collapse) {
-            float cx = W - kPad - 9, cy = r.y + 20;
-            *onClose = (x - cx) * (x - cx) + (y - cy) * (y - cy) <= 11 * 11;
+        if (cards[i].gone || x < 0 || x >= kW || y < r.y || y >= r.y + r.h) continue;
+        if (!part) return static_cast<int>(i);
+        const float ly = y - r.y;
+        switch (r.kind) {
+            case K::Notif: case K::Group: {
+                float cx = kW - kPad - 9, cy = kHeaderY + 8;
+                *part = (x - cx) * (x - cx) + (ly - cy) * (ly - cy) <= 11 * 11 ? 1 : 0;
+                break;
+            }
+            case K::Collapse: *part = 0; break;
+            case K::Header: *part = Visible() && x >= kW - kPad - 58 - 4 ? 2 : -1; break;
+            case K::Calendar: {
+                const float ny = kCalHead;
+                if (ly >= ny && ly < ny + kCalNav) {
+                    float nx1 = kW - kPad - 26, nx0 = nx1 - 28;
+                    *part = x >= nx1 ? 4 : x >= nx0 ? 3 : x < kW / 2 ? 5 : -1;
+                }
+                break;
+            }
+            default: break;
         }
         return static_cast<int>(i);
     }
     return -1;
 }
 
-LRESULT NotificationStack::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    const float x = static_cast<short>(LOWORD(l)) / s, y = static_cast<short>(HIWORD(l)) / s;
+LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    const float x = static_cast<short>(LOWORD(l)) / s - motion::kPad, y = static_cast<short>(HIWORD(l)) / s - motion::kPad;
     switch (m) {
         case WM_ERASEBKGND: return 1;
-        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;  // never steal focus: the Control Center closes when it loses it
+        case WM_ACTIVATE:
+            if (LOWORD(w) == WA_INACTIVE && st == St::Open) Close();  // clicked outside
+            return 0;
+        case WM_KEYDOWN:
+            if (w == VK_ESCAPE) Close();
+            return 0;
         case WM_NCHITTEST: {
             POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
             ScreenToClient(h, &p);
-            return CardAt(p.x / s, p.y / s, nullptr) >= 0 ? HTCLIENT : HTTRANSPARENT;
+            return CardAt(p.x / s - motion::kPad, p.y / s - motion::kPad, nullptr) >= 0 ? HTCLIENT : HTTRANSPARENT;
         }
         case WM_MOUSEMOVE: {
             if (!tracking && !_wgetenv(L"HALO_TEST")) {  // test hook: posted moves must not be undone by a real WM_MOUSELEAVE
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
                 tracking = TrackMouseEvent(&tme);
             }
-            bool cl = false;
-            int i = CardAt(x, y, &cl);
-            if (i != hoverCard || cl != hoverClose) {
+            int part = -1;
+            int i = CardAt(x, y, &part);
+            if (i != hoverCard || part != hoverPart) {
                 int old = hoverCard;
                 hoverCard = i;
-                hoverClose = cl;
-                if (old >= 0 && old < static_cast<int>(cards.size())) Draw(cards[old], false, false);
-                if (i >= 0) Draw(cards[i], true, cl);
+                hoverPart = part;
+                if (old >= 0 && old < static_cast<int>(cards.size())) Draw(cards[old], false, -1);
+                if (i >= 0) Draw(cards[i], true, part);
             }
             return 0;
         }
@@ -476,20 +637,28 @@ LRESULT NotificationStack::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             tracking = false;
             int old = hoverCard;
             hoverCard = -1;
-            hoverClose = false;
-            if (old >= 0 && old < static_cast<int>(cards.size())) Draw(cards[old], false, false);
+            hoverPart = -1;
+            if (old >= 0 && old < static_cast<int>(cards.size())) Draw(cards[old], false, -1);
             return 0;
         }
         case WM_LBUTTONDOWN: {
             if (st != St::Open) return 0;
-            bool cl = false;
-            int i = CardAt(x, y, &cl);
+            int part = -1;
+            int i = CardAt(x, y, &part);
             if (i < 0) return 0;
             Row r = cards[i].row;  // copy: Update() rebuilds the cards
-            if (r.collapse) { expanded.erase(r.groupKey); Update(false); }
-            else if (cl) Dismiss(r);
-            else if (r.group) { expanded.insert(r.groupKey); Update(false); }
-            else Activate(r);
+            switch (r.kind) {
+                case K::Collapse: expanded.erase(r.groupKey); Update(false); break;
+                case K::Notif: if (part == 1) Dismiss(r); else Activate(r); break;
+                case K::Group: if (part == 1) Dismiss(r); else { expanded.insert(r.groupKey); Update(false); } break;
+                case K::Header: if (part == 2) ClearAll(); break;
+                case K::Calendar:
+                    if (part == 3) ShiftMonth(-1);
+                    else if (part == 4) ShiftMonth(1);
+                    else if (part == 5) { calYear = today.wYear; calMonth = today.wMonth; ShiftMonth(0); }
+                    break;
+                default: break;
+            }
             return 0;
         }
         case WM_TIMER:
@@ -501,11 +670,12 @@ LRESULT NotificationStack::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 Teardown();
             }
             return 0;
+        case WM_NCDESTROY: hwnd = nullptr; break;
     }
     return DefWindowProcW(h, m, w, l);
 }
 
-void NotificationStack::Impl::Dismiss(Row const& r) {
+void NotificationCenter::Impl::Dismiss(Row const& r) {
     for (UINT id : r.ids) {
         hidden.insert(id);
         if (dry) { svc::Log(L"notifications: DRY RUN, would remove id " + std::to_wstring(id)); continue; }
@@ -516,7 +686,15 @@ void NotificationStack::Impl::Dismiss(Row const& r) {
     Update(false);
 }
 
-void NotificationStack::Impl::Activate(Row const& r) {
+void NotificationCenter::Impl::ClearAll() {
+    Row r;
+    for (auto const& n : all)
+        if (!hidden.count(n.id)) r.ids.push_back(n.id);
+    svc::Log(L"notifications: clear all (" + std::to_wstring(r.ids.size()) + L")");
+    Dismiss(r);
+}
+
+void NotificationCenter::Impl::Activate(Row const& r) {
     if (dry) { svc::Log(L"notifications: DRY RUN, would open " + r.n.aumid + L" and remove id " + std::to_wstring(r.n.id)); return; }
     if (!r.n.aumid.empty()) {
         auto res = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + r.n.aumid).c_str(), nullptr, nullptr, SW_SHOWNORMAL));
@@ -525,13 +703,13 @@ void NotificationStack::Impl::Activate(Row const& r) {
     Dismiss(r);  // Windows removes a toast once it has been clicked
 }
 
-void NotificationStack::Impl::BuildFonts() {
+void NotificationCenter::Impl::BuildFonts() {
     if (dw) return;
     winrt::check_hresult(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dw.put())));
-    auto mk = [&](winrt::com_ptr<IDWriteTextFormat>& out, DWRITE_FONT_WEIGHT wt, float size, DWRITE_TEXT_ALIGNMENT al, bool wrap) {
+    auto mk = [&](winrt::com_ptr<IDWriteTextFormat>& out, DWRITE_FONT_WEIGHT wt, float size, DWRITE_TEXT_ALIGNMENT al, bool wrap, bool mid = false) {
         winrt::check_hresult(dw->CreateTextFormat(L"Segoe UI Variable Text", nullptr, wt, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", out.put()));
         out->SetTextAlignment(al);
-        out->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        out->SetParagraphAlignment(mid ? DWRITE_PARAGRAPH_ALIGNMENT_CENTER : DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         out->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
         if (!wrap) {
             winrt::com_ptr<IDWriteInlineObject> sign;
@@ -540,17 +718,24 @@ void NotificationStack::Impl::BuildFonts() {
         }
     };
     const auto SB = DWRITE_FONT_WEIGHT_SEMI_BOLD, R = DWRITE_FONT_WEIGHT_NORMAL;
-    mk(fApp, SB, 11, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+    const auto L_ = DWRITE_TEXT_ALIGNMENT_LEADING, C = DWRITE_TEXT_ALIGNMENT_CENTER;
+    mk(fApp, SB, 11, L_, false);
     mk(fTime, R, 11, DWRITE_TEXT_ALIGNMENT_TRAILING, false);
-    mk(fTitle, SB, 12.5f, DWRITE_TEXT_ALIGNMENT_LEADING, false);
-    mk(fBody, R, 11.5f, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-    mk(fPill, SB, 11.5f, DWRITE_TEXT_ALIGNMENT_CENTER, false);
-    mk(fCount, SB, 10.5f, DWRITE_TEXT_ALIGNMENT_CENTER, false);
-    fPill->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fCount->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    mk(fTitle, SB, 12.5f, L_, false);
+    mk(fBody, R, 11.5f, L_, true);
+    mk(fPill, SB, 11.5f, C, false, true);
+    mk(fCount, SB, 10.5f, C, false, true);
+    mk(fHead, SB, 15, L_, false, true);
+    mk(fClear, SB, 12, C, false, true);
+    mk(fBig, SB, 28, L_, false);
+    mk(fCalDow, SB, 11.5f, L_, false);
+    mk(fNav, SB, 13, L_, false, true);
+    mk(fDay, R, 12.5f, C, false, true);
+    mk(fDayB, SB, 12.5f, C, false, true);
+    mk(fDow, SB, 10.5f, C, false, true);
 }
 
-wuc::CompositionBrush NotificationStack::Impl::NoiseBrush(int w, int h) {
+wuc::CompositionBrush NotificationCenter::Impl::NoiseBrush(int w, int h) {
     auto surface = gdev.CreateDrawingSurface({static_cast<float>(w), static_cast<float>(h)},
                                              winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                                              winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
@@ -586,13 +771,14 @@ wuc::CompositionBrush NotificationStack::Impl::NoiseBrush(int w, int h) {
 
 // Same glass recipe as the dock pill and the Control Center: blurred backdrop, #16161A tint at 50%,
 // 2.5% grain, 1 px gradient rim.
-void NotificationStack::Impl::CreateCard(Card& c) {
-    const float wPx = std::ceil(W * s), hPx = std::ceil(c.row.h * s);
+void NotificationCenter::Impl::CreateCard(Card& c) {
+    const float wPx = std::ceil(kW * s), hPx = std::ceil(c.row.h * s);
+    const bool group = c.row.kind == K::Group;
     c.outer = comp.CreateContainerVisual();
-    c.outer.Size({wPx, hPx + (c.row.group ? kPeek * s : 0)});
+    c.outer.Size({wPx, hPx + (group ? kPeek * s : 0)});
     c.outer.CenterPoint({wPx / 2, 0, 0});
 
-    if (c.row.group) {  // the rest of the stack peeking out from under the card
+    if (group) {  // the rest of the stack peeking out from under the card
         for (int i = 2; i >= 1; --i) {
             auto peek = comp.CreateSpriteVisual();
             float inset = (7.0f * i) * s;
@@ -644,7 +830,8 @@ void NotificationStack::Impl::CreateCard(Card& c) {
     c.vis.Children().InsertAtTop(c.content);
 
     const float t = s;
-    const float rad = c.row.collapse ? c.row.h / 2 * s : kRadius * s;
+    const bool pill = c.row.kind == K::Collapse || c.row.kind == K::More || c.row.kind == K::Header;
+    const float rad = pill ? c.row.h / 2 * s : kRadius * s;
     c.rim = comp.CreateRoundedRectangleGeometry();
     c.rim.Offset({t / 2, t / 2});
     c.rim.CornerRadius({rad - t / 2, rad - t / 2});
@@ -669,10 +856,10 @@ void NotificationStack::Impl::CreateCard(Card& c) {
     c.clip.CornerRadius({rad, rad});
     c.clip.Size({wPx, hPx});
     c.vis.Clip(comp.CreateGeometricClip(c.clip));
-    Draw(c, false, false);
+    Draw(c, false, -1);
 }
 
-void NotificationStack::Impl::Draw(Card& c, bool hover, bool closeHover) {
+void NotificationCenter::Impl::Draw(Card& c, bool hover, int part) {
     if (!c.surf) return;
     auto interop = c.surf.as<ICompositionDrawingSurfaceInterop>();
     winrt::com_ptr<ID2D1DeviceContext> dc;
@@ -685,122 +872,212 @@ void NotificationStack::Impl::Draw(Card& c, bool hover, bool closeHover) {
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         winrt::com_ptr<ID2D1SolidColorBrush> br;
         dc->CreateSolidColorBrush(kText, br.put());
-        if (hover) {
+        const bool interactive = r.kind == K::Notif || r.kind == K::Group || r.kind == K::Collapse;
+        if (hover && interactive) {
             br->SetColor(ColorF(1, 1, 1, 0.06f));
-            dc->FillRectangle(D2D1::RectF(0, 0, W, r.h), br.get());
+            dc->FillRectangle(D2D1::RectF(0, 0, kW, r.h), br.get());
         }
-        if (r.collapse) {
-            br->SetColor(kText);
-            dc->DrawText(L"Show less", 9, fPill.get(), D2D1::RectF(0, 0, W, r.h), br.get());
-        } else {
-            // icon: the app's own logo if Windows gave one, else a letter tile
-            const D2D1_ROUNDED_RECT ir = D2D1::RoundedRect(D2D1::RectF(kPad, kHeaderY + 2, kPad + kIcon, kHeaderY + 2 + kIcon), 9, 9);
-            auto ic = icons.find(r.n.appKey);
-            bool drawn = false;
-            if (ic != icons.end()) {
-                winrt::com_ptr<ID2D1Bitmap> bmp;
-                auto props = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-                if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(ic->second.w, ic->second.h), ic->second.px.data(), ic->second.w * 4, &props, bmp.put()))) {
-                    winrt::com_ptr<ID2D1BitmapBrush> bb;
-                    if (SUCCEEDED(dc->CreateBitmapBrush(bmp.get(), bb.put()))) {
-                        bb->SetInterpolationMode(D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                        bb->SetTransform(D2D1::Matrix3x2F::Scale(kIcon / ic->second.w, kIcon / ic->second.h) * D2D1::Matrix3x2F::Translation(ir.rect.left, ir.rect.top));
-                        // plate behind transparent logos so they read on the dark glass
-                        br->SetColor(ColorF(1, 1, 1, 0.14f));
-                        dc->FillRoundedRectangle(ir, br.get());
-                        dc->FillRoundedRectangle(ir, bb.get());
-                        drawn = true;
-                    }
-                }
-            }
-            if (!drawn) {
-                size_t hsh = std::hash<std::wstring>{}(r.n.appKey);
-                br->SetColor(ColorF(0.25f + (hsh & 0xFF) / 700.0f, 0.3f + ((hsh >> 8) & 0xFF) / 700.0f, 0.5f + ((hsh >> 16) & 0xFF) / 600.0f, 1));
-                dc->FillRoundedRectangle(ir, br.get());
-                std::wstring letter = r.n.app.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(towupper(r.n.app[0])));
+        switch (r.kind) {
+            case K::Collapse:
                 br->SetColor(kText);
-                dc->DrawText(letter.c_str(), 1, fPill.get(), ir.rect, br.get());
-            }
-
-            // header: app name, count chip, time (or the x while hovered)
-            const float tx = kTextX, tw = W - kTextX - kPad;
-            std::wstring app = r.n.app.empty() ? L"Notification" : r.n.app;
-            br->SetColor(kDim);
-            float appW = std::min<float>(tw - 60, app.size() * 6.4f + 4);
-            winrt::com_ptr<IDWriteTextLayout> lay;
-            if (SUCCEEDED(dw->CreateTextLayout(app.c_str(), static_cast<UINT32>(app.size()), fApp.get(), tw - 70, 15, lay.put()))) {
-                DWRITE_TEXT_METRICS tm{};
-                lay->GetMetrics(&tm);
-                appW = tm.widthIncludingTrailingWhitespace;
-                dc->DrawTextLayout(D2D1::Point2F(tx, kHeaderY), lay.get(), br.get());
-            }
-            if (r.group && r.count > 1) {
-                std::wstring cnt = std::to_wstring(r.count);
-                float cw = 12.0f + 7.0f * cnt.size();
-                D2D1_ROUNDED_RECT chip = D2D1::RoundedRect(D2D1::RectF(tx + appW + 6, kHeaderY + 0.5f, tx + appW + 6 + cw, kHeaderY + 15.5f), 7.5f, 7.5f);
-                br->SetColor(ColorF(1, 1, 1, 0.20f));
-                dc->FillRoundedRectangle(chip, br.get());
-                br->SetColor(kText);
-                dc->DrawText(cnt.c_str(), static_cast<UINT32>(cnt.size()), fCount.get(), chip.rect, br.get());
-            }
-            if (hover) {
-                const D2D1_POINT_2F ctr = D2D1::Point2F(W - kPad - 9, kHeaderY + 8);
-                br->SetColor(ColorF(1, 1, 1, closeHover ? 0.32f : 0.16f));
-                dc->FillEllipse(D2D1::Ellipse(ctr, 9, 9), br.get());
-                br->SetColor(kText);
-                dc->DrawLine(D2D1::Point2F(ctr.x - 3.2f, ctr.y - 3.2f), D2D1::Point2F(ctr.x + 3.2f, ctr.y + 3.2f), br.get(), 1.4f);
-                dc->DrawLine(D2D1::Point2F(ctr.x - 3.2f, ctr.y + 3.2f), D2D1::Point2F(ctr.x + 3.2f, ctr.y - 3.2f), br.get(), 1.4f);
-            } else {
-                std::wstring t = Rel(r.n.ft);
+                dc->DrawText(L"Show less", 9, fPill.get(), D2D1::RectF(0, 0, kW, r.h), br.get());
+                break;
+            case K::More: {
+                std::wstring t = std::to_wstring(r.count) + L" more";
                 br->SetColor(kDim);
-                dc->DrawText(t.c_str(), static_cast<UINT32>(t.size()), fTime.get(), D2D1::RectF(W - kPad - 70, kHeaderY, W - kPad, kHeaderY + 15), br.get());
+                dc->DrawText(t.c_str(), static_cast<UINT32>(t.size()), fPill.get(), D2D1::RectF(0, 0, kW, r.h), br.get());
+                break;
             }
-
-            std::wstring title = r.n.title.empty() ? L"New notification" : r.n.title;
-            br->SetColor(kText);
-            dc->DrawText(title.c_str(), static_cast<UINT32>(title.size()), fTitle.get(), D2D1::RectF(tx, kTitleY, tx + tw, kTitleY + 18), br.get());
-            if (!r.n.body.empty()) {
-                std::wstring body = r.n.body;
-                int lines = 0;
-                MeasureBody(body, tw, &lines);
+            case K::Empty:
                 br->SetColor(kDim);
-                dc->DrawText(body.c_str(), static_cast<UINT32>(body.size()), fBody.get(), D2D1::RectF(tx, kBodyY, tx + tw, kBodyY + kLine * 2 + 2), br.get());
-            }
+                dc->DrawText(L"No new notifications", 20, fPill.get(), D2D1::RectF(0, 0, kW, r.h), br.get());
+                break;
+            case K::Header: DrawHeader(dc.get(), br.get(), r, hover ? part : -1); break;
+            case K::Calendar: DrawCalendar(dc.get(), br.get(), hover ? part : -1); break;
+            default: DrawNotif(dc.get(), br.get(), r, hover, hover && part == 1); break;
         }
     } catch (...) {}
     interop->EndDraw();
 }
 
-void NotificationStack::Impl::AnimateIn(Card& c, int order) {
-    const auto delay = std::chrono::milliseconds(60 + 55 * order);
+void NotificationCenter::Impl::DrawHeader(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, int part) {
+    br->SetColor(kText);
+    dc->DrawText(L"Notifications", 13, fHead.get(), D2D1::RectF(kPad + 4, 0, kW - 100, r.h), br);
+    if (!Visible()) return;
+    const D2D1_ROUNDED_RECT btn = D2D1::RoundedRect(D2D1::RectF(kW - kPad - 58, 7, kW - kPad + 2, r.h - 7), 12, 12);
+    br->SetColor(ColorF(1, 1, 1, part == 2 ? 0.26f : 0.12f));
+    dc->FillRoundedRectangle(btn, br);
+    br->SetColor(kText);
+    dc->DrawText(L"Clear", 5, fClear.get(), btn.rect, br);
+}
+
+void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, bool hover, bool closeHover) {
+    // icon: the app's own icon, else a letter tile
+    const D2D1_ROUNDED_RECT ir = D2D1::RoundedRect(D2D1::RectF(kPad, kHeaderY + 2, kPad + kIcon, kHeaderY + 2 + kIcon), 8, 8);
+    auto ic = icons.find(r.n.appKey);
+    bool drawn = false;
+    if (ic != icons.end()) {
+        winrt::com_ptr<ID2D1Bitmap> bmp;
+        auto props = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(ic->second.w, ic->second.h), ic->second.px.data(), ic->second.w * 4, &props, bmp.put()))) {
+            winrt::com_ptr<ID2D1BitmapBrush> bb;
+            if (SUCCEEDED(dc->CreateBitmapBrush(bmp.get(), bb.put()))) {
+                bb->SetInterpolationMode(D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                bb->SetTransform(D2D1::Matrix3x2F::Scale(kIcon / ic->second.w, kIcon / ic->second.h) * D2D1::Matrix3x2F::Translation(ir.rect.left, ir.rect.top));
+                // plate behind transparent logos so they read on the dark glass
+                br->SetColor(ColorF(1, 1, 1, 0.10f));
+                dc->FillRoundedRectangle(ir, br);
+                dc->FillRoundedRectangle(ir, bb.get());
+                drawn = true;
+            }
+        }
+    }
+    if (!drawn) {
+        size_t hsh = std::hash<std::wstring>{}(r.n.appKey);
+        br->SetColor(ColorF(0.25f + (hsh & 0xFF) / 700.0f, 0.3f + ((hsh >> 8) & 0xFF) / 700.0f, 0.5f + ((hsh >> 16) & 0xFF) / 600.0f, 1));
+        dc->FillRoundedRectangle(ir, br);
+        std::wstring letter = r.n.app.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(towupper(r.n.app[0])));
+        br->SetColor(kText);
+        dc->DrawText(letter.c_str(), 1, fPill.get(), ir.rect, br);
+    }
+
+    // header: app name, count chip, time (or the x while hovered)
+    const float tx = kTextX, tw = kW - kTextX - kPad;
+    std::wstring app = r.n.app.empty() ? L"Notification" : r.n.app;
+    br->SetColor(kDim);
+    float appW = std::min<float>(tw - 60, app.size() * 6.4f + 4);
+    winrt::com_ptr<IDWriteTextLayout> lay;
+    if (SUCCEEDED(dw->CreateTextLayout(app.c_str(), static_cast<UINT32>(app.size()), fApp.get(), tw - 70, 15, lay.put()))) {
+        DWRITE_TEXT_METRICS tm{};
+        lay->GetMetrics(&tm);
+        appW = tm.widthIncludingTrailingWhitespace;
+        dc->DrawTextLayout(D2D1::Point2F(tx, kHeaderY), lay.get(), br);
+    }
+    if (r.kind == K::Group && r.count > 1) {
+        std::wstring cnt = std::to_wstring(r.count);
+        float cw = 12.0f + 7.0f * cnt.size();
+        D2D1_ROUNDED_RECT chip = D2D1::RoundedRect(D2D1::RectF(tx + appW + 6, kHeaderY + 0.5f, tx + appW + 6 + cw, kHeaderY + 15.5f), 7.5f, 7.5f);
+        br->SetColor(ColorF(1, 1, 1, 0.20f));
+        dc->FillRoundedRectangle(chip, br);
+        br->SetColor(kText);
+        dc->DrawText(cnt.c_str(), static_cast<UINT32>(cnt.size()), fCount.get(), chip.rect, br);
+    }
+    if (hover) {
+        const D2D1_POINT_2F ctr = D2D1::Point2F(kW - kPad - 9, kHeaderY + 8);
+        br->SetColor(ColorF(1, 1, 1, closeHover ? 0.32f : 0.16f));
+        dc->FillEllipse(D2D1::Ellipse(ctr, 9, 9), br);
+        br->SetColor(kText);
+        dc->DrawLine(D2D1::Point2F(ctr.x - 3.2f, ctr.y - 3.2f), D2D1::Point2F(ctr.x + 3.2f, ctr.y + 3.2f), br, 1.4f);
+        dc->DrawLine(D2D1::Point2F(ctr.x - 3.2f, ctr.y + 3.2f), D2D1::Point2F(ctr.x + 3.2f, ctr.y - 3.2f), br, 1.4f);
+    } else {
+        std::wstring t = Rel(r.n.ft);
+        br->SetColor(kDim);
+        dc->DrawText(t.c_str(), static_cast<UINT32>(t.size()), fTime.get(), D2D1::RectF(kW - kPad - 70, kHeaderY, kW - kPad, kHeaderY + 15), br);
+    }
+
+    std::wstring title = r.n.title.empty() ? L"New notification" : r.n.title;
+    br->SetColor(kText);
+    dc->DrawText(title.c_str(), static_cast<UINT32>(title.size()), fTitle.get(), D2D1::RectF(tx, kTitleY, tx + tw, kTitleY + 18), br);
+    if (!r.n.body.empty()) {
+        std::wstring body = r.n.body;
+        int lines = 0;
+        MeasureBody(body, tw, &lines);
+        br->SetColor(kDim);
+        dc->DrawText(body.c_str(), static_cast<UINT32>(body.size()), fBody.get(), D2D1::RectF(tx, kBodyY, tx + tw, kBodyY + kLine * 2 + 2), br);
+    }
+}
+
+void NotificationCenter::Impl::DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, int part) {
+    wchar_t buf[96];
+    SYSTEMTIME t = today;
+    // big weekday + date
+    br->SetColor(accent);
+    if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"dddd", buf, 96, nullptr)) {
+        CharUpperW(buf);
+        dc->DrawText(buf, static_cast<UINT32>(wcslen(buf)), fCalDow.get(), D2D1::RectF(kPad, 14, kW - kPad, 32), br);
+    }
+    br->SetColor(kText);
+    if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"d MMMM", buf, 96, nullptr))
+        dc->DrawText(buf, static_cast<UINT32>(wcslen(buf)), fBig.get(), D2D1::RectF(kPad, 30, kW - kPad, 66), br);
+
+    // month nav
+    SYSTEMTIME mo{};
+    mo.wYear = static_cast<WORD>(calYear); mo.wMonth = static_cast<WORD>(calMonth); mo.wDay = 1;
+    br->SetColor(part == 5 ? kText : ColorF(1, 1, 1, 0.82f));
+    if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &mo, L"MMMM yyyy", buf, 96, nullptr))
+        dc->DrawText(buf, static_cast<UINT32>(wcslen(buf)), fNav.get(), D2D1::RectF(kPad, kCalHead, kW / 2 + 40, kCalHead + kCalNav), br);
+    const float cy = kCalHead + kCalNav / 2;
+    for (int d = 0; d < 2; ++d) {
+        float cx = kW - kPad - 26 - 14 + d * 28 + 14 - 0;  // centres: prev at kW-kPad-40, next at kW-kPad-12
+        cx = kW - kPad - 40 + d * 28;
+        br->SetColor(ColorF(1, 1, 1, part == 3 + d ? 0.22f : 0.0f));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 12, 12), br);
+        br->SetColor(kText);
+        float dir = d ? 1.0f : -1.0f;
+        dc->DrawLine(D2D1::Point2F(cx - dir * 2.0f, cy - 4.5f), D2D1::Point2F(cx + dir * 2.0f, cy), br, 1.6f);
+        dc->DrawLine(D2D1::Point2F(cx + dir * 2.0f, cy), D2D1::Point2F(cx - dir * 2.0f, cy + 4.5f), br, 1.6f);
+    }
+
+    // weekday letters and the grid
+    int fdVal = 0;
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_IFIRSTDAYOFWEEK | LOCALE_RETURN_NUMBER, reinterpret_cast<LPWSTR>(&fdVal), 2);
+    const int firstSun = (fdVal + 1) % 7;  // 0 = Monday in the locale, SYSTEMTIME counts from Sunday
+    const float gx = kPad, cw = (kW - 2 * kPad) / 7, dowY = kCalHead + kCalNav + 4, gridY = dowY + kCalDow + 2;
+    br->SetColor(kDim);
+    for (int c = 0; c < 7; ++c) {
+        int mon = ((firstSun + c) % 7 + 6) % 7;
+        wchar_t nm[16] = L"";
+        GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SABBREVDAYNAME1 + mon, nm, 16);
+        UINT32 n = nm[0] ? 1 : 0;
+        if (nm[0] >= 0xD800 && nm[0] < 0xDC00) n = 2;
+        dc->DrawText(nm, n, fDow.get(), D2D1::RectF(gx + c * cw, dowY, gx + (c + 1) * cw, dowY + kCalDow), br);
+    }
+    FILETIME ft;
+    SYSTEMTIME first{};
+    SystemTimeToFileTime(&mo, &ft);
+    FileTimeToSystemTime(&ft, &first);
+    const int offset = (first.wDayOfWeek - firstSun + 7) % 7;
+    const int dim = DaysIn(calYear, calMonth);
+    const int prevDim = calMonth == 1 ? 31 : DaysIn(calYear, calMonth - 1);
+    for (int i = 0; i < 42; ++i) {
+        int day = i - offset + 1;
+        bool inMonth = day >= 1 && day <= dim;
+        if (day < 1) day += prevDim;
+        else if (day > dim) day -= dim;
+        const float cx = gx + (i % 7) * cw + cw / 2, cyy = gridY + (i / 7) * kCalRow + kCalRow / 2;
+        const bool isToday = inMonth && calYear == today.wYear && calMonth == today.wMonth && day == today.wDay;
+        if (isToday) {
+            br->SetColor(accent);
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cyy), 12, 12), br);
+        }
+        std::wstring ds = std::to_wstring(day);
+        br->SetColor(isToday ? ColorF(1, 1, 1, 1) : inMonth ? kText : ColorF(1, 1, 1, 0.26f));
+        dc->DrawText(ds.c_str(), static_cast<UINT32>(ds.size()), isToday ? fDayB.get() : fDay.get(),
+                     D2D1::RectF(cx - cw / 2, cyy - kCalRow / 2, cx + cw / 2, cyy + kCalRow / 2), br);
+    }
+}
+
+// Each card slides 12 px in from the right and fades, 25 ms after the one before it. Compositor only.
+void NotificationCenter::Impl::AnimateIn(Card& c, int order) {
+    const auto delay = std::chrono::milliseconds(25 * order);
+    auto ease = comp.CreateCubicBezierEasingFunction({0.2f, 0.8f}, {0.2f, 1.0f});
     c.outer.Opacity(0);
     auto fade = comp.CreateScalarKeyFrameAnimation();
     fade.InsertKeyFrame(1.0f, 1.0f);
-    fade.Duration(180ms);
+    fade.Duration(200ms);
     fade.DelayTime(delay);
     fade.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
     c.outer.StartAnimation(L"Opacity", fade);
-    auto slide = comp.CreateSpringScalarAnimation();
-    slide.InitialValue((c.row.y - 14.0f) * s);
-    slide.FinalValue(c.row.y * s);
-    slide.DampingRatio(0.78f);
-    slide.Period(50ms);
+    auto slide = comp.CreateScalarKeyFrameAnimation();
+    slide.InsertKeyFrame(0.0f, 12.0f * s);
+    slide.InsertKeyFrame(1.0f, 0.0f, ease);
+    slide.Duration(300ms);
     slide.DelayTime(delay);
     slide.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
-    c.outer.StartAnimation(L"Offset.Y", slide);
-    auto scale = comp.CreateSpringVector3Animation();
-    scale.InitialValue(winrt::Windows::Foundation::IReference<winrt::Windows::Foundation::Numerics::float3>(
-        winrt::Windows::Foundation::Numerics::float3{0.96f, 0.96f, 1.0f}));
-    scale.FinalValue(winrt::Windows::Foundation::IReference<winrt::Windows::Foundation::Numerics::float3>(
-        winrt::Windows::Foundation::Numerics::float3{1.0f, 1.0f, 1.0f}));
-    scale.DampingRatio(0.78f);
-    scale.Period(50ms);
-    scale.DelayTime(delay);
-    scale.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
-    c.outer.StartAnimation(L"Scale", scale);
+    c.outer.StartAnimation(L"Offset.X", slide);
 }
 
-void NotificationStack::Impl::AnimateOut(Card& c) {
+void NotificationCenter::Impl::AnimateOut(Card& c) {
     auto fade = comp.CreateScalarKeyFrameAnimation();
     fade.InsertKeyFrame(1.0f, 0.0f);
     fade.Duration(130ms);
@@ -811,51 +1088,102 @@ void NotificationStack::Impl::AnimateOut(Card& c) {
     c.outer.StartAnimation(L"Scale", scale);
 }
 
-// Diffs the wanted rows against the live cards: new ones spring in (staggered), gone ones fade out,
+// Diffs the wanted rows against the live cards: new ones animate in (staggered), gone ones fade out,
 // survivors glide to their new slot.
-void NotificationStack::Impl::Update(bool firstShow) {
+void NotificationCenter::Impl::Update(bool firstShow) {
     if (st != St::Open || !root) return;
-    auto rows = BuildRows();
+    GetLocalTime(&today);
+    auto src = BuildRows();
 
-    // geometry, capped to what fits under the panel
-    MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfoW(MonitorFromRect(&panel, MONITOR_DEFAULTTONEAREST), &mi);
-    const float avail = (mi.rcMonitor.bottom - panel.bottom) / s - kBelowPanel - 8;
+    std::vector<Row> rows;
     float y = 0;
-    size_t keep = 0;
-    for (auto& r : rows) {
-        if (keep >= static_cast<size_t>(kMaxRows)) break;
-        float h;
-        if (r.collapse) h = kCollapseH;
-        else {
-            r.n.title = r.n.title.empty() ? r.n.title : r.n.title;
-            int lines = 0;
-            std::wstring b = r.n.body;
-            MeasureBody(b, W - kTextX - kPad, &lines);
-            h = std::max(kMinH, kBodyY + kLine * lines + 14);
-            if (!lines) h = std::max(kMinH, kTitleY + 18 + 14);
-        }
-        float use = h + (r.group ? kPeek : 0);
-        if (y + use > avail) break;
+    auto add = [&](Row r, float h, float extra = 0) {
         r.h = h;
         r.y = y;
-        y += use + kGap;
+        y += h + extra + kGap;
+        rows.push_back(std::move(r));
+    };
+    {
+        Row r;
+        r.key = L"hdr";
+        r.kind = K::Header;
+        r.count = Visible();
+        add(std::move(r), kHeadH);
+    }
+    const float cardsAvail = availH - (kHeadH + kGap) - (kCalH + kGap);
+    if (haveData && src.empty()) {
+        Row r;
+        r.key = L"empty";
+        r.kind = K::Empty;
+        add(std::move(r), kEmptyH);
+    }
+    // heights first, then keep the prefix that fits under the card limit
+    struct Sized { Row r; float h; };
+    std::vector<Sized> sized;
+    for (auto& r : src) {
+        float h;
+        if (r.kind == K::Collapse) h = kCollapseH;
+        else {
+            int lines = 0;
+            std::wstring b = r.n.body;
+            MeasureBody(b, kW - kTextX - kPad, &lines);
+            h = lines ? std::max(kMinH, kBodyY + kLine * lines + 14) : std::max(kMinH, kTitleY + 18 + 14);
+        }
+        sized.push_back({std::move(r), h});
+    }
+    size_t keep = 0;
+    float used = 0;
+    int cardsShown = 0;
+    for (auto& z : sized) {
+        const bool isCard = z.r.kind != K::Collapse;
+        float use = z.h + (z.r.kind == K::Group ? kPeek : 0) + kGap;
+        if ((isCard && cardsShown >= kMaxCards) || used + use > cardsAvail) break;
+        used += use;
+        cardsShown += isCard;
         ++keep;
     }
-    rows.resize(keep);
-    totalH = keep ? y - kGap : 0;
+    // room for the "N more" pill
+    if (keep < sized.size())
+        while (keep > 1 && used + kMoreH + kGap > cardsAvail) {
+            --keep;
+            used -= sized[keep].h + (sized[keep].r.kind == K::Group ? kPeek : 0) + kGap;
+        }
+    int more = 0;
+    for (size_t i = keep; i < sized.size(); ++i)
+        if (sized[i].r.kind == K::Notif) more += 1;
+        else if (sized[i].r.kind == K::Group) more += sized[i].r.count;
+    for (size_t i = 0; i < keep; ++i) {
+        const float extra = sized[i].r.kind == K::Group ? kPeek : 0;
+        add(std::move(sized[i].r), sized[i].h, extra);
+    }
+    if (more) {
+        Row r;
+        r.key = L"more";
+        r.kind = K::More;
+        r.count = more;
+        add(std::move(r), kMoreH);
+    }
+    {
+        Row r;
+        r.key = L"cal";
+        r.kind = K::Calendar;
+        add(std::move(r), kCalH);
+    }
+    totalH = y - kGap;
 
     std::vector<Card> next;
     int order = 0;
     for (auto& r : rows) {
-        std::wstring sig = r.n.title + L"\x1f" + r.n.body + L"\x1f" + Rel(r.n.ft) + L"\x1f" + std::to_wstring(r.count) + L"\x1f" + std::to_wstring(r.h) + (r.group ? L"g" : L"");
+        std::wstring sig = r.n.title + L"\x1f" + r.n.body + L"\x1f" + Rel(r.n.ft) + L"\x1f" + std::to_wstring(r.count) + L"\x1f" +
+                           std::to_wstring(r.h) + (r.kind == K::Group ? L"g" : L"") + (icons.count(r.n.appKey) ? L"i" : L"") +
+                           (r.kind == K::Calendar ? std::to_wstring(today.wYear * 10000 + today.wMonth * 100 + today.wDay) : L"");
         auto it = std::find_if(cards.begin(), cards.end(), [&](Card const& c) { return c.row.key == r.key && !c.gone; });
-        if (it != cards.end() && it->row.h == r.h && it->row.group == r.group) {
+        if (it != cards.end() && it->row.h == r.h && it->row.kind == r.kind) {
             Card c = std::move(*it);
             cards.erase(it);
             bool moved = c.row.y != r.y;
             c.row = r;
-            if (c.sig != sig) { c.sig = sig; Draw(c, false, false); }
+            if (c.sig != sig) { c.sig = sig; Draw(c, false, -1); }
             if (moved) {
                 auto glide = comp.CreateScalarKeyFrameAnimation();
                 glide.InsertKeyFrame(1.0f, r.y * s, comp.CreateCubicBezierEasingFunction({0.2f, 0.8f}, {0.2f, 1.0f}));
@@ -867,14 +1195,15 @@ void NotificationStack::Impl::Update(bool firstShow) {
             Card c;
             c.row = r;
             c.sig = sig;
-                    CreateCard(c);
-                    c.outer.Offset({0, r.y * s, 0});
-            root.Children().InsertAtTop(c.outer);
-            AnimateIn(c, firstShow ? order : order);
+            CreateCard(c);
+            c.outer.Offset({0, r.y * s, 0});
+            panelVis.Children().InsertAtTop(c.outer);
+            AnimateIn(c, order);
             ++order;
             next.push_back(std::move(c));
         }
     }
+    (void)firstShow;
     // whatever is left disappears
     for (auto& c : cards) {
         c.gone = true;
@@ -887,62 +1216,94 @@ void NotificationStack::Impl::Update(bool firstShow) {
     Place();
 }
 
-void NotificationStack::Impl::Place() {
+// The window is content-sized, with motion::kPad of empty margin around the visual; it stays tall
+// enough for fading cards and shrinks once they are gone.
+void NotificationCenter::Impl::Place() {
     if (!hwnd) return;
-    int wPx = static_cast<int>(std::ceil(W * s));
     float h = totalH;
-    if (!dying.empty()) h = std::max(h, 1.0f * totalH + 200);  // leave room for fades; trimmed once they are gone
-    int hPx = std::max(1, static_cast<int>(std::ceil(h * s)));
-    // window shrinks only after fades finish; never let a dying card be clipped by a smaller window
-    SetWindowPos(hwnd, HWND_TOPMOST, panel.left, panel.bottom + static_cast<int>(kBelowPanel * s), wPx, hPx, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    ShowWindow(hwnd, totalH > 0 || !dying.empty() ? SW_SHOWNA : SW_HIDE);
+    if (!dying.empty()) h = std::max(h, winH);
+    h = std::min(h, availH);
+    winH = h;
+    const int wPx = static_cast<int>(std::ceil((kW + 2 * motion::kPad) * s));
+    const int hPx = std::max(1, static_cast<int>(std::ceil((h + 2 * motion::kPad) * s)));
+    const int x = work.right - wPx + static_cast<int>((motion::kPad - kEdge) * s);
+    const int yy = work.top + static_cast<int>((kEdge - motion::kPad) * s);
+    SetWindowPos(hwnd, HWND_TOPMOST, x, yy, wPx, hPx, SWP_NOACTIVATE);
 }
 
-void NotificationStack::Impl::Show(RECT p) {
-    if (p.right <= p.left) return;
-    visible = true;
+// The panel takes focus so Esc works and clicking elsewhere closes it (same as the Control Center).
+void NotificationCenter::Impl::Focus() {
+    DWORD me = GetCurrentThreadId(), fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    bool attached = fg && fg != me && AttachThreadInput(me, fg, TRUE);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+    if (attached) AttachThreadInput(me, fg, FALSE);
+}
+
+void NotificationCenter::Impl::Open() {
+    if (st == St::Open) return;
     if (st == St::Closing) Teardown();
-    panel = p;
-    if (st == St::Open) { Place(); SetEvent(evReq); return; }
+    visible = true;
     try {
-        HMONITOR hm = MonitorFromRect(&panel, MONITOR_DEFAULTTONEAREST);
+        POINT origin{0, 0};
+        HMONITOR hm = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(hm, &mi);
+        work = mi.rcWork;
         UINT dx = 96, dy = 96;
         GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
         s = dx / 96.0f;
-        W = (panel.right - panel.left) / s;
+        availH = (work.bottom - work.top) / s - 2 * kEdge;
+        try {
+            auto c = winrt::Windows::UI::ViewManagement::UISettings().GetColorValue(winrt::Windows::UI::ViewManagement::UIColorType::Accent);
+            accent = ColorF(c.R / 255.0f, c.G / 255.0f, c.B / 255.0f, 1);
+        } catch (...) {}
+        GetLocalTime(&today);
+        calYear = today.wYear;
+        calMonth = today.wMonth;
         BuildFonts();
-        hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, kClass, L"Halo Notifications",
-                               WS_POPUP, panel.left, panel.bottom, 1, 1, nullptr, nullptr, inst, this);
-        if (!hwnd) return;
+        hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kClass, L"Halo Notification Center", WS_POPUP,
+                               work.right - 1, work.top, 1, 1, nullptr, nullptr, inst, this);
+        if (!hwnd) { visible = false; return; }
         BOOL on = TRUE;
         DwmSetWindowAttribute(hwnd, 17 /* DWMWA_USE_HOSTBACKDROPBRUSH */, &on, sizeof(on));
         winrt::check_hresult(comp.as<ICompositorDesktopInterop>()->CreateDesktopWindowTarget(hwnd, TRUE, winrt::put_abi(target)));
         root = comp.CreateContainerVisual();
         root.RelativeSizeAdjustment({1, 1});
         target.Root(root);
-        try { noise = NoiseBrush(static_cast<int>(std::ceil(W * s)), 256); } catch (...) { noise = nullptr; }
+        panelVis = comp.CreateContainerVisual();
+        panelVis.Size({std::ceil(kW * s), 1});
+        const float3 rest{motion::kPad * s, motion::kPad * s, 0};
+        panelVis.Offset(rest);
+        root.Children().InsertAtTop(panelVis);
+        try { noise = NoiseBrush(static_cast<int>(std::ceil(kW * s)), 256); } catch (...) { noise = nullptr; }
         st = St::Open;
-        if (haveData) Update(true);
+        winH = 0;
+        Update(true);
+        ShowWindow(hwnd, SW_SHOW);
+        Focus();
+        motion::In(comp, panelVis, rest, Anchor(), {48.0f * s, 0});
         SetEvent(evReq);
     } catch (winrt::hresult_error const& e) {
-        svc::Log(L"notifications: show failed: " + std::wstring(e.message().c_str()));
+        svc::Log(L"notifications: open failed: " + std::wstring(e.message().c_str()));
         Teardown();
     }
 }
 
-void NotificationStack::Impl::Hide() {
+void NotificationCenter::Impl::Close() {
     visible = false;
     if (st != St::Open) return;
     st = St::Closing;
-    int i = 0;
-    for (auto& c : cards) { (void)i; AnimateOut(c); }
-    SetTimer(hwnd, kTimerClose, 150, nullptr);
+    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Anchor(), {48.0f * s, 0});
+    SetTimer(hwnd, kTimerClose, motion::kOutMs + 10, nullptr);
 }
 
-void NotificationStack::Impl::Teardown() {
+void NotificationCenter::Impl::Teardown() {
+    visible = false;
     if (hwnd) { KillTimer(hwnd, kTimerGone); KillTimer(hwnd, kTimerClose); }
     cards.clear();
     dying.clear();
+    panelVis = nullptr;
     root = nullptr;
     target = nullptr;
     noise = nullptr;
@@ -956,12 +1317,14 @@ void NotificationStack::Impl::Teardown() {
 // ---------------------------------------------------------------------------------------------
 // public
 
-NotificationStack::NotificationStack(HINSTANCE inst, wuc::Compositor comp, wuc::CompositionGraphicsDevice gdev)
+NotificationCenter::NotificationCenter(HINSTANCE inst, HWND, wuc::Compositor comp, wuc::CompositionGraphicsDevice gdev)
     : m(std::make_unique<Impl>(inst, std::move(comp), std::move(gdev))) {
     m->Start();
 }
-NotificationStack::~NotificationStack() { m->Stop(); }
-void NotificationStack::Show(RECT panelScreen) { m->Show(panelScreen); }
-void NotificationStack::Hide() { m->Hide(); }
+NotificationCenter::~NotificationCenter() { m->Stop(); }
+void NotificationCenter::Toggle() { IsOpen() ? Close() : Open(); }
+void NotificationCenter::Open() { m->Open(); }
+void NotificationCenter::Close() { m->Close(); }
+bool NotificationCenter::IsOpen() const { return m->st == Impl::St::Open; }
 
 }  // namespace halo

@@ -27,6 +27,7 @@ namespace detail {
 namespace wuc = winrt::Windows::UI::Composition;
 using winrt::Windows::Foundation::Numerics::float2;
 using winrt::Windows::Foundation::Numerics::float3;
+inline winrt::Windows::Foundation::IReference<float3> Ref3(float3 v) { return v; }  // spring animations take IReference<float3>
 }  // namespace detail
 
 inline void In(detail::wuc::Compositor const& c, detail::wuc::Visual const& v, detail::float3 rest,
@@ -34,14 +35,14 @@ inline void In(detail::wuc::Compositor const& c, detail::wuc::Visual const& v, d
     using namespace std::chrono;
     v.CenterPoint({anchor.x, anchor.y, 0});
     auto slide = c.CreateSpringVector3Animation();
-    slide.InitialValue({rest.x + travel.x, rest.y + travel.y, rest.z});
-    slide.FinalValue(rest);
+    slide.InitialValue(detail::Ref3({rest.x + travel.x, rest.y + travel.y, rest.z}));
+    slide.FinalValue(detail::Ref3(rest));
     slide.DampingRatio(kDamping);
     slide.Period(milliseconds(kPeriodMs));
     v.StartAnimation(L"Offset", slide);
     auto scale = c.CreateSpringVector3Animation();
-    scale.InitialValue({0.92f, 0.92f, 1.0f});
-    scale.FinalValue({1.0f, 1.0f, 1.0f});
+    scale.InitialValue(detail::Ref3({0.92f, 0.92f, 1.0f}));
+    scale.FinalValue(detail::Ref3({1.0f, 1.0f, 1.0f}));
     scale.DampingRatio(kDamping);
     scale.Period(milliseconds(kPeriodMs));
     v.StartAnimation(L"Scale", scale);
