@@ -539,6 +539,7 @@ void Dock::Bounce(int index) {
     for (auto& e : m_entries) {
         if (e.leaving || k++ != index || Bouncing(e)) continue;
         e.bounceStart = std::chrono::steady_clock::now();
+        fwprintf(stderr, L"[halo] bounce started\n"); fflush(stderr);
         // Up by half the rest size, easing out on the way up and in on the way down.
         const float rest = IconY();
         auto a = m_compositor.CreateScalarKeyFrameAnimation();
@@ -548,6 +549,22 @@ void Dock::Bounce(int index) {
         a.Duration(std::chrono::milliseconds(kBounceMs));
         a.IterationCount(kBounces);
         Start(e.icon, L"Offset.Y", a, L"bounce");
+        break;
+    }
+}
+
+void Dock::Bob(int index) {
+    int k = 0;
+    for (auto& e : m_entries) {
+        if (e.leaving || k++ != index || Bouncing(e)) continue;
+        const float rest = IconY();
+        auto a = m_compositor.CreateScalarKeyFrameAnimation();
+        a.InsertKeyFrame(0.0f, rest);
+        a.InsertKeyFrame(0.45f, rest - m_m.restSize / 4, BounceUp(m_compositor));
+        a.InsertKeyFrame(1.0f, rest, BounceDown(m_compositor));
+        a.Duration(std::chrono::milliseconds(kBounceMs * 2 / 3));
+        Start(e.icon, L"Offset.Y", a, L"bob");
+        fwprintf(stderr, L"[halo] bob started\n"); fflush(stderr);
         break;
     }
 }

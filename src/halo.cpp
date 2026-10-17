@@ -37,6 +37,7 @@
 #include "launcher.h"
 #include "label.h"
 #include "multimon.h"
+#include "previews.h"
 #include "winkey.h"
 
 // Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
@@ -81,9 +82,14 @@ constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 // Test hook (HALO_TEST=1): wParam 0 = open the launcher panel without Command Palette, 1 = close it, else Launcher::TestCommand.
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
+constexpr UINT kMsgTestBounce = WM_APP + 30;  // HALO_TEST=1: wParam = dock item to bounce (no launch)
 constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
+constexpr UINT_PTR kPreviewTimer = 21;  // the pointer rested on a running app
+constexpr UINT_PTR kPreviewGrace = 22;  // the pointer left the icon and the strip
+constexpr UINT kPreviewDelayMs = 400;
+constexpr UINT kPreviewGraceMs = 300;
 constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
 
 void Log(std::wstring const& msg) {
@@ -137,6 +143,10 @@ private:
     void UpdateRegion();
     wuc::CompositionBrush IconBrushFor(std::wstring const& path);
     void Activate(size_t item);
+    void ActivateWindow(HWND w);
+    void ShowPreviewsFor(int item);
+    void RefreshPreviews();
+    void HidePreviews(bool instant = false);
     void PointerMove(float x, float y = 0.0f);
     void PointerLeave();
     void Reveal();
@@ -168,6 +178,9 @@ private:
     std::unique_ptr<DockCluster> m_cluster;
     std::unique_ptr<halo::AppLabel> m_label;
     std::unique_ptr<halo::Launcher> m_launcher;
+    std::unique_ptr<halo::Previews> m_previews;
+    int m_hoverItem = -1;           // the dock icon the pointer is on
+    std::wstring m_previewKey;      // the app the strip shows
     std::unique_ptr<halo::IntellihideDetector> m_intellihide;
     std::unique_ptr<halo::MultiMonitorFollower> m_multimon;
     std::unique_ptr<halo::ControlCenter> m_cc;
@@ -279,6 +292,15 @@ bool Halo::Create(HINSTANCE inst) {
                 host.closed = [this] { if (!m_trackingMouse) PointerLeave(); };  // the dock may auto-hide again
                 m_launcher = std::make_unique<halo::Launcher>(inst, m_comp, m_gdev, std::move(host));
                 m_tracker->onForeground = [this](RunningApp const& app) { m_launcher->Note(LaunchTarget(app)); };
+            });
+            Step(L"previews", [&] {
+                halo::PreviewsHost host;
+                host.glass = [this](int noiseHeight) { return BuildPill(noiseHeight); };
+                host.activate = [this](HWND w) { ActivateWindow(w); };
+                host.entered = [this] { KillTimer(m_hwnd, kPreviewGrace); Reveal(); };
+                host.left = [this] { SetTimer(m_hwnd, kPreviewGrace, kPreviewGraceMs, nullptr); };
+                host.refresh = [this] { RefreshPreviews(); };
+                m_previews = std::make_unique<halo::Previews>(inst, m_comp, m_gdev, std::move(host));
             });
         }
     }
@@ -529,6 +551,12 @@ void Halo::RefreshDock() {
     Log(std::to_wstring(running.size()) + L" running apps, " + std::to_wstring(items.size()) + L" icons");
     m_dock->SetItems(items);
     UpdateRegion();
+    if (_wgetenv(L"HALO_TEST"))  // where a test can hover: the pointer x of each running app's icon
+        for (size_t i = 0; i < m_items.size(); i++)
+            if (!m_items[i].key.empty())
+                Log(L"test icon " + std::to_wstring(i) + L" " + m_appNames[i] + L" x=" +
+                    std::to_wstring(static_cast<int>(m_dock->RestIconCenter(i).first)) + L" windows=" +
+                    std::to_wstring(m_tracker->WindowsOf(m_items[i].key).size()));
 }
 
 RECT Halo::GetPillRectScreen() const {
@@ -600,14 +628,32 @@ void Halo::UpdateRegion() {
     Log(L"input region x " + std::to_wstring(left) + L".." + std::to_wstring(right) + (hidden ? L" (strip)" : L""));
 }
 
-// macOS: a running app comes to the front (its most recent window,
-// restored if minimized); one that isn't running is launched.
+// Brings one window to the front, restoring it if minimized. Sent, not ShowWindow'd, so the
+// restore runs in the app and the genie mod can animate it.
+void Halo::ActivateWindow(HWND w) {
+    HidePreviews();
+    if (IsIconic(w)) SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
+    SetForegroundWindow(w);
+}
+
+// macOS: a running app comes to the front (its most recent window, restored if minimized) with a
+// short bob; clicking it while it is already in front minimizes it; one that isn't running is launched.
 void Halo::Activate(size_t item) {
     Item const& it = m_items[item];
+    HidePreviews();
+    KillTimer(m_hwnd, kPreviewTimer);
     if (HWND w = it.key.empty() ? nullptr : m_tracker->Front(it.key)) {
-        // Sent, not ShowWindow'd, so the restore runs in the app and the genie mod can animate it.
-        if (IsIconic(w)) SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
-        SetForegroundWindow(w);
+        HWND fg = GetForegroundWindow();
+        if (_wgetenv(L"HALO_TEST"))
+            Log(L"activate: key=" + it.key + L" front=" + std::to_wstring(reinterpret_cast<uintptr_t>(w)) + L" fg=" +
+                std::to_wstring(reinterpret_cast<uintptr_t>(fg)) + L" fgKey=" + m_tracker->KeyOf(fg));
+        if (fg && m_tracker->KeyOf(fg) == it.key) {
+            for (HWND h : m_tracker->WindowsOf(it.key))
+                if (!IsIconic(h)) SendMessageTimeoutW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
+            return;
+        }
+        m_dock->Bob(static_cast<int>(item));
+        ActivateWindow(w);
     } else if (!it.launch.empty()) {
         // Bounce first: ShellExecute can block this thread for a while, the animation runs without it.
         if (m_launcher) m_launcher->Note(it.launch);
@@ -616,12 +662,53 @@ void Halo::Activate(size_t item) {
     }
 }
 
+void Halo::HidePreviews(bool instant) {
+    KillTimer(m_hwnd, kPreviewGrace);
+    if (m_previews) m_previews->Hide(instant);
+}
+
+// (Re)lists the windows of the app the strip shows; follows its icon, or drops the strip if the app is gone.
+void Halo::RefreshPreviews() {
+    if (!m_previews || !m_previews->IsVisible() || !m_tracker || !m_dock) return;
+    auto wins = m_tracker->WindowsOf(m_previewKey);
+    for (size_t i = 0; i < m_items.size(); i++) {
+        if (m_items[i].key != m_previewKey || wins.empty()) continue;
+        auto [cx, topY] = m_dock->MagnifiedIconCenterAndTop(i);
+        m_previews->Show(wins, m_full.left + static_cast<int>(cx), GetPillRectScreen().top, m_monitor, m_scale.v);
+        return;
+    }
+    HidePreviews();
+}
+
+void Halo::ShowPreviewsFor(int item) {
+    if (!m_previews || item < 0 || item >= static_cast<int>(m_items.size()) || m_items[item].key.empty()) return;
+    m_previewKey = m_items[item].key;
+    if (m_label) m_label->Hide();
+    auto wins = m_tracker->WindowsOf(m_previewKey);
+    auto [cx, topY] = m_dock->MagnifiedIconCenterAndTop(item);
+    m_previews->Show(wins, m_full.left + static_cast<int>(cx), GetPillRectScreen().top, m_monitor, m_scale.v);
+}
+
 void Halo::PointerMove(float x, float y) {
     if (m_autoHide) Reveal();
     if (m_dock) m_dock->OnPointerMove(x);
+    if (m_dock && m_previews) {
+        int hit = m_dock->HitTest(x, y);
+        bool running = hit >= 0 && hit < static_cast<int>(m_items.size()) && !m_items[hit].key.empty();
+        if (hit != m_hoverItem) {
+            m_hoverItem = hit;
+            KillTimer(m_hwnd, kPreviewTimer);
+            if (running && m_previews->IsVisible()) ShowPreviewsFor(hit);                    // follow to the next app
+            else if (running) SetTimer(m_hwnd, kPreviewTimer, kPreviewDelayMs, nullptr);     // rest first
+            else if (m_previews->IsVisible()) SetTimer(m_hwnd, kPreviewGrace, kPreviewGraceMs, nullptr);
+        }
+        if (running) KillTimer(m_hwnd, kPreviewGrace);
+    }
     if (m_dock && m_label) {
         int hit = m_dock->HitTest(x, y);
-        if (hit >= 0 && hit < static_cast<int>(m_appNames.size()) && !m_appNames[hit].empty()) {
+        if (m_previews && m_previews->IsVisible()) {
+            m_label->Hide();  // the strip names the windows
+        } else if (hit >= 0 && hit < static_cast<int>(m_appNames.size()) && !m_appNames[hit].empty()) {
             auto [cx, topY] = m_dock->MagnifiedIconCenterAndTop(hit);
             m_label->Show(m_appNames[hit], cx, topY);
         } else {
@@ -633,6 +720,12 @@ void Halo::PointerMove(float x, float y) {
 void Halo::PointerLeave() {
     if (m_label) m_label->Hide();
     if (m_dock) m_dock->OnPointerLeave();
+    m_hoverItem = -1;
+    KillTimer(m_hwnd, kPreviewTimer);
+    if (m_previews && m_previews->IsVisible()) {  // time to move onto the strip; the dock stays up meanwhile
+        SetTimer(m_hwnd, kPreviewGrace, kPreviewGraceMs, nullptr);
+        return;
+    }
     if (m_autoHide && m_state == State::Shown) {
         if (!m_intellihide || m_intellihide->HasOverlap() || m_intellihide->IsFullscreen()) {
             SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
@@ -699,6 +792,7 @@ void Halo::StartHide() {
     if (m_state != State::Shown) return;
     if (m_launcher && m_launcher->IsOpen()) return;  // the panel is up; its close brings the hide back
     m_state = State::Hiding;
+    HidePreviews(true);
     if (m_label) m_label->Hide();
     if (m_dock) m_dock->OnPointerLeave();  // magnification relaxes as the dock drops
     unsigned gen = ++m_hideGen;
@@ -778,7 +872,8 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             m_trackingMouse = false;
             PointerLeave();
             return 0;
-        case kMsgTestMove: PointerMove(static_cast<float>(w), m_metrics.bottom - m_metrics.pillHeight / 2.0f); return 0;
+        case kMsgTestBounce: if (m_dock && _wgetenv(L"HALO_TEST")) m_dock->Bounce(static_cast<int>(w)); return 0;
+        case kMsgTestMove: Reveal(); PointerMove(static_cast<float>(w), m_metrics.bottom - m_metrics.pillHeight / 2.0f); return 0;
         case kMsgTestLeave: PointerLeave(); return 0;
         case kMsgTestLauncher:
             if (m_launcher && !m_autoHide) {
@@ -806,6 +901,15 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (w == kHideTimer) {
                 KillTimer(m_hwnd, kHideTimer);
                 StartHide();
+            } else if (w == kPreviewTimer) {
+                KillTimer(m_hwnd, kPreviewTimer);
+                if (m_hoverItem >= 0 && m_state == State::Shown) ShowPreviewsFor(m_hoverItem);
+            } else if (w == kPreviewGrace) {
+                KillTimer(m_hwnd, kPreviewGrace);
+                if (m_previews && !m_previews->ContainsCursor()) {
+                    m_previews->Hide();
+                    if (!m_trackingMouse) PointerLeave();  // now the dock may auto-hide
+                }
             } else if (w == DockCluster::kClockTimer) {
                 if (m_dock) m_dock->OnClockTimer();
             }
@@ -847,11 +951,12 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case kMsgAppsChanged:
             if (m_dock) RefreshDock();
+            RefreshPreviews();
             return 0;
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
             return 0;
-        case WM_CLOSE: m_cc.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
+        case WM_CLOSE: m_previews.reset(); m_cc.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);
