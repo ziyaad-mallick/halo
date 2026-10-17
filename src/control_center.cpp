@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <powrprof.h>
 #include <thread>
 #include <vector>
 
@@ -50,29 +51,29 @@ namespace {
 // 24 panel radius, 18 module radius. The window is the panel plus motion::kPad of empty margin on every
 // side, so the spring's overshoot never clips; everything below is in panel ("pill") coordinates.
 constexpr float kW = 340, kInset = 14, kGap = 10, kRadius = 24, kTileR = 18;
-constexpr float kPillH = 60, kRowH = 68, kSliderH = 68, kMediaH = 88, kSqH = 66, kSqW = 66, kBattW = 84;
+constexpr float kPillH = 60, kRowH = 68, kSliderH = 52, kMediaH = 88, kHeadH = 76, kActH = 60, kPowH = 48;
 constexpr float kMaxH = 900, kMargin = 8;
 constexpr int kMaxOutputs = 6;
 
 constexpr UINT kMsgAudio = WM_APP + 1, kMsgMic = WM_APP + 2, kMsgRadios = WM_APP + 3, kMsgBright = WM_APP + 4,
                kMsgMedia = WM_APP + 5, kMsgWifi = WM_APP + 6, kMsgBt = WM_APP + 7, kMsgLate = WM_APP + 8;
-constexpr UINT_PTR kTimerClose = 1, kTimerChord = 2;
+constexpr UINT_PTR kTimerClose = 1, kTimerChord = 2, kTimerClock = 3;
 constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloControlCenterTimers";
 
 enum class Id {
     None, WifiPill, BtPill, WifiText, BtText, Wifi, Bluetooth, RowTile, Airplane, Hotspot, Night, Dark, Dnd,
     DisplayTile, Bright, SoundTile, Vol, OutRow, OutDev, ListTile, WifiNet, BtDev, MediaTile, Prev, PlayPause, Next,
-    Snip, Cast, Settings, Battery
+    Snip, Cast, Settings, Battery, Header, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut
 };
 bool Passive(Id id) {
     return id == Id::WifiPill || id == Id::BtPill || id == Id::RowTile || id == Id::DisplayTile || id == Id::SoundTile ||
-           id == Id::ListTile || id == Id::MediaTile;
+           id == Id::ListTile || id == Id::MediaTile || id == Id::Header || id == Id::PowerTile;
 }
 // Controls that squash to 0.96 under the finger (their drawing is lifted onto its own little surface).
 bool Scalable(Id id) {
     return id == Id::Wifi || id == Id::Bluetooth || id == Id::Airplane || id == Id::Hotspot || id == Id::Night ||
            id == Id::Dark || id == Id::Dnd || id == Id::Snip || id == Id::Cast || id == Id::Settings ||
-           id == Id::Battery || id == Id::Prev || id == Id::PlayPause || id == Id::Next;
+           id == Id::Battery || id == Id::Lock || id == Id::Power || id == Id::Mic || id == Id::Prev || id == Id::PlayPause || id == Id::Next;
 }
 enum class Expand { None, Wifi, Bluetooth };
 
@@ -123,7 +124,7 @@ struct ControlCenter::Impl {
 
     // Kept across opens: the DirectWrite factory and formats, and the grain texture.
     winrt::com_ptr<IDWriteFactory> dw;
-    winrt::com_ptr<IDWriteTextFormat> fTime, fDate, fTitle, fSub, fSubR, fBatt, fIcon, fIconS, fPill, fCap;
+    winrt::com_ptr<IDWriteTextFormat> fTime, fDate, fTitle, fSub, fSubR, fBatt, fIcon, fIconS, fPill, fCap, fBtn;
     wuc::CompositionBrush noiseBrush{nullptr};
     int noiseW = 0;
 
@@ -144,6 +145,8 @@ struct ControlCenter::Impl {
     std::vector<Item> items;
     Item hover, pressed;
     bool tracking = false;
+    bool powerOpen = false;
+    WORD lastMin = 0xFFFF;
     Id drag = Id::None;
     ULONGLONG lastBrightSet = 0;
     WORD chordKey = 0;
@@ -178,6 +181,7 @@ struct ControlCenter::Impl {
     void LaunchAfterClose(wchar_t const* uri);
     void DeferChord(WORD key, bool shift);
     void DragTo(float x);
+    void RunPowerAfterClose(int item);
     Item const* HitAt(float x, float y) const;
     float TextWidth(std::wstring const& t, IDWriteTextFormat* f);
     SIZE WindowPx() const;
@@ -240,7 +244,12 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_ERASEBKGND: return 1;
         case WM_ACTIVATE:
-            if (LOWORD(w) == WA_INACTIVE && st == St::Open) Close();  // clicked outside
+            if (LOWORD(w) == WA_INACTIVE && st == St::Open) {  // clicked outside, unless it was the notification column
+                HWND other = reinterpret_cast<HWND>(l);
+                if (other && api->siblingHwnd && other == api->siblingHwnd()) return 0;
+                svc::Log(L"panel deactivated, closing (focus went to " + std::to_wstring(reinterpret_cast<uintptr_t>(other)) + L")");
+                Close();
+            }
             return 0;
         case WM_KEYDOWN:
             if (w == VK_ESCAPE) Close();
@@ -318,6 +327,11 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_TIMER:
             if (w == kTimerClose) Teardown();
+            else if (w == kTimerClock && st == St::Open) {
+                SYSTEMTIME t;
+                GetLocalTime(&t);
+                if (t.wMinute != lastMin) Render();
+            }
             return 0;
         case WM_NCDESTROY: hwnd = nullptr; break;
     }
@@ -339,9 +353,7 @@ void ControlCenter::Impl::Open() {
     QueryPerformanceCounter(&q0);
     QueryPerformanceFrequency(&qf);
 
-    POINT pt{};
-    GetCursorPos(&pt);
-    HMONITOR hm = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    HMONITOR hm = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);  // one column on the primary monitor
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(hm, &mi);
     mon = mi.rcMonitor;
@@ -377,6 +389,7 @@ void ControlCenter::Impl::Open() {
             svc::Log(L"open latency Open()->ShowWindow: " + std::to_wstring((q1.QuadPart - q0.QuadPart) * 10000 / qf.QuadPart / 10.0) + L" ms");
         }
         Focus();
+        SetTimer(hwnd, kTimerClock, 15000, nullptr);
         // Async sources fill in as they arrive.
         radios.Start(hwnd, kMsgRadios);
         media.Start(hwnd, kMsgMedia, [this] { if (st == St::Open) Render(); });
@@ -430,6 +443,7 @@ void ControlCenter::Impl::Teardown() {
     svc::BtStop();
     drag = Id::None;
     outsOpen = false;
+    powerOpen = false;
     expand = Expand::None;
     btAsked = false;
     hover = pressed = {};
@@ -630,6 +644,34 @@ void ControlCenter::Impl::LaunchAfterClose(wchar_t const* uri) {
     }).detach();
 }
 
+// Sleep / Restart / Shut down from the inline choice. The panel fades first; under HALO_TEST or
+// HALO_TEST_POWER_DRYRUN (or the CC dry run) it only logs.
+void ControlCenter::Impl::RunPowerAfterClose(int item) {
+    static wchar_t const* const names[] = {L"Sleep", L"Restart", L"Shut down"};
+    wchar_t const* env = _wgetenv(L"HALO_TEST_POWER_DRYRUN");
+    if (svc::DryRun() || _wgetenv(L"HALO_TEST") || (env && env[0] == L'1')) {
+        svc::Log(std::wstring(L"power: DRY RUN, would run ") + names[item]);
+        Close();
+        return;
+    }
+    svc::Log(std::wstring(L"power: ") + names[item]);
+    Close();
+    std::thread([item] {
+        Sleep(280);
+        constexpr DWORD kReason = SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED;
+        if (item == 0) { SetSuspendState(FALSE, FALSE, FALSE); return; }
+        HANDLE t = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &t)) {
+            TOKEN_PRIVILEGES tp{};
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (LookupPrivilegeValueW(nullptr, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid)) AdjustTokenPrivileges(t, FALSE, &tp, 0, nullptr, nullptr);
+            CloseHandle(t);
+        }
+        ExitWindowsEx(item == 1 ? EWX_REBOOT : EWX_POWEROFF, kReason);
+    }).detach();
+}
+
 void ControlCenter::Impl::Click(Item const& it) {
     if (svc::DryRun()) svc::Log(L"click id=" + std::to_wstring(static_cast<int>(it.id)) + L" arg=" + std::to_wstring(it.arg));
     switch (it.id) {
@@ -705,6 +747,21 @@ void ControlCenter::Impl::Click(Item const& it) {
         case Id::Snip: LaunchAfterClose(L"ms-screenclip:"); return;
         case Id::Cast: LaunchAfterClose(L"ms-settings-connectabledevices:devicediscovery"); return;
         case Id::Settings: LaunchAfterClose(L"ms-settings:"); return;
+        case Id::Lock:
+            if (svc::DryRun()) { svc::Log(L"DRYRUN lock workstation"); break; }
+            Close();
+            std::thread([] { Sleep(250); LockWorkStation(); }).detach();
+            return;
+        case Id::Power: powerOpen = !powerOpen; break;
+        case Id::PowSleep: RunPowerAfterClose(0); return;
+        case Id::PowRestart: RunPowerAfterClose(1); return;
+        case Id::PowShut: RunPowerAfterClose(2); return;
+        case Id::Mic:
+            if (!mic.Available()) return;
+            micMuted = !micMuted;
+            mic.SetMute(micMuted);
+            Pulse(it);
+            break;
         case Id::OutRow: outsOpen = !outsOpen; break;
         case Id::OutDev: {
             auto id = outs[it.arg].id;
@@ -756,6 +813,11 @@ void ControlCenter::Impl::Layout() {
     float y = kInset;
     auto add = [&](Id id, D2D1_RECT_F r, int arg = 0, float rad = 10) { items.push_back({id, r, arg, rad}); };
 
+    // Header module: the time and date, and the power mode + battery (click cycles the mode).
+    add(Id::Header, {x0, y, x1, y + kHeadH}, 0, kTileR);
+    add(Id::Battery, {x1 - 14 - 124, y + (kHeadH - 44) / 2, x1 - 14, y + (kHeadH - 44) / 2 + 44}, 0, 16);
+    y += kHeadH + kGap;
+
     // Row 1: two half-width pills. The icon toggles the radio, the text (and chevron) opens its list.
     const float pw = (x1 - x0 - kGap) / 2;
     for (int i = 0; i < 2; i++) {
@@ -792,19 +854,20 @@ void ControlCenter::Impl::Layout() {
         y += kRowH + kGap;
     }
 
+    // Slim Display and Sound sliders.
     if (bright >= 0) {
         add(Id::DisplayTile, {x0, y, x1, y + kSliderH}, 0, kTileR);
-        add(Id::Bright, {x0 + 14, y + 34, x1 - 14, y + 58});
+        add(Id::Bright, {x0 + 14, y + 27, x1 - 14, y + 47});
         y += kSliderH + kGap;
     }
     if (speaker.Available()) {
         float extra = outsOpen ? outs.size() * 32.0f + 6 : 0;
         add(Id::SoundTile, {x0, y, x1, y + kSliderH + extra}, 0, kTileR);
-        add(Id::OutRow, {x0 + 100, y + 6, x1 - 8, y + 30}, 0, 10);
-        add(Id::Vol, {x0 + 14, y + 34, x1 - 14, y + 58});
+        add(Id::OutRow, {x0 + 100, y + 4, x1 - 8, y + 26}, 0, 10);
+        add(Id::Vol, {x0 + 14, y + 27, x1 - 14, y + 47});
         if (outsOpen)
             for (size_t i = 0; i < outs.size(); i++)
-                add(Id::OutDev, {x0 + 8, y + 66 + i * 32, x1 - 8, y + 98 + i * 32}, static_cast<int>(i), 12);
+                add(Id::OutDev, {x0 + 8, y + kSliderH - 2 + i * 32, x1 - 8, y + kSliderH + 30 + i * 32}, static_cast<int>(i), 12);
         y += kSliderH + extra + kGap;
     }
     if (media.State().has) {
@@ -815,16 +878,26 @@ void ControlCenter::Impl::Layout() {
         y += kMediaH + kGap;
     }
 
-    // Bottom row: three square shortcuts and the battery.
+    // Quick actions: round buttons.
     {
-        Id ids[] = {Id::Snip, Id::Cast, Id::Settings};
-        for (int i = 0; i < 3; i++) {
-            float l = x0 + i * (kSqW + kGap);
-            add(ids[i], {l, y, l + kSqW, y + kSqH}, 0, kTileR);
+        add(Id::RowTile, {x0, y, x1, y + kActH}, 0, kTileR);
+        Id ids[] = {Id::Settings, Id::Lock, Id::Power, Id::Mic, Id::Snip, Id::Cast};
+        float step = (x1 - x0 - 2 * 30) / 5;
+        for (int i = 0; i < 6; i++) {
+            float cx = x0 + 30 + i * step, cy = y + kActH / 2;
+            add(ids[i], {cx - 22, cy - 22, cx + 22, cy + 22}, 0, 22);
         }
-        add(Id::Battery, {x1 - kBattW, y, x1, y + kSqH}, 0, kTileR);
-        y += kSqH + kInset;
+        y += kActH + kGap;
     }
+    // The inline Sleep / Restart / Shut down choice under the actions.
+    if (powerOpen) {
+        add(Id::PowerTile, {x0, y, x1, y + kPowH}, 0, kTileR);
+        Id ids[] = {Id::PowSleep, Id::PowRestart, Id::PowShut};
+        float w3 = (x1 - x0 - 16) / 3;
+        for (int i = 0; i < 3; i++) add(ids[i], {x0 + 8 + i * w3, y + 6, x0 + 8 + (i + 1) * w3, y + kPowH - 6}, 0, 14);
+        y += kPowH + kGap;
+    }
+    y += kInset - kGap;
     height = std::min({y, kMaxH, std::max(200.0f, (mon.bottom - mon.top) / s - 2 * kMargin)});
 }
 
@@ -922,10 +995,20 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         auto const& r = it.r;
         const float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
         switch (it.id) {
-            case Id::WifiPill: case Id::BtPill: case Id::RowTile: case Id::DisplayTile: case Id::SoundTile: case Id::ListTile: case Id::MediaTile:
+            case Id::WifiPill: case Id::BtPill: case Id::RowTile: case Id::DisplayTile: case Id::SoundTile: case Id::ListTile: case Id::MediaTile: case Id::Header: case Id::PowerTile:
                 tile(r, kTileR);
-                if (it.id == Id::DisplayTile) txt(L"Display", fTitle.get(), {r.left + 16, r.top + 8, r.right - 16, r.top + 28}, kText);
-                if (it.id == Id::SoundTile) txt(L"Sound", fTitle.get(), {r.left + 16, r.top + 8, r.left + 96, r.top + 28}, kText);
+                if (it.id == Id::Header) {
+                    wchar_t tb[32] = L"", db[64] = L"";
+                    SYSTEMTIME now;
+                    GetLocalTime(&now);
+                    lastMin = now.wMinute;
+                    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS | TIME_NOTIMEMARKER, &now, nullptr, tb, 32);
+                    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &now, L"dddd, d MMMM", db, 64, nullptr);
+                    txt(tb, fTime.get(), {r.left + 16, r.top + 6, r.left + 170, r.top + 52}, kText);
+                    txt(db, fDate.get(), {r.left + 17, r.top + 50, r.left + 176, r.top + 70}, kDim);
+                }
+                if (it.id == Id::DisplayTile) txt(L"Display", fTitle.get(), {r.left + 16, r.top + 4, r.right - 16, r.top + 25}, kText);
+                if (it.id == Id::SoundTile) txt(L"Sound", fTitle.get(), {r.left + 16, r.top + 4, r.left + 96, r.top + 25}, kText);
                 if (it.id == Id::ListTile)
                     txt(expand == Expand::Wifi ? L"Known Wi-Fi networks" : L"Paired Bluetooth devices", fTitle.get(),
                         {r.left + 16, r.top + 10, r.right - 16, r.top + 32}, kText);
@@ -957,32 +1040,35 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             case Id::Night: icon(cx, cy, 22, night, true, 0xF08C, fIcon.get(), false); break;
             case Id::Dark: icon(cx, cy, 22, dark, true, 0, fIcon.get(), true); break;
             case Id::Dnd: icon(cx, cy, 22, dnd, true, 0xE708, fIcon.get(), false); break;
-            case Id::Snip: case Id::Cast: case Id::Settings: {
-                wchar_t g = it.id == Id::Snip ? 0xE8C6 : it.id == Id::Cast ? 0xE7F4 : 0xE713;
-                wchar_t const* label = it.id == Id::Snip ? L"Snip" : it.id == Id::Cast ? L"Cast" : L"Settings";
-                tile(r, kTileR);
-                glyph(g, fIcon.get(), {r.left, r.top + 10, r.right, r.top + 40}, kText);
-                txt(label, fCap.get(), {r.left + 2, r.top + 42, r.right - 2, r.bottom - 4}, ColorF(1, 1, 1, 0.72f));
+            case Id::Snip: icon(cx, cy, 22, false, true, 0xE8C6, fIcon.get(), false); break;
+            case Id::Cast: icon(cx, cy, 22, false, true, 0xE7F4, fIcon.get(), false); break;
+            case Id::Settings: icon(cx, cy, 22, false, true, 0xE713, fIcon.get(), false); break;
+            case Id::Lock: icon(cx, cy, 22, false, true, 0xE72E, fIcon.get(), false); break;
+            case Id::Power: icon(cx, cy, 22, powerOpen, true, 0xE7E8, fIcon.get(), false); break;
+            case Id::Mic: icon(cx, cy, 22, micMuted, mic.Available(), micMuted ? 0xEC54 : 0xE720, fIcon.get(), false); break;
+            case Id::PowSleep: case Id::PowRestart: case Id::PowShut:
+                box(r, 14, ColorF(1, 1, 1, 0.10f));
+                txt(it.id == Id::PowSleep ? L"Sleep" : it.id == Id::PowRestart ? L"Restart" : L"Shut down", fBtn.get(), r, kText);
                 break;
-            }
             case Id::Battery: {
-                tile(r, kTileR);
+                box(r, 16, ColorF(1, 1, 1, 0.12f));
                 if (battery.hasBattery) {
                     int lvl = std::min(10, battery.percent / 10);
                     wchar_t g = static_cast<wchar_t>((battery.ac ? 0xEBAB : 0xEBA0) + lvl);
-                    glyph(g, fIcon.get(), {r.left + 8, r.top + 10, r.left + 34, r.top + 36}, kText);
-                    txt(std::to_wstring(battery.percent) + L"%", fBatt.get(), {r.left + 34, r.top + 10, r.right - 6, r.top + 36}, kText);
+                    glyph(g, fIcon.get(), {r.left + 6, r.top, r.left + 32, r.bottom}, kText);
                 } else {
-                    glyph(0xE83E, fIcon.get(), {r.left, r.top + 10, r.right, r.top + 36}, kText);  // plug
+                    glyph(0xE83E, fIcon.get(), {r.left + 6, r.top, r.left + 32, r.bottom}, kText);  // plug
                 }
                 std::wstring cap = battery.ac ? L"Plugged in" : L"Battery";
-                switch (mode) {  // short names: the tile is 84 px wide
+                switch (mode) {
                     case svc::PowerMode::Efficiency: cap = L"Efficiency"; break;
                     case svc::PowerMode::Balanced: cap = L"Balanced"; break;
                     case svc::PowerMode::Performance: case svc::PowerMode::Max: cap = L"Performance"; break;
                     default: break;
                 }
-                txt(cap, fCap.get(), {r.left + 4, r.top + 42, r.right - 4, r.bottom - 4}, ColorF(1, 1, 1, 0.72f));
+                std::wstring top = battery.hasBattery ? std::to_wstring(battery.percent) + L"%" : cap;
+                txt(top, fBatt.get(), {r.left + 36, r.top + 4, r.right - 6, cy + 2}, kText);
+                if (battery.hasBattery) txt(cap, fSub.get(), {r.left + 36, cy + 1, r.right - 6, r.bottom - 3}, kDim);
                 break;
             }
             case Id::Bright: case Id::Vol: {
@@ -1080,6 +1166,9 @@ void ControlCenter::Impl::BuildFonts() {
     mk(fIcon, L"Segoe Fluent Icons", R, 18, C, M);
     mk(fIconS, L"Segoe Fluent Icons", R, 14, C, M);
     mk(fCap, L"Segoe UI Variable Text", R, 11, C, N);
+    mk(fTime, L"Segoe UI Variable Display", SB, 34, L, N);
+    mk(fDate, L"Segoe UI Variable Text", R, 12, L, N);
+    mk(fBtn, L"Segoe UI Variable Text", SB, 12.5f, C, M);
 }
 
 // Same recipe as the dock pill (Halo::BuildPill): blurred backdrop, #16161A tint at 50%, 2.5% grain,
@@ -1223,5 +1312,6 @@ void ControlCenter::Close() { m->Close(); }
 bool ControlCenter::IsOpen() const { return m->st == Impl::St::Open; }
 // The panel itself (physical px), not the padded window.
 RECT ControlCenter::PanelRectScreen() const { return m->st == Impl::St::Closed ? RECT{} : m->rect; }
+HWND ControlCenter::Hwnd() const { return m->st == Impl::St::Closed ? nullptr : m->hwnd; }
 
 }  // namespace halo

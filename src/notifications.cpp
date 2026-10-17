@@ -62,13 +62,14 @@ namespace halo {
 namespace {
 
 // Logical px; everything is scaled by the monitor DPI.
-constexpr float kW = 360;             // panel width
+constexpr float kWStd = 360;          // panel width when standalone (attached, it follows the Control Center)
 constexpr float kEdge = 10;           // gap to the screen edge (right and top)
 constexpr float kPad = 14, kIcon = 32, kTextX = kPad + kIcon + 10, kRadius = 18, kGap = 10, kPeek = 10;
 constexpr float kHeaderY = 12, kTitleY = 30, kBodyY = 48, kLine = 15, kMinH = 62, kCollapseH = 28;
 constexpr float kHeadH = 38, kMoreH = 28, kEmptyH = 56;
-constexpr float kCalHead = 74, kCalNav = 26, kCalDow = 18, kCalRow = 26, kCalH = kCalHead + kCalNav + 4 + kCalDow + 2 + 6 * kCalRow + 12;
-constexpr int kMaxCards = 6;
+constexpr float kCalHeadStd = 74, kCalNav = 26, kCalDow = 18, kCalRowStd = 26, kCalHStd = kCalHeadStd + kCalNav + 4 + kCalDow + 2 + 6 * kCalRowStd + 12;
+constexpr int kMaxCards = 6, kMaxCardsAttached = 3;
+constexpr float kAttachGap = 10, kAttachMargin = 8;  // below the Control Center; to the screen bottom
 constexpr UINT kMsgData = WM_APP + 1;
 constexpr UINT_PTR kTimerGone = 1, kTimerClose = 2;
 constexpr wchar_t kClass[] = L"HaloNotifications", kMsgClass[] = L"HaloNotificationsMsg";
@@ -98,6 +99,7 @@ enum class K { Header, Notif, Group, Collapse, More, Empty, Calendar };
 struct Row {
     std::wstring key;
     K kind = K::Notif;
+    bool clearBtn = false;  // attached mode: the first card carries a small "Clear"
     int count = 1;  // Group: notifications in it. More: how many are not shown.
     std::wstring groupKey;
     std::vector<UINT> ids;  // what the x removes
@@ -230,6 +232,7 @@ int DaysIn(int y, int m) {
 }  // namespace
 
 struct NotificationCenter::Impl {
+    NotificationCenter* api;
     HINSTANCE inst;
     wuc::Compositor comp;
     wuc::CompositionGraphicsDevice gdev;
@@ -263,6 +266,11 @@ struct NotificationCenter::Impl {
     float s = 1;
     RECT work{};
     float availH = 800;  // logical px a column of content may use
+    // Geometry. Standalone these are the constants; attached to the Control Center the width is the CC's
+    // and the calendar drops its big date (the CC header has it) and may use shorter rows.
+    float kW = kWStd, kCalHead = kCalHeadStd, kCalRow = kCalRowStd, kCalH = kCalHStd;
+    bool attached = false;
+    RECT anchorRc{};  // the Control Center panel on screen (physical px)
     wuc::Desktop::DesktopWindowTarget target{nullptr};
     wuc::ContainerVisual root{nullptr}, panelVis{nullptr};
     wuc::CompositionBrush noise{nullptr};
@@ -280,7 +288,7 @@ struct NotificationCenter::Impl {
     winrt::com_ptr<IDWriteFactory> dw;
     winrt::com_ptr<IDWriteTextFormat> fApp, fTime, fTitle, fBody, fPill, fCount, fHead, fClear, fBig, fCalDow, fNav, fDay, fDayB, fDow;
 
-    Impl(HINSTANCE i, wuc::Compositor c, wuc::CompositionGraphicsDevice g) : inst(i), comp(std::move(c)), gdev(std::move(g)) {}
+    Impl(NotificationCenter* a, HINSTANCE i, wuc::Compositor c, wuc::CompositionGraphicsDevice g) : api(a), inst(i), comp(std::move(c)), gdev(std::move(g)) {}
 
     void Start();
     void Stop();
@@ -297,11 +305,14 @@ struct NotificationCenter::Impl {
     void Update(bool firstShow);
     void CreateCard(Card& c);
     void Draw(Card& c, bool hover, int part);
-    void DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, bool hover, bool closeHover);
+    void DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, bool hover, bool closeHover, bool clearHover);
     void DrawHeader(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, int part);
     void DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, int part);
     void Place();
-    float2 Anchor() const { return {(kW + motion::kPad) * s, (totalH / 2 + motion::kPad) * s}; }
+    void ApplyGeometry();
+    void Dismissed() { if (api->onDismiss) api->onDismiss(); else Close(); }
+    float2 Anchor() const { return attached ? float2{std::ceil(kW * s), 0} : float2{(kW + motion::kPad) * s, (totalH / 2 + motion::kPad) * s}; }
+    float2 Travel() const { return attached ? float2{0, -28.0f * s} : float2{48.0f * s, 0}; }  // attached: the Control Center's motion
     void AnimateIn(Card& c, int order);
     void AnimateOut(Card& c);
     int CardAt(float x, float y, int* part);
@@ -583,6 +594,7 @@ int NotificationCenter::Impl::CardAt(float x, float y, int* part) {
             case K::Notif: case K::Group: {
                 float cx = kW - kPad - 9, cy = kHeaderY + 8;
                 *part = (x - cx) * (x - cx) + (ly - cy) * (ly - cy) <= 11 * 11 ? 1 : 0;
+                if (r.clearBtn && x >= kW - kPad - 118 && x < kW - kPad - 70 && ly >= kHeaderY - 3 && ly < kHeaderY + 17) *part = 2;
                 break;
             }
             case K::Collapse: *part = 0; break;
@@ -607,10 +619,14 @@ LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_ERASEBKGND: return 1;
         case WM_ACTIVATE:
-            if (LOWORD(w) == WA_INACTIVE && st == St::Open) Close();  // clicked outside
+            if (LOWORD(w) == WA_INACTIVE && st == St::Open) {  // clicked outside, unless it was the Control Center
+                HWND other = reinterpret_cast<HWND>(l);
+                if (other && api->siblingHwnd && other == api->siblingHwnd()) return 0;
+                Dismissed();
+            }
             return 0;
         case WM_KEYDOWN:
-            if (w == VK_ESCAPE) Close();
+            if (w == VK_ESCAPE) Dismissed();
             return 0;
         case WM_NCHITTEST: {
             POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
@@ -649,8 +665,8 @@ LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             Row r = cards[i].row;  // copy: Update() rebuilds the cards
             switch (r.kind) {
                 case K::Collapse: expanded.erase(r.groupKey); Update(false); break;
-                case K::Notif: if (part == 1) Dismiss(r); else Activate(r); break;
-                case K::Group: if (part == 1) Dismiss(r); else { expanded.insert(r.groupKey); Update(false); } break;
+                case K::Notif: if (part == 1) Dismiss(r); else if (part == 2) ClearAll(); else Activate(r); break;
+                case K::Group: if (part == 1) Dismiss(r); else if (part == 2) ClearAll(); else { expanded.insert(r.groupKey); Update(false); } break;
                 case K::Header: if (part == 2) ClearAll(); break;
                 case K::Calendar:
                     if (part == 3) ShiftMonth(-1);
@@ -894,7 +910,7 @@ void NotificationCenter::Impl::Draw(Card& c, bool hover, int part) {
                 break;
             case K::Header: DrawHeader(dc.get(), br.get(), r, hover ? part : -1); break;
             case K::Calendar: DrawCalendar(dc.get(), br.get(), hover ? part : -1); break;
-            default: DrawNotif(dc.get(), br.get(), r, hover, hover && part == 1); break;
+            default: DrawNotif(dc.get(), br.get(), r, hover, hover && part == 1, hover && part == 2); break;
         }
     } catch (...) {}
     interop->EndDraw();
@@ -911,7 +927,7 @@ void NotificationCenter::Impl::DrawHeader(ID2D1DeviceContext* dc, ID2D1SolidColo
     dc->DrawText(L"Clear", 5, fClear.get(), btn.rect, br);
 }
 
-void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, bool hover, bool closeHover) {
+void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, bool hover, bool closeHover, bool clearHover) {
     // icon: the app's own icon, else a letter tile
     const D2D1_ROUNDED_RECT ir = D2D1::RoundedRect(D2D1::RectF(kPad, kHeaderY + 2, kPad + kIcon, kHeaderY + 2 + kIcon), 8, 8);
     auto ic = icons.find(r.n.appKey);
@@ -947,7 +963,7 @@ void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColor
     br->SetColor(kDim);
     float appW = std::min<float>(tw - 60, app.size() * 6.4f + 4);
     winrt::com_ptr<IDWriteTextLayout> lay;
-    if (SUCCEEDED(dw->CreateTextLayout(app.c_str(), static_cast<UINT32>(app.size()), fApp.get(), tw - 70, 15, lay.put()))) {
+    if (SUCCEEDED(dw->CreateTextLayout(app.c_str(), static_cast<UINT32>(app.size()), fApp.get(), tw - 70 - (r.clearBtn ? 54 : 0), 15, lay.put()))) {
         DWRITE_TEXT_METRICS tm{};
         lay->GetMetrics(&tm);
         appW = tm.widthIncludingTrailingWhitespace;
@@ -961,6 +977,13 @@ void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColor
         dc->FillRoundedRectangle(chip, br);
         br->SetColor(kText);
         dc->DrawText(cnt.c_str(), static_cast<UINT32>(cnt.size()), fCount.get(), chip.rect, br);
+    }
+    if (r.clearBtn) {  // the small text button, left of the time
+        const D2D1_ROUNDED_RECT btn = D2D1::RoundedRect(D2D1::RectF(kW - kPad - 118, kHeaderY - 3, kW - kPad - 70, kHeaderY + 17), 10, 10);
+        br->SetColor(ColorF(1, 1, 1, clearHover ? 0.26f : 0.12f));
+        dc->FillRoundedRectangle(btn, br);
+        br->SetColor(kText);
+        dc->DrawText(L"Clear", 5, fClear.get(), btn.rect, br);
     }
     if (hover) {
         const D2D1_POINT_2F ctr = D2D1::Point2F(kW - kPad - 9, kHeaderY + 8);
@@ -990,15 +1013,16 @@ void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColor
 void NotificationCenter::Impl::DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, int part) {
     wchar_t buf[96];
     SYSTEMTIME t = today;
-    // big weekday + date
-    br->SetColor(accent);
-    if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"dddd", buf, 96, nullptr)) {
-        CharUpperW(buf);
-        dc->DrawText(buf, static_cast<UINT32>(wcslen(buf)), fCalDow.get(), D2D1::RectF(kPad, 14, kW - kPad, 32), br);
+    if (!attached) {  // big weekday + date (attached, the Control Center header shows them)
+        br->SetColor(accent);
+        if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"dddd", buf, 96, nullptr)) {
+            CharUpperW(buf);
+            dc->DrawText(buf, static_cast<UINT32>(wcslen(buf)), fCalDow.get(), D2D1::RectF(kPad, 14, kW - kPad, 32), br);
+        }
+        br->SetColor(kText);
+        if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"d MMMM", buf, 96, nullptr))
+            dc->DrawText(buf, static_cast<UINT32>(wcslen(buf)), fBig.get(), D2D1::RectF(kPad, 30, kW - kPad, 66), br);
     }
-    br->SetColor(kText);
-    if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"d MMMM", buf, 96, nullptr))
-        dc->DrawText(buf, static_cast<UINT32>(wcslen(buf)), fBig.get(), D2D1::RectF(kPad, 30, kW - kPad, 66), br);
 
     // month nav
     SYSTEMTIME mo{};
@@ -1048,7 +1072,7 @@ void NotificationCenter::Impl::DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidCo
         const bool isToday = inMonth && calYear == today.wYear && calMonth == today.wMonth && day == today.wDay;
         if (isToday) {
             br->SetColor(accent);
-            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cyy), 12, 12), br);
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cyy), std::min(12.0f, kCalRow / 2 - 1), std::min(12.0f, kCalRow / 2 - 1)), br);
         }
         std::wstring ds = std::to_wstring(day);
         br->SetColor(isToday ? ColorF(1, 1, 1, 1) : inMonth ? kText : ColorF(1, 1, 1, 0.26f));
@@ -1103,19 +1127,19 @@ void NotificationCenter::Impl::Update(bool firstShow) {
         y += h + extra + kGap;
         rows.push_back(std::move(r));
     };
-    {
+    if (!attached) {
         Row r;
         r.key = L"hdr";
         r.kind = K::Header;
         r.count = Visible();
         add(std::move(r), kHeadH);
     }
-    const float cardsAvail = availH - (kHeadH + kGap) - (kCalH + kGap);
+    const float cardsAvail = availH - (attached ? 0 : kHeadH + kGap) - (kCalH + kGap);
     if (haveData && src.empty()) {
         Row r;
         r.key = L"empty";
         r.kind = K::Empty;
-        add(std::move(r), kEmptyH);
+        add(std::move(r), attached ? 36.0f : kEmptyH);
     }
     // heights first, then keep the prefix that fits under the card limit
     struct Sized { Row r; float h; };
@@ -1137,13 +1161,13 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     for (auto& z : sized) {
         const bool isCard = z.r.kind != K::Collapse;
         float use = z.h + (z.r.kind == K::Group ? kPeek : 0) + kGap;
-        if ((isCard && cardsShown >= kMaxCards) || used + use > cardsAvail) break;
+        if ((isCard && cardsShown >= (attached ? kMaxCardsAttached : kMaxCards)) || used + use > cardsAvail) break;
         used += use;
         cardsShown += isCard;
         ++keep;
     }
     // room for the "N more" pill
-    if (keep < sized.size())
+    if (keep < sized.size() && !attached)
         while (keep > 1 && used + kMoreH + kGap > cardsAvail) {
             --keep;
             used -= sized[keep].h + (sized[keep].r.kind == K::Group ? kPeek : 0) + kGap;
@@ -1152,11 +1176,12 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     for (size_t i = keep; i < sized.size(); ++i)
         if (sized[i].r.kind == K::Notif) more += 1;
         else if (sized[i].r.kind == K::Group) more += sized[i].r.count;
+    if (attached && keep && sized[0].r.kind != K::Collapse) sized[0].r.clearBtn = true;
     for (size_t i = 0; i < keep; ++i) {
         const float extra = sized[i].r.kind == K::Group ? kPeek : 0;
         add(std::move(sized[i].r), sized[i].h, extra);
     }
-    if (more) {
+    if (more && (!attached || used + kMoreH + kGap <= cardsAvail)) {
         Row r;
         r.key = L"more";
         r.kind = K::More;
@@ -1175,7 +1200,7 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     int order = 0;
     for (auto& r : rows) {
         std::wstring sig = r.n.title + L"\x1f" + r.n.body + L"\x1f" + Rel(r.n.ft) + L"\x1f" + std::to_wstring(r.count) + L"\x1f" +
-                           std::to_wstring(r.h) + (r.kind == K::Group ? L"g" : L"") + (icons.count(r.n.appKey) ? L"i" : L"") +
+                           std::to_wstring(r.h) + (r.kind == K::Group ? L"g" : L"") + (r.clearBtn ? L"C" : L"") + (icons.count(r.n.appKey) ? L"i" : L"") +
                            (r.kind == K::Calendar ? std::to_wstring(today.wYear * 10000 + today.wMonth * 100 + today.wDay) : L"");
         auto it = std::find_if(cards.begin(), cards.end(), [&](Card const& c) { return c.row.key == r.key && !c.gone; });
         if (it != cards.end() && it->row.h == r.h && it->row.kind == r.kind) {
@@ -1198,12 +1223,11 @@ void NotificationCenter::Impl::Update(bool firstShow) {
             CreateCard(c);
             c.outer.Offset({0, r.y * s, 0});
             panelVis.Children().InsertAtTop(c.outer);
-            AnimateIn(c, order);
+            if (!(attached && firstShow)) AnimateIn(c, order);  // attached: the whole column moves as one
             ++order;
             next.push_back(std::move(c));
         }
     }
-    (void)firstShow;
     // whatever is left disappears
     for (auto& c : cards) {
         c.gone = true;
@@ -1226,8 +1250,13 @@ void NotificationCenter::Impl::Place() {
     winH = h;
     const int wPx = static_cast<int>(std::ceil((kW + 2 * motion::kPad) * s));
     const int hPx = std::max(1, static_cast<int>(std::ceil((h + 2 * motion::kPad) * s)));
-    const int x = work.right - wPx + static_cast<int>((motion::kPad - kEdge) * s);
-    const int yy = work.top + static_cast<int>((kEdge - motion::kPad) * s);
+    int x = work.right - wPx + static_cast<int>((motion::kPad - kEdge) * s);
+    int yy = work.top + static_cast<int>((kEdge - motion::kPad) * s);
+    if (attached) {  // directly under the Control Center, same left edge
+        const int pad = static_cast<int>(std::lround(motion::kPad * s));
+        x = anchorRc.left - pad;
+        yy = anchorRc.bottom + static_cast<int>(std::lround(kAttachGap * s)) - pad;
+    }
     SetWindowPos(hwnd, HWND_TOPMOST, x, yy, wPx, hPx, SWP_NOACTIVATE);
 }
 
@@ -1240,20 +1269,42 @@ void NotificationCenter::Impl::Focus() {
     if (attached) AttachThreadInput(me, fg, FALSE);
 }
 
+// Monitor, scale, width, available height and calendar size. Attached, everything follows the Control Center.
+void NotificationCenter::Impl::ApplyGeometry() {
+    HMONITOR hm;
+    if (attached) hm = MonitorFromRect(&anchorRc, MONITOR_DEFAULTTOPRIMARY);
+    else hm = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(hm, &mi);
+    work = mi.rcWork;
+    UINT dx = 96, dy = 96;
+    GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
+    s = dx / 96.0f;
+    if (!attached) {
+        kW = kWStd;
+        kCalHead = kCalHeadStd;
+        kCalRow = kCalRowStd;
+        kCalH = kCalHStd;
+        availH = (work.bottom - work.top) / s - 2 * kEdge;
+        return;
+    }
+    kW = (anchorRc.right - anchorRc.left) / s;
+    const float top = anchorRc.bottom + kAttachGap * s;
+    availH = std::max(120.0f, (mi.rcMonitor.bottom - top) / s - kAttachMargin);
+    // Compact calendar: just the month row, the weekday letters and the grid. Shorter rows only if even
+    // the calendar alone would not fit (cards are dropped first, see Update).
+    kCalHead = 4;
+    auto calH = [&](float row) { return kCalHead + kCalNav + 4 + kCalDow + 2 + 6 * row + 8; };
+    kCalRow = availH < calH(24) ? 20.0f : 24.0f;
+    kCalH = calH(kCalRow);
+}
+
 void NotificationCenter::Impl::Open() {
     if (st == St::Open) return;
     if (st == St::Closing) Teardown();
     visible = true;
     try {
-        POINT origin{0, 0};
-        HMONITOR hm = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
-        MONITORINFO mi{sizeof(mi)};
-        GetMonitorInfoW(hm, &mi);
-        work = mi.rcWork;
-        UINT dx = 96, dy = 96;
-        GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
-        s = dx / 96.0f;
-        availH = (work.bottom - work.top) / s - 2 * kEdge;
+        ApplyGeometry();
         try {
             auto c = winrt::Windows::UI::ViewManagement::UISettings().GetColorValue(winrt::Windows::UI::ViewManagement::UIColorType::Accent);
             accent = ColorF(c.R / 255.0f, c.G / 255.0f, c.B / 255.0f, 1);
@@ -1280,10 +1331,12 @@ void NotificationCenter::Impl::Open() {
         st = St::Open;
         winH = 0;
         Update(true);
-        ShowWindow(hwnd, SW_SHOW);
-        Focus();
-        motion::In(comp, panelVis, rest, Anchor(), {48.0f * s, 0});
+        ShowWindow(hwnd, attached ? SW_SHOWNOACTIVATE : SW_SHOW);  // attached: the Control Center keeps the focus
+        if (!attached) Focus();
+        motion::In(comp, panelVis, rest, Anchor(), Travel());
         SetEvent(evReq);
+        svc::Log(std::wstring(L"notifications: open") + (attached ? L" (attached)" : L"") + L" availH=" + std::to_wstring(static_cast<int>(availH)) +
+                 L" totalH=" + std::to_wstring(static_cast<int>(totalH)));
     } catch (winrt::hresult_error const& e) {
         svc::Log(L"notifications: open failed: " + std::wstring(e.message().c_str()));
         Teardown();
@@ -1294,7 +1347,7 @@ void NotificationCenter::Impl::Close() {
     visible = false;
     if (st != St::Open) return;
     st = St::Closing;
-    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Anchor(), {48.0f * s, 0});
+    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Anchor(), Travel());
     SetTimer(hwnd, kTimerClose, motion::kOutMs + 10, nullptr);
 }
 
@@ -1318,7 +1371,7 @@ void NotificationCenter::Impl::Teardown() {
 // public
 
 NotificationCenter::NotificationCenter(HINSTANCE inst, HWND, wuc::Compositor comp, wuc::CompositionGraphicsDevice gdev)
-    : m(std::make_unique<Impl>(inst, std::move(comp), std::move(gdev))) {
+    : m(std::make_unique<Impl>(this, inst, std::move(comp), std::move(gdev))) {
     m->Start();
 }
 NotificationCenter::~NotificationCenter() { m->Stop(); }
@@ -1326,5 +1379,15 @@ void NotificationCenter::Toggle() { IsOpen() ? Close() : Open(); }
 void NotificationCenter::Open() { m->Open(); }
 void NotificationCenter::Close() { m->Close(); }
 bool NotificationCenter::IsOpen() const { return m->st == Impl::St::Open; }
+HWND NotificationCenter::Hwnd() const { return m->st == Impl::St::Closed ? nullptr : m->hwnd; }
+// Attach under the Control Center panel (physical px); an empty rect detaches. Re-lays out while open.
+void NotificationCenter::SetAnchor(RECT ccPanel) {
+    m->attached = ccPanel.right > ccPanel.left;
+    m->anchorRc = ccPanel;
+    if (m->st == Impl::St::Open && m->attached) {
+        m->ApplyGeometry();
+        m->Update(false);
+    }
+}
 
 }  // namespace halo

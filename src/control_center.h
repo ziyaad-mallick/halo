@@ -22,9 +22,12 @@ public:
     // Where the panel is on screen (physical px); empty while it is closed. For things that stack
     // below it (notifications). Height changes when sections expand: see onResized.
     RECT PanelRectScreen() const;
+    HWND Hwnd() const;  // null while closed
     // UI thread. onShown: the panel just opened. onHidden: it started closing (fading out).
     // onResized: it opened or changed height while open; read PanelRectScreen() again.
     std::function<void()> onShown, onHidden, onResized;
+    // Focus moving to this window must not close the panel (the attached notification column).
+    std::function<HWND()> siblingHwnd;
 
 private:
     struct Impl;

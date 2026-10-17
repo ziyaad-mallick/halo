@@ -6,6 +6,7 @@
 #pragma once
 #include <windows.h>
 #include <winrt/Windows.UI.Composition.h>
+#include <functional>
 #include <memory>
 
 namespace halo {
@@ -19,6 +20,15 @@ public:
     void Open();
     void Close();
     bool IsOpen() const;
+    HWND Hwnd() const;  // null while closed
+    // Attached mode: the Control Center's panel on screen (physical px). The column then sits right under
+    // it with the same width and left edge, shows at most 3 cards and a compact calendar, takes no focus,
+    // and moves with the CC's motion. Call before Open(), and again when the CC resizes.
+    void SetAnchor(RECT ccPanel);
+    // Esc / click outside: when set, called instead of closing only this panel (Halo closes both).
+    std::function<void()> onDismiss;
+    // Focus moving to this window must not dismiss the panel.
+    std::function<HWND()> siblingHwnd;
 
 private:
     struct Impl;

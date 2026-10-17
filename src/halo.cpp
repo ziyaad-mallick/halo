@@ -92,6 +92,8 @@ constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
 constexpr UINT_PTR kPreviewTimer = 21;  // the pointer rested on a running app
 constexpr UINT_PTR kPreviewGrace = 22;  // the pointer left the icon and the strip
+constexpr UINT_PTR kPanelStagger = 23;  // the notification column follows the Control Center
+constexpr UINT kPanelStaggerMs = 40;
 constexpr UINT kPreviewDelayMs = 400;
 constexpr UINT kPreviewGraceMs = 300;
 constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
@@ -155,8 +157,11 @@ private:
     void PointerLeave();
     void Reveal();
     void OpenLauncher();
-    void OpenNotifications() { if (m_notif && !m_notif->IsOpen()) { if (m_cc) m_cc->Close(); m_notif->Open(); } }
-    void ToggleNotifications() { if (m_notif && m_notif->IsOpen()) m_notif->Close(); else OpenNotifications(); }
+    // Control Center + notifications + calendar are one column on the primary monitor, opened, toggled and
+    // closed together: Win+A, Win+N, the edge gestures and the test messages all come through here.
+    void OpenPanel();
+    void ClosePanel();
+    void TogglePanel() { if (m_cc && m_cc->IsOpen()) ClosePanel(); else OpenPanel(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
     std::wstring LaunchTarget(RunningApp const& app) const;
     void LaunchRecent(std::wstring const& target);
@@ -317,6 +322,19 @@ bool Halo::Create(HINSTANCE inst) {
     Step(L"notifications", [&] {
         m_notif = std::make_unique<halo::NotificationCenter>(inst, m_hwnd, m_comp, m_gdev);
     });
+    if (m_cc && m_notif) {
+        // Two windows, one column: focus moving between them must not close anything; Esc or a click
+        // outside closes both; the notification column tracks the Control Center's size.
+        m_cc->siblingHwnd = [this] { return m_notif ? m_notif->Hwnd() : nullptr; };
+        m_notif->siblingHwnd = [this] { return m_cc ? m_cc->Hwnd() : nullptr; };
+        m_notif->onDismiss = [this] { ClosePanel(); };
+        m_cc->onHidden = [this] {
+            KillTimer(m_hwnd, kPanelStagger);
+            if (m_notif) m_notif->Close();
+            Log(L"panel: closed");
+        };
+        m_cc->onResized = [this] { if (m_notif && m_notif->IsOpen()) m_notif->SetAnchor(m_cc->PanelRectScreen()); };
+    }
     if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
     else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
     if (!_wgetenv(L"HALO_TEST_NOHOOK") && !halo::edge::Start(inst, m_hwnd, kMsgEdge))
@@ -861,6 +879,23 @@ LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return self ? self->OnMessage(m, w, l) : DefWindowProcW(h, m, w, l);
 }
 
+void Halo::OpenPanel() {
+    if (!m_cc || m_cc->IsOpen()) return;
+    m_cc->Open();
+    if (!m_cc->IsOpen()) return;
+    Log(L"panel: opened");
+    if (m_notif) {
+        m_notif->SetAnchor(m_cc->PanelRectScreen());
+        SetTimer(m_hwnd, kPanelStagger, kPanelStaggerMs, nullptr);  // follows ~40 ms later with the same motion
+    }
+}
+
+void Halo::ClosePanel() {
+    KillTimer(m_hwnd, kPanelStagger);
+    if (m_cc) m_cc->Close();   // its onHidden closes the notification column too
+    if (m_notif) m_notif->Close();
+}
+
 LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
@@ -870,9 +905,8 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         if (m_launcher) m_launcher->Hide();
         return 0;
     }
-    if (m == halo::winkey::ControlCenterMessage()) {  // Win+A (wParam 0) / Win+N (1)
-        if (w) ToggleNotifications();
-        else if (m_cc) { if (m_notif && !m_cc->IsOpen()) m_notif->Close(); m_cc->Toggle(); }
+    if (m == halo::winkey::ControlCenterMessage()) {  // Win+A (wParam 0) / Win+N (1): both toggle the one panel
+        TogglePanel();
         return 0;
     }
     switch (m) {
@@ -898,8 +932,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 else m_launcher->TestCommand(w);
             }
             return 0;
-        case kMsgTestControlCenter: if (m_cc && _wgetenv(L"HALO_TEST")) m_cc->Toggle(); return 0;
-        case kMsgTestNotifCenter: if (m_notif && _wgetenv(L"HALO_TEST")) m_notif->Toggle(); return 0;
+        case kMsgTestControlCenter: case kMsgTestNotifCenter: if (_wgetenv(L"HALO_TEST")) TogglePanel(); return 0;
         case kMsgIntellihideChanged:
             if (w || l) {
                 if (!m_trackingMouse) StartHide();
@@ -916,13 +949,19 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case kMsgEdge:
             Log(w == halo::edge::kTop ? L"edge: top" : L"edge: right");
-            if (w == halo::edge::kTop) { if (m_cc && !m_cc->IsOpen()) { if (m_notif) m_notif->Close(); m_cc->Open(); } }
-            else OpenNotifications();
+            OpenPanel();  // kTop and kRight alike
             return 0;
         case WM_TIMER:
             if (w == kHideTimer) {
                 KillTimer(m_hwnd, kHideTimer);
                 StartHide();
+            } else if (w == kPanelStagger) {
+                KillTimer(m_hwnd, kPanelStagger);
+                if (m_cc && m_cc->IsOpen() && m_notif) {
+                    m_notif->SetAnchor(m_cc->PanelRectScreen());
+                    m_notif->Open();
+                    Log(L"panel: notification column opened");
+                }
             } else if (w == kPreviewTimer) {
                 KillTimer(m_hwnd, kPreviewTimer);
                 if (m_hoverItem >= 0 && m_state == State::Shown) ShowPreviewsFor(m_hoverItem);
