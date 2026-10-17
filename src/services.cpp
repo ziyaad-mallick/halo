@@ -7,6 +7,12 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Networking.Connectivity.h>
+#include <winrt/Windows.Networking.NetworkOperators.h>
+#include <wlanapi.h>
+#include <winrt/Windows.Devices.Bluetooth.h>
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <wincodec.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -399,6 +405,167 @@ std::wstring ConnectedSsid() {
     return {};
 }
 
+// ---- Quick toggles ------------------------------------------------------------------------
+namespace {
+constexpr wchar_t kThemeKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+}
+
+bool ReadDarkMode() {
+    DWORD v = 1, n = sizeof(v);
+    RegGetValueW(HKEY_CURRENT_USER, kThemeKey, L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &n);
+    return v == 0;
+}
+
+void SetDarkMode(bool on) {
+    if (DryRun()) return Log(std::wstring(L"DRYRUN dark mode -> ") + (on ? L"on" : L"off"));
+    DWORD v = on ? 0 : 1;
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kThemeKey, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
+    RegSetValueExW(k, L"AppsUseLightTheme", 0, REG_DWORD, reinterpret_cast<BYTE const*>(&v), sizeof(v));
+    RegSetValueExW(k, L"SystemUsesLightTheme", 0, REG_DWORD, reinterpret_cast<BYTE const*>(&v), sizeof(v));
+    RegCloseKey(k);
+    DWORD_PTR r;
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"ImmersiveColorSet"), SMTO_ABORTIFHUNG, 200, &r);
+}
+
+bool ReadEnergySaver() {
+    SYSTEM_POWER_STATUS s{};
+    return GetSystemPowerStatus(&s) && (s.SystemStatusFlag & 1);
+}
+
+void OpenSettings(wchar_t const* uri) {
+    if (DryRun()) return Log(std::wstring(L"DRYRUN open ") + uri);
+    ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void SendWinChord(WORD key, bool shift) {
+    if (DryRun()) return Log(std::wstring(L"DRYRUN chord Win+") + (shift ? L"Shift+" : L"") + std::to_wstring(key));
+    std::vector<INPUT> in;
+    auto add = [&](WORD vk, bool up) {
+        INPUT i{};
+        i.type = INPUT_KEYBOARD;
+        i.ki.wVk = vk;
+        i.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+        in.push_back(i);
+    };
+    add(VK_LWIN, false);
+    if (shift) add(VK_SHIFT, false);
+    add(key, false);
+    add(key, true);
+    if (shift) add(VK_SHIFT, true);
+    add(VK_LWIN, true);
+    SendInput(static_cast<UINT>(in.size()), in.data(), sizeof(INPUT));
+}
+
+namespace wno = winrt::Windows::Networking::NetworkOperators;
+namespace wnc = winrt::Windows::Networking::Connectivity;
+
+bool HotspotAvailable() {
+    try {
+        auto p = wnc::NetworkInformation::GetInternetConnectionProfile();
+        return p && wno::NetworkOperatorTetheringManager::GetTetheringCapabilityFromConnectionProfile(p) == wno::TetheringCapability::Enabled;
+    } catch (...) { return false; }
+}
+
+bool ReadHotspot() {
+    try {
+        auto p = wnc::NetworkInformation::GetInternetConnectionProfile();
+        return p && wno::NetworkOperatorTetheringManager::CreateFromConnectionProfile(p).TetheringOperationalState() == wno::TetheringOperationalState::On;
+    } catch (...) { return false; }
+}
+
+static winrt::fire_and_forget HotspotSet(bool on) {
+    try {
+        auto mgr = wno::NetworkOperatorTetheringManager::CreateFromConnectionProfile(wnc::NetworkInformation::GetInternetConnectionProfile());
+        if (on) co_await mgr.StartTetheringAsync(); else co_await mgr.StopTetheringAsync();
+    } catch (...) {}
+}
+
+void SetHotspot(bool on) {
+    if (DryRun()) return Log(std::wstring(L"DRYRUN hotspot -> ") + (on ? L"on" : L"off"));
+    HotspotSet(on);
+}
+
+// ---- Wi-Fi networks and paired Bluetooth devices -----------------------------------------------------
+namespace {
+std::vector<WifiNet> g_nets;
+std::vector<BtDevice> g_bt;
+unsigned g_btGen = 0;
+
+// Saved Wi-Fi profiles via the WLAN API. Scanning for new networks needs location permission since
+// Windows 11 24H2 (WiFiAdapter answers "Access is denied" for an unpackaged app), so the list is the
+// networks this PC already knows; joining one is WlanConnect on its profile.
+GUID g_iface{};
+bool OpenWlan(HANDLE& h) {
+    DWORD ver = 0;
+    return WlanOpenHandle(2, nullptr, &ver, &h) == ERROR_SUCCESS;
+}
+void BuildNets() {
+    g_nets.clear();
+    HANDLE h;
+    if (!OpenWlan(h)) return;
+    PWLAN_INTERFACE_INFO_LIST il = nullptr;
+    if (WlanEnumInterfaces(h, nullptr, &il) == ERROR_SUCCESS && il && il->dwNumberOfItems) {
+        g_iface = il->InterfaceInfo[0].InterfaceGuid;
+        PWLAN_PROFILE_INFO_LIST pl = nullptr;
+        if (WlanGetProfileList(h, &g_iface, nullptr, &pl) == ERROR_SUCCESS && pl) {
+            auto connected = ConnectedSsid();
+            for (DWORD i = 0; i < pl->dwNumberOfItems && g_nets.size() < 8; i++) {
+                std::wstring name = pl->ProfileInfo[i].strProfileName;
+                g_nets.push_back({name, 0, true, name == connected});
+            }
+            WlanFreeMemory(pl);
+        }
+    }
+    if (il) WlanFreeMemory(il);
+    WlanCloseHandle(h, nullptr);
+    std::stable_sort(g_nets.begin(), g_nets.end(), [](WifiNet const& a, WifiNet const& b) { return a.connected > b.connected; });
+}
+
+winrt::fire_and_forget BtTask(HWND notify, UINT msg, unsigned gen) {
+    namespace wdb = winrt::Windows::Devices::Bluetooth;
+    try {
+        auto found = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::FindAllAsync(
+            wdb::BluetoothDevice::GetDeviceSelectorFromPairingState(true));
+        std::vector<BtDevice> out;
+        for (auto const& d : found) {
+            if (out.size() >= 6) break;
+            BtDevice b{d.Name().c_str(), false};
+            try {
+                auto dev = co_await wdb::BluetoothDevice::FromIdAsync(d.Id());
+                b.connected = dev && dev.ConnectionStatus() == wdb::BluetoothConnectionStatus::Connected;
+            } catch (...) {}
+            if (!b.name.empty()) out.push_back(std::move(b));
+        }
+        if (gen != g_btGen) co_return;
+        std::sort(out.begin(), out.end(), [](BtDevice const& a, BtDevice const& b) { return a.connected > b.connected; });
+        g_bt = std::move(out);
+        PostMessageW(notify, msg, 0, 0);
+    } catch (...) {}
+}
+}  // namespace
+
+void WifiRefresh(HWND notify, UINT msg) {
+    BuildNets();
+    PostMessageW(notify, msg, 0, 0);
+}
+void WifiStop() { g_nets.clear(); }
+std::vector<WifiNet> const& WifiNets() { return g_nets; }
+void WifiConnect(std::wstring const& ssid) {
+    if (DryRun()) return Log(L"DRYRUN join Wi-Fi " + ssid);
+    HANDLE h;
+    if (!OpenWlan(h)) return;
+    WLAN_CONNECTION_PARAMETERS cp{};
+    cp.wlanConnectionMode = wlan_connection_mode_profile;
+    cp.strProfile = ssid.c_str();
+    cp.dot11BssType = dot11_BSS_type_any;
+    WlanConnect(h, &g_iface, &cp, nullptr);
+    WlanCloseHandle(h, nullptr);
+}
+void BtRefresh(HWND notify, UINT msg) { BtTask(notify, msg, ++g_btGen); }
+void BtStop() { g_btGen++; g_bt.clear(); }
+std::vector<BtDevice> const& BtDevices() { return g_bt; }
+
 // ---- Now Playing ------------------------------------------------------------------------------
 void Media::Start(HWND notify, UINT event, std::function<void()> changed) {
     Stop();
@@ -431,6 +598,38 @@ winrt::fire_and_forget Media::Init(unsigned gen) {
     } catch (...) {}
 }
 
+namespace {
+// Decodes image bytes to a 96x96 premultiplied BGRA square (scaled to cover, centre-cropped).
+void DecodeArt(std::vector<uint8_t> const& bytes, MediaState& out) {
+    constexpr UINT kSize = 96;
+    winrt::com_ptr<IWICImagingFactory> f;
+    winrt::com_ptr<IWICStream> st;
+    winrt::com_ptr<IWICBitmapDecoder> dec;
+    winrt::com_ptr<IWICBitmapFrameDecode> fr;
+    if (bytes.empty() || FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(f.put()))) ||
+        FAILED(f->CreateStream(st.put())) ||
+        FAILED(st->InitializeFromMemory(const_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()))) ||
+        FAILED(f->CreateDecoderFromStream(st.get(), nullptr, WICDecodeMetadataCacheOnDemand, dec.put())) ||
+        FAILED(dec->GetFrame(0, fr.put())))
+        return;
+    UINT w = 0, h = 0;
+    fr->GetSize(&w, &h);
+    if (!w || !h) return;
+    double k = std::max(double(kSize) / w, double(kSize) / h);
+    UINT sw = std::max<UINT>(kSize, static_cast<UINT>(w * k + 0.5)), sh = std::max<UINT>(kSize, static_cast<UINT>(h * k + 0.5));
+    winrt::com_ptr<IWICBitmapScaler> sc;
+    winrt::com_ptr<IWICFormatConverter> cv;
+    if (FAILED(f->CreateBitmapScaler(sc.put())) || FAILED(sc->Initialize(fr.get(), sw, sh, WICBitmapInterpolationModeFant)) ||
+        FAILED(f->CreateFormatConverter(cv.put())) ||
+        FAILED(cv->Initialize(sc.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+        return;
+    WICRect r{static_cast<INT>((sw - kSize) / 2), static_cast<INT>((sh - kSize) / 2), static_cast<INT>(kSize), static_cast<INT>(kSize)};
+    out.art.assign(kSize * kSize, 0);
+    if (SUCCEEDED(cv->CopyPixels(&r, kSize * 4, kSize * kSize * 4, reinterpret_cast<BYTE*>(out.art.data())))) out.artSize = kSize;
+    else out.art.clear();
+}
+}  // namespace
+
 winrt::fire_and_forget Media::PullAsync() {
     unsigned gen = m_gen;
     if (!m_mgr) co_return;
@@ -460,6 +659,20 @@ winrt::fire_and_forget Media::PullAsync() {
             if (gen != m_gen) co_return;
             next.title = props.Title().c_str();
             next.artist = props.Artist().c_str();
+            if (next.title == m_state.title && next.artist == m_state.artist) {
+                next.art = m_state.art;  // same track: keep the decoded art
+                next.artSize = m_state.artSize;
+            } else if (auto thumb = props.Thumbnail()) {
+                try {
+                    auto stream = co_await thumb.OpenReadAsync();
+                    winrt::Windows::Storage::Streams::DataReader reader(stream);
+                    co_await reader.LoadAsync(static_cast<uint32_t>(stream.Size()));
+                    std::vector<uint8_t> bytes(stream.Size());
+                    reader.ReadBytes(bytes);
+                    DecodeArt(bytes, next);
+                } catch (...) {}
+                if (gen != m_gen) co_return;
+            }
         }
         if (gen != m_gen) co_return;
         m_state = std::move(next);
