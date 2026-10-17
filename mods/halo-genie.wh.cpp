@@ -2,7 +2,7 @@
 // @id              halo-genie
 // @name            Halo Genie
 // @description     macOS genie minimize/restore into Halo's dock icons, plus a zoom swoop for maximize/un-maximize.
-// @version         1.0.0
+// @version         2.0.0
 // @author          Ziyaad Mallick (fork of MacOS Minimize Animation by Abdullah Masood)
 // @include         *
 // @exclude         halo.exe
@@ -46,10 +46,47 @@ with SendMessageTimeoutW (SMTO_ABORTIFHUNG, 50 ms):
   its hidden, slid-off position. The reply needs a 64-bit LRESULT, so the
   mod is x86-64 only.
 - On 1 and 2 Halo also reveals the dock and keeps it up until 300 ms after
-  the animation (it assumes the 400 ms genie) so the swoop lands in a visible icon.
+  the animation (it assumes the 500 ms genie) so the swoop lands in a visible icon.
 
 Halo replies 0 (no dock icon): the mod lets Windows do its own animation.
 No Halo window: the taskbar fallback above.
+
+## Halo GPU handoff (version 2)
+
+With Halo running, the animation is not drawn here at all. The mod takes one
+snapshot of the window (PrintWindow, before the state changes) and hands it to
+Halo (src/genie.cpp), which builds the animation once with Windows.UI.Composition
+and lets DWM play it at vsync, with no per-frame work in any process. The same
+contract is documented in src/genie.h.
+
+1. The mod makes a sequence id: `id = pid << 32 | n`, and with `I` = the id in
+   lower-case hex creates, with a null DACL so Halo can open them even when the
+   app is elevated: the file mapping `Local\HaloGenie.I` and the manual-reset
+   events `Local\HaloGenie.I.ready` and `Local\HaloGenie.I.done`.
+2. The mapping holds a 64-byte header, then the snapshot, top-down premultiplied
+   BGRA, `stride` bytes per row (little endian):
+
+       u32 magic 'HGEN'   u32 version = 1
+       u32 kind           0 minimize, 1 restore, 2 maximize, 3 unmaximize
+       u32 width, height, stride        the snapshot, px
+       i32 window[4]      l,t,r,b: the window's extended frame when the animation
+                          starts (restore: where it will be once restored), screen px
+       i32 target[4]      l,t,r,b: the dock icon (kinds 0, 1) or the window's end
+                          rect (kinds 2, 3), screen px
+       u32 reserved[2]
+
+3. The mod posts the registered message `Halo.Genie` to the HaloDockWindow:
+   wParam = op, lParam = id. op 1 = start. Halo opens the objects by name, uploads
+   the snapshot, builds the animation, commits it, waits for DWM to compose the
+   first frame (RequestCommitAsync + DwmFlush) and sets `.ready`. The mod waits for
+   `.ready` (500 ms at most; on a timeout it cancels with op 3 and draws the
+   animation itself on the CPU) and only then changes the real window, so there
+   is neither a flash nor a gap.
+4. When the animation ends Halo sets `.done`. For restore, maximize and unmaximize
+   the real window has been cloaked until now: the mod uncloaks it, waits for DWM
+   (DwmFlush), then posts op 2 (release) and Halo drops its overlay. Halo drops it
+   itself 1 s after `.done` if the release never comes. Minimize needs no release.
+   op 3 (cancel) means the state change did not happen after all.
 
 ## Credits and licence
 
@@ -81,6 +118,7 @@ IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 #include <d2d1.h>
 #include <uiautomation.h>
 #include <math.h>
+#include <stdarg.h>
 #include <atomic>
 #include <algorithm>
 #include <memory>
@@ -100,10 +138,21 @@ IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-constexpr int kGenieMs = 400;  // Halo keeps the dock up for this + 300 ms
+constexpr int kGenieMs = 400;  // the CPU fallback's genie (Halo's GPU genie lasts 500 ms)
 constexpr int kZoomMs = 280;
 constexpr int kTiles = 32;     // genie mesh resolution
 constexpr float kPi = 3.14159265f;
+
+// Wh_Log, and OutputDebugString so tools/dbwin.ps1 can read it without the Windhawk UI.
+static void Dbg(const wchar_t* fmt, ...) {
+    wchar_t buf[300];
+    va_list args;
+    va_start(args, fmt);
+    vswprintf(buf, 300, fmt, args);
+    va_end(args);
+    Wh_Log(L"%s", buf);
+    OutputDebugStringW((std::wstring(L"[genie] ") + buf + L"\n").c_str());
+}
 
 enum Kind { Minimize, Restore, Maximize, Unmaximize };
 struct Geometry { float x, y, width, height; };
@@ -111,6 +160,7 @@ struct Geometry { float x, y, width, height; };
 // Shared immutable snapshot: premultiplied 32-bit top-down DIB.
 struct Snap {
     HBITMAP bmp; void* bits; int w, h;
+    int dx, dy;  // extended frame minus window rect, top-left (to place a restored window)
     ~Snap() { DeleteObject(bmp); }
 };
 
@@ -122,7 +172,14 @@ struct Anim {
     std::atomic<bool> toReady{false}, abort{false}, firstShown{false};
     bool cloaked = false;
     std::shared_ptr<Snap> snap;
+    HWND halo = nullptr;          // the dock window, when the GPU handoff is available
+    unsigned long long id = 0;    // the handoff (see the readme), once started
+    HANDLE done = nullptr;
+    ~Anim() { if (done) CloseHandle(done); }
 };
+
+// Halo's handoff messages (src/genie.h).
+enum { kOpStart = 1, kOpRelease = 2, kOpCancel = 3 };
 
 typedef LRESULT (WINAPI *DefWindowProcW_t)(HWND, UINT, WPARAM, LPARAM);
 typedef BOOL (WINAPI *ShowWindow_t)(HWND, int);
@@ -134,9 +191,10 @@ SetWindowPlacement_t SetWindowPlacement_Original;
 CloseWindow_t CloseWindow_Original;
 
 ID2D1Factory* g_d2dFactory = nullptr;
-UINT g_haloMsg = 0;
+UINT g_haloMsg = 0, g_haloOpMsg = 0;
 std::mutex g_mutex;
 std::unordered_map<HWND, std::shared_ptr<Snap>> g_cache;  // minimize snapshot, reused by restore
+std::unordered_map<HWND, RECT> g_insets;                  // window rect minus extended frame, per side, when normal
 std::unordered_set<HWND> g_active;                        // windows with an animation in flight
 std::atomic<bool> g_unloading{false};
 std::atomic<int> g_workers{0};
@@ -166,11 +224,16 @@ static BOOL CALLBACK FindHaloProc(HWND h, LPARAM l) {
     return TRUE;
 }
 
+static HWND FindHalo() {
+    HWND halo = nullptr;
+    EnumWindows(FindHaloProc, (LPARAM)&halo);
+    return halo;
+}
+
 enum class Ask { NoHalo, Unknown, Ok };
 
 static Ask AskHalo(HWND win, int op, Geometry* icon) {
-    HWND halo = nullptr;
-    EnumWindows(FindHaloProc, (LPARAM)&halo);
+    HWND halo = FindHalo();
     if (!halo) return Ask::NoHalo;
     DWORD_PTR r = 0;
     if (!SendMessageTimeoutW(halo, g_haloMsg, (WPARAM)win, op, SMTO_ABORTIFHUNG, 50, &r) || !(r & 0xFFFF))
@@ -270,6 +333,11 @@ static std::shared_ptr<Snap> Capture(HWND hwnd, RECT* ext) {
     BITMAPINFO bmi = {{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB}};
     auto s = std::make_shared<Snap>();
     s->w = w; s->h = h;
+    s->dx = ext->left - win.left; s->dy = ext->top - win.top;
+    if (!IsZoomed(hwnd)) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_insets[hwnd] = {s->dx, s->dy, win.right - ext->right, win.bottom - ext->bottom};
+    }
     HDC screen = GetDC(nullptr), dc = CreateCompatibleDC(screen);
     s->bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &s->bits, nullptr, 0);
     bmi.bmiHeader.biWidth = rawW; bmi.bmiHeader.biHeight = -rawH;
@@ -278,8 +346,13 @@ static std::shared_ptr<Snap> Capture(HWND hwnd, RECT* ext) {
     bool ok = s->bmp && rawBmp;
     if (ok) {
         HGDIOBJ old = SelectObject(dc, rawBmp);
+        LARGE_INTEGER t0, t1, qf;
+        QueryPerformanceCounter(&t0);
         PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT);
         GdiFlush();
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&qf);
+        Dbg(L"capture %dx%d PrintWindow %.1f ms", rawW, rawH, (t1.QuadPart - t0.QuadPart) * 1000.0 / qf.QuadPart);
         SelectObject(dc, old);
         DWORD *src = (DWORD*)raw, *dst = (DWORD*)s->bits;
         int dx = ext->left - win.left, dy = ext->top - win.top;
@@ -535,7 +608,7 @@ static DWORD WINAPI Worker(LPVOID param) {
             SwitchToThread();
         }
     }
-    Wh_Log(L"genie kind=%d frames=%d avg=%.2fms max=%.2fms dur=%dms canvas=%dx%d", (int)a->kind, frames,
+    Dbg(L"genie kind=%d frames=%d avg=%.2fms max=%.2fms dur=%dms canvas=%dx%d", (int)a->kind, frames,
            frames > 1 ? sumGap / (frames - 1) : 0.0, maxGap, (int)durMs, vW, vH);
 
     if (timer) CloseHandle(timer);
@@ -585,6 +658,7 @@ static std::shared_ptr<Anim> Begin(HWND h, Kind kind) {
     auto a = std::make_shared<Anim>();
     a->hwnd = h;
     a->kind = kind;
+    a->halo = FindHalo();
     if (kind <= Restore) {
         Ask r = AskHalo(h, kind == Minimize ? 1 : 2, &a->icon);
         if (r == Ask::Unknown || (r == Ask::NoHalo && !TaskbarTarget(h, &a->icon))) return nullptr;
@@ -627,6 +701,12 @@ static bool Prepare(const std::shared_ptr<Anim>& a) {
         WINDOWPLACEMENT wp = {sizeof(wp)};
         GetWindowPlacement(h, &wp);
         a->toEst = wp.rcNormalPosition;
+        std::lock_guard<std::mutex> lock(g_mutex);  // the invisible frame, as seen when it was last normal
+        auto it = g_insets.find(h);
+        if (it != g_insets.end()) {
+            a->toEst.left += it->second.left; a->toEst.top += it->second.top;
+            a->toEst.right -= it->second.right; a->toEst.bottom -= it->second.bottom;
+        }
     }
     return true;
 }
@@ -647,6 +727,112 @@ static bool Launch(const std::shared_ptr<Anim>& a, bool wait) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Halo GPU handoff (the protocol is in the readme above and in src/genie.h)
+// ---------------------------------------------------------------------------
+struct HandoffHeader {
+    UINT magic, version, kind, width, height, stride;
+    RECT window, target;
+    UINT reserved[2];
+};
+static_assert(sizeof(HandoffHeader) == 64, "header layout");
+std::atomic<unsigned> g_seq{0};
+
+static double Ms(LARGE_INTEGER from, LARGE_INTEGER to) {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return (to.QuadPart - from.QuadPart) * 1000.0 / f.QuadPart;
+}
+
+// Hands the snapshot to Halo and waits until its first frame is on screen.
+// False: Halo did not take it, nothing is playing, the caller draws it itself.
+static bool HaloStart(const std::shared_ptr<Anim>& a) {
+    LARGE_INTEGER t0, t1 = {};
+    QueryPerformanceCounter(&t0);
+    const Snap& s = *a->snap;
+    a->id = (unsigned long long)GetCurrentProcessId() << 32 | ++g_seq;
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);  // Halo may run at another integrity level
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), &sd, FALSE};
+    wchar_t base[64];
+    swprintf(base, 64, L"Local\\HaloGenie.%llx", a->id);
+    size_t pixels = (size_t)s.w * 4 * s.h, bytes = sizeof(HandoffHeader) + pixels;
+    HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, (DWORD)(bytes >> 32), (DWORD)bytes, base);
+    auto* view = map ? (BYTE*)MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 0) : nullptr;
+    HANDLE ready = CreateEventW(&sa, TRUE, FALSE, (std::wstring(base) + L".ready").c_str());
+    a->done = CreateEventW(&sa, TRUE, FALSE, (std::wstring(base) + L".done").c_str());
+    bool ok = false;
+    if (view && ready && a->done) {
+        auto* hdr = (HandoffHeader*)view;
+        hdr->magic = 0x4847454E; hdr->version = 1; hdr->kind = a->kind;
+        hdr->width = s.w; hdr->height = s.h; hdr->stride = s.w * 4;
+        hdr->window = a->from;
+        hdr->target = a->kind <= Restore
+            ? RECT{(LONG)(a->icon.x + 0.5f), (LONG)(a->icon.y + 0.5f), (LONG)(a->icon.x + a->icon.width + 0.5f), (LONG)(a->icon.y + a->icon.height + 0.5f)}
+            : a->toEst;
+        hdr->reserved[0] = hdr->reserved[1] = 0;
+        memcpy(view + sizeof(HandoffHeader), s.bits, pixels);
+        QueryPerformanceCounter(&t1);
+        PostMessageW(a->halo, g_haloOpMsg, kOpStart, (LPARAM)a->id);
+        ok = WaitForSingleObject(ready, 500) == WAIT_OBJECT_0;
+        if (!ok) PostMessageW(a->halo, g_haloOpMsg, kOpCancel, (LPARAM)a->id);
+    }
+    if (view) UnmapViewOfFile(view);
+    if (map) CloseHandle(map);
+    if (ready) CloseHandle(ready);
+    if (!ok && a->done) { CloseHandle(a->done); a->done = nullptr; }
+    LARGE_INTEGER t2;
+    QueryPerformanceCounter(&t2);
+    Dbg(L"handoff kind=%d ok=%d snapshot copy %.1f ms, wait for Halo's first frame %.1f ms", (int)a->kind, (int)ok,
+           Ms(t0, t1), Ms(t1, t2));
+    return ok;
+}
+
+// A restore whose minimize snapshot still fits: the window comes back where it
+// was, so Halo can start before the window is restored. False: capture it afterwards.
+static bool FastRestore(const std::shared_ptr<Anim>& a) {
+    DpiScope dpi;
+    WINDOWPLACEMENT wp = {sizeof(wp)};
+    if (!GetWindowPlacement(a->hwnd, &wp) || (wp.flags & WPF_RESTORETOMAXIMIZED)) return false;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_cache.find(a->hwnd);
+    if (it == g_cache.end()) return false;
+    a->snap = it->second;
+    g_cache.erase(it);
+    int l = wp.rcNormalPosition.left + a->snap->dx, t = wp.rcNormalPosition.top + a->snap->dy;
+    a->from = {l, t, l + a->snap->w, t + a->snap->h};
+    return true;
+}
+
+// Waits for Halo's animation to end, then gives the real window back.
+static DWORD WINAPI Finisher(LPVOID param) {
+    std::shared_ptr<Anim> a(*(std::shared_ptr<Anim>*)param);
+    delete (std::shared_ptr<Anim>*)param;
+    for (int i = 0; i < 100 && !g_unloading.load() && WaitForSingleObject(a->done, 50) == WAIT_TIMEOUT; i++) {}
+    if (a->cloaked) { Cloak(a->hwnd, FALSE); DwmFlush(); }  // the window is on screen under Halo's last frame
+    SetTransitions(a->hwnd, TRUE);
+    if (a->kind != Minimize) PostMessageW(a->halo, g_haloOpMsg, kOpRelease, (LPARAM)a->id);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_active.erase(a->hwnd);
+    }
+    a.reset();
+    g_workers.fetch_sub(1, std::memory_order_release);
+    return 0;
+}
+
+static void Finish(const std::shared_ptr<Anim>& a) {
+    g_workers.fetch_add(1, std::memory_order_relaxed);
+    auto* copy = new std::shared_ptr<Anim>(a);
+    HANDLE t = CreateThread(nullptr, 0, Finisher, copy, 0, nullptr);
+    if (t) { CloseHandle(t); return; }
+    g_workers.fetch_sub(1, std::memory_order_release);
+    delete copy;
+    PostMessageW(a->halo, g_haloOpMsg, kOpCancel, (LPARAM)a->id);
+    Abandon(a);
+}
+
 // Runs `real` (the call that changes the window) under the animation `kind`.
 template <class F>
 static auto Run(HWND h, Kind kind, F real) -> decltype(real()) {
@@ -655,12 +841,30 @@ static auto Run(HWND h, Kind kind, F real) -> decltype(real()) {
     SetTransitions(h, FALSE);
     if (kind == Restore) {  // hide the restored window, then play out of the icon
         a->cloaked = true;
+        bool gpu = a->halo && FastRestore(a) && HaloStart(a);
         Cloak(h, TRUE);
         auto r = real();
-        if (!Prepare(a) || !Launch(a, false)) Abandon(a);
+        if (gpu) Finish(a);
+        else if (!Prepare(a)) Abandon(a);
+        else if (a->halo && HaloStart(a)) Finish(a);
+        else if (!Launch(a, false)) Abandon(a);
         return r;
     }
     if (!Prepare(a)) { Abandon(a); return real(); }
+    if (a->halo && HaloStart(a)) {
+        if (kind == Minimize) { auto r = real(); Finish(a); return r; }
+        a->cloaked = true;
+        Cloak(h, TRUE);
+        bool wasZoomed = IsZoomed(h);
+        auto r = real();
+        RECT fin;
+        if (IsZoomed(h) == wasZoomed) PostMessageW(a->halo, g_haloOpMsg, kOpCancel, (LPARAM)a->id);  // nothing changed
+        else if (ExtFrame(h, &fin))
+            Dbg(L"zoom kind=%d target estimate %ld,%ld,%ld,%ld final %ld,%ld,%ld,%ld", (int)kind, a->toEst.left, a->toEst.top,
+                   a->toEst.right, a->toEst.bottom, fin.left, fin.top, fin.right, fin.bottom);
+        Finish(a);
+        return r;
+    }
     if (!Launch(a, true)) return real();
     if (kind == Minimize) return real();
     a->cloaked = true;  // zoom: swap the real window under the ghost
@@ -726,12 +930,14 @@ LRESULT WINAPI DefWindowProcW_Hook(HWND h, UINT msg, WPARAM w, LPARAM l) {
     } else if (msg == WM_DESTROY) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_cache.erase(h);
+        g_insets.erase(h);
     }
     return DefWindowProcW_Original(h, msg, w, l);
 }
 
 BOOL Wh_ModInit() {
     g_haloMsg = RegisterWindowMessageW(L"Halo.DockIconForWindow");
+    g_haloOpMsg = RegisterWindowMessageW(L"Halo.Genie");
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, __uuidof(ID2D1Factory), (void**)&g_d2dFactory)))
         g_d2dFactory = nullptr;
     Wh_SetFunctionHook((void*)DefWindowProcW, (void*)DefWindowProcW_Hook, (void**)&DefWindowProcW_Original);
