@@ -25,6 +25,7 @@
 #include <memory>
 #include <shellapi.h>
 #include <string>
+#include <utility>
 #include <vector>
 #include "apps.h"
 #include "dock.h"
@@ -116,7 +117,7 @@ private:
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
     void RefreshDock();
-    void Layout(size_t icons);
+    void UpdateRegion();
     wuc::CompositionBrush IconBrushFor(std::wstring const& path);
     void Activate(size_t item);
     void PointerMove(float x);
@@ -140,12 +141,13 @@ private:
     std::unique_ptr<WindowTracker> m_tracker;
     std::unique_ptr<Dock> m_dock;
     bool m_trackingMouse = false;
+    int m_pressed = -1;  // the icon the mouse button went down on
     bool m_autoHide = true;  // off under HALO_TEST
 
     enum class State { Hidden, Shown, Hiding };
     State m_state = State::Shown;
     unsigned m_hideGen = 0;  // invalidates a hide batch that a reveal interrupted
-    RECT m_monitor{}, m_full{}, m_strip{};
+    RECT m_monitor{}, m_full{};
     wuc::ContainerVisual m_slide{nullptr};  // the dock's parent; its Offset.Y slides the dock off-screen
 
     winrt::Windows::System::DispatcherQueueController m_dq{nullptr};
@@ -178,8 +180,9 @@ bool Halo::Create(HINSTANCE inst) {
 
     Step(L"pinned apps", [&] { m_apps = LoadPinnedApps(); });
 
-    // Metrics in physical px. The window is tall enough for a fully
-    // magnified icon above the pill.
+    // Metrics in physical px. The window is as wide as the monitor and tall
+    // enough for a fully magnified, bouncing icon above the pill; only the
+    // dock's part of it takes input (UpdateRegion), so it never has to resize.
     m_metrics.restSize = m_scale.f(28);
     m_metrics.gap = m_scale.f(10);
     m_metrics.maxScale = 1.57f;
@@ -190,18 +193,20 @@ bool Halo::Create(HINSTANCE inst) {
     // The window reaches the monitor's bottom edge so a hiding dock slides
     // fully off-screen; the dock itself sits a margin above it.
     int margin = m_scale.px(6);
-    m_height = static_cast<int>(
-        std::ceil(m_metrics.pillHeight + m_metrics.restSize * (m_metrics.maxScale - 1) + m_scale.f(16))) + margin;
+    float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
+    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_metrics.restSize / 2 + m_scale.f(8))) +
+               margin;
     m_metrics.bottom = static_cast<float>(m_height - margin);
     m_monitor = mi.rcMonitor;
-    Layout(m_apps.size());
-    int x = m_full.left, y = m_full.top;
-    RECT const& first = m_autoHide ? m_strip : m_full;
+    m_width = m_monitor.right - m_monitor.left;
+    m_metrics.centerX = m_width / 2.0f;
+    int x = m_monitor.left, y = m_monitor.bottom - m_height;
+    m_full = {x, y, x + m_width, y + m_height};
     if (m_autoHide) m_state = State::Hidden;
 
     m_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                             wc.lpszClassName, L"Halo", WS_POPUP, first.left, first.top, first.right - first.left,
-                             first.bottom - first.top, nullptr, nullptr, inst, this);
+                             wc.lpszClassName, L"Halo", WS_POPUP, x, y, m_width, m_height, nullptr, nullptr, inst,
+                             this);
     if (!m_hwnd) {
         Log(L"CreateWindowEx failed " + std::to_wstring(GetLastError()));
         return false;
@@ -415,6 +420,9 @@ wuc::CompositionBrush Halo::IconBrushFor(std::wstring const& path) {
 
 // Pinned apps first, then the running apps that aren't pinned.
 void Halo::RefreshDock() {
+    // A new window (Paint, say) can land above us in the topmost band; take the top back
+    // before the slow part, loading its icon.
+    SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     auto running = m_tracker->Apps();
     std::vector<bool> pinned(running.size());
     std::vector<Dock::Item> items;
@@ -431,10 +439,9 @@ void Halo::RefreshDock() {
                 if (item.key.empty()) item.key = r.key;
             }
         }
-        items.push_back({brush, !item.key.empty()});
+        items.push_back({L"p:" + pin.linkPath, brush, !item.key.empty(), false});
         m_items.push_back(item);
     }
-    size_t divider = items.size();
     for (size_t i = 0; i < running.size(); i++) {
         if (pinned[i] || running[i].exe.empty()) continue;
         // Packaged apps' exes often carry no icon; their Start entry has the logo.
@@ -442,30 +449,25 @@ void Halo::RefreshDock() {
         if (!running[i].aumid.empty()) brush = IconBrushFor(L"shell:AppsFolder\\" + running[i].aumid);
         if (!brush) brush = IconBrushFor(running[i].exe);
         if (!brush) continue;
-        items.push_back({brush, true});
+        items.push_back({L"u:" + running[i].key, brush, true, true});
         m_items.push_back({{}, running[i].key});
     }
     Log(std::to_wstring(running.size()) + L" running apps, " + std::to_wstring(items.size()) + L" icons");
-    Layout(items.size());
-    m_dock->SetCenter(m_metrics.centerX);
-    m_dock->SetIcons(items, divider);
+    m_dock->SetItems(items);
+    UpdateRegion();
 }
 
-// Sizes the window for `icons` icons (it must hold the dock at full
-// magnification) and keeps it centered on the monitor.
-void Halo::Layout(size_t icons) {
-    float pitch = m_metrics.restSize + m_metrics.gap;
-    float n = static_cast<float>(std::max<size_t>(icons, 1));
-    float growth = 3.0f * pitch * (m_metrics.maxScale - 1);  // generous bound on how far the wave widens it
-    m_width = static_cast<int>(std::ceil(n * pitch + 2 * m_metrics.padding + growth + m_scale.f(40)));
-    m_metrics.centerX = m_width / 2.0f;
-    int x = m_monitor.left + ((m_monitor.right - m_monitor.left) - m_width) / 2;
-    int y = m_monitor.bottom - m_height;
-    m_full = {x, y, x + m_width, y + m_height};
-    m_strip = {x, m_monitor.bottom - kStripPx, x + m_width, m_monitor.bottom};
-    if (!m_hwnd) return;
-    RECT const& r = m_state == State::Hidden ? m_strip : m_full;
-    SetWindowPos(m_hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+// Limits the window's input to the dock (and the bar of it a hidden dock
+// leaves on the screen edge); clicks anywhere else on the bottom of the
+// screen reach the windows underneath. Takes the width the dock can grow to.
+void Halo::UpdateRegion() {
+    if (!m_dock || !m_hwnd) return;
+    bool hidden = m_state == State::Hidden;
+    float half = (hidden ? m_dock->RestWidth() : m_dock->MaxWidth()) / 2;
+    int left = std::max(0, static_cast<int>(m_metrics.centerX - half));
+    int right = std::min(m_width, static_cast<int>(std::ceil(m_metrics.centerX + half)));
+    SetWindowRgn(m_hwnd, CreateRectRgn(left, hidden ? m_height - kStripPx : 0, right, m_height), TRUE);
+    Log(L"input region x " + std::to_wstring(left) + L".." + std::to_wstring(right) + (hidden ? L" (strip)" : L""));
 }
 
 // macOS: a running app comes to the front (its most recent window,
@@ -477,6 +479,7 @@ void Halo::Activate(size_t item) {
         SetForegroundWindow(w);
     } else if (!it.launch.empty()) {
         ShellExecuteW(nullptr, L"open", it.launch.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        m_dock->Bounce(static_cast<int>(item));
     }
 }
 
@@ -490,14 +493,13 @@ void Halo::PointerLeave() {
     if (m_autoHide && m_state == State::Shown) SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
 }
 
-// Shows the full window at once and springs the dock up from wherever it is.
+// Takes input over the whole dock at once and springs it up from wherever it is.
 void Halo::Reveal() {
     KillTimer(m_hwnd, kHideTimer);
     if (m_state == State::Shown) return;
-    if (m_state == State::Hidden)
-        SetWindowPos(m_hwnd, HWND_TOPMOST, m_full.left, m_full.top, m_full.right - m_full.left,
-                     m_full.bottom - m_full.top, SWP_NOACTIVATE);
+    bool wasHidden = m_state == State::Hidden;
     m_state = State::Shown;
+    if (wasHidden) UpdateRegion();
     ++m_hideGen;
     auto spring = m_comp.CreateSpringScalarAnimation();
     spring.FinalValue(0.0f);
@@ -509,6 +511,7 @@ void Halo::Reveal() {
 void Halo::StartHide() {
     if (m_state != State::Shown) return;
     m_state = State::Hiding;
+    if (m_dock) m_dock->OnPointerLeave();  // magnification relaxes as the dock drops
     unsigned gen = ++m_hideGen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     auto slide = m_comp.CreateScalarKeyFrameAnimation();
@@ -520,8 +523,7 @@ void Halo::StartHide() {
     batch.Completed([this, gen](auto&&, auto&&) {
         if (gen != m_hideGen || m_state != State::Hiding) return;  // a reveal took over
         m_state = State::Hidden;
-        SetWindowPos(m_hwnd, HWND_TOPMOST, m_strip.left, m_strip.top, m_strip.right - m_strip.left,
-                     m_strip.bottom - m_strip.top, SWP_NOACTIVATE);
+        UpdateRegion();
     });
 }
 
@@ -560,10 +562,24 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 StartHide();
             }
             return 0;
-        case WM_LBUTTONUP:
+        case WM_LBUTTONDOWN:
             if (m_dock && m_state == State::Shown) {
-                int i = m_dock->HitTest(mx, my);
-                if (i >= 0 && i < static_cast<int>(m_items.size())) Activate(i);
+                m_pressed = m_dock->HitTest(mx, my);
+                m_dock->SetPressed(m_pressed);
+                if (m_pressed >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
+            }
+            return 0;
+        case WM_LBUTTONUP:
+        case WM_CAPTURECHANGED:
+            if (m_pressed >= 0 && m_dock) {
+                int pressed = std::exchange(m_pressed, -1);
+                m_dock->SetPressed(-1);
+                if (m == WM_LBUTTONUP) {
+                    ReleaseCapture();
+                    if (m_state == State::Shown && m_dock->HitTest(mx, my) == pressed &&
+                        pressed < static_cast<int>(m_items.size()))
+                        Activate(pressed);
+                }
             }
             return 0;
         case kMsgAppsChanged:

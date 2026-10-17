@@ -8,7 +8,7 @@
 # press: a magnified frame with -Icon held down. bounce: a burst after clicking -Icon.
 # Output: build/<Tag>-*.png and build/<Tag>-sheet.png (a stacked contact sheet of a burst).
 param([string]$Scenario = 'hover', [string]$Tag = 'shots', [int]$X = 960, [int]$Icon = 0,
-      [string]$App = 'notepad.exe', [int]$Frames = 16, [int]$IntervalMs = 60)
+      [string]$App = 'notepad.exe', [int]$Frames = 16, [int]$IntervalMs = 100)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot
 $out = Join-Path $repo 'build'
@@ -61,8 +61,22 @@ function Burst($ms, $afterMs, $action) {
     $frames
 }
 # Stacks the middle 1000 px of each frame (labelled with its time) into one image.
+# Keeps the frames that differ from the last kept one (sampled pixels), at most $max.
+function Distinct($frames, $max) {
+    $kept = @(); $last = $null
+    foreach ($f in $frames) {
+        $d = 1e9
+        if ($last) { $d = 0; for ($y = 110; $y -lt 200; $y += 5) { for ($x = 700; $x -lt 1600; $x += 5) {
+            $a = $f.Bmp.GetPixel($x, $y); $b = $last.Bmp.GetPixel($x, $y)
+            $d += [math]::Abs($a.R - $b.R) + [math]::Abs($a.G - $b.G) + [math]::Abs($a.B - $b.B) } } }
+        if ($d -gt 3000) { $kept += $f; $last = $f }
+    }
+    if ($kept.Count -gt $max) { $kept = $kept[0..($max - 1)] }
+    $kept
+}
 function Sheet($frames, $name) {
-    $w = 1000; $h = 150; $x0 = 460
+    $frames = Distinct $frames 30
+    $w = 900; $h = 90; $x0 = 700
     $sheet = New-Object System.Drawing.Bitmap $w, ($h * $frames.Count)
     $g = [System.Drawing.Graphics]::FromImage($sheet); $g.Clear([System.Drawing.Color]::FromArgb(40, 40, 40))
     $font = New-Object System.Drawing.Font 'Consolas', 9
@@ -99,9 +113,8 @@ try {
                   Sheet $f 'open'; Start-Sleep -Seconds 1; Shot 'after'
                   Get-Process | Where-Object { $_.Id -eq $started.Id } | ForEach-Object { $_.CloseMainWindow() | Out-Null } }
         'close' { $started = Start-Process $App -PassThru; Start-Sleep -Seconds 4; Shot 'before'
-                  $f = Burst 2000 300 { $started.CloseMainWindow() | Out-Null
-                                         Start-Sleep -Milliseconds 200
-                                         if (-not $started.HasExited) { Stop-Process -Id $started.Id -ErrorAction SilentlyContinue } }
+                  $f = Burst 2000 300 { $started.CloseMainWindow() | Out-Null }
+                  if (-not $started.HasExited) { Stop-Process -Id $started.Id -ErrorAction SilentlyContinue }
                   Sheet $f 'close'; Shot 'after' }
         'press' { $ix = [int](IconX $Icon); PMove $ix; Start-Sleep -Milliseconds 600
                   Shot 'hover'
