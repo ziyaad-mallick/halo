@@ -1,14 +1,14 @@
 // ==WindhawkMod==
 // @id              halo-genie
 // @name            Halo Genie
-// @description     macOS genie minimize/restore into Halo's dock icons, plus a zoom swoop for maximize/un-maximize.
-// @version         1.0.0
+// @description     macOS Scale-effect minimize/restore into Halo's dock icons (GPU compositor), plus a zoom for maximize/un-maximize.
+// @version         2.0.0
 // @author          Ziyaad Mallick (fork of MacOS Minimize Animation by Abdullah Masood)
 // @include         *
 // @exclude         halo.exe
 // @exclude         guardian.exe
 // @architecture    x86-64
-// @compilerOptions -ldwmapi -lgdi32 -ld2d1 -lole32 -loleaut32 -luuid
+// @compilerOptions -ldwmapi -lgdi32 -ldcomp -ld3d11 -ldxgi -lole32 -loleaut32 -luuid
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -16,10 +16,17 @@
 /*
 # Halo Genie
 
-The macOS genie effect for [Halo](https://github.com/ziyaad-mallick/halo), the
-dock that replaces the Windows taskbar. Minimizing pours the window into the
-app's dock icon, restoring pours it back out. Maximize and un-maximize get a
-matching zoom (the window scales between its two rects, ease-out, no flash).
+The macOS "Scale" minimize effect for [Halo](https://github.com/ziyaad-mallick/halo),
+the dock that replaces the Windows taskbar. Minimizing shrinks the window
+toward the app's dock icon along an ease-in-out path (about 320 ms, fading out
+over the last 30%); restoring is the exact reverse with a tiny spring settle.
+Maximize and un-maximize get a matching zoom (the window scales between its two
+rects, ease-out, no flash).
+
+The animation runs on the GPU compositor: the window is captured once into a
+DirectComposition surface, and scale, translate and opacity are
+IDCompositionAnimation timelines committed once, so the DWM plays them at the
+display refresh rate with no per-frame CPU work in the host process.
 
 If Halo is not running, minimize and restore aim at the Windows taskbar button
 instead (simplified from the original mod: the click position, or a name match
@@ -46,7 +53,7 @@ with SendMessageTimeoutW (SMTO_ABORTIFHUNG, 50 ms):
   its hidden, slid-off position. The reply needs a 64-bit LRESULT, so the
   mod is x86-64 only.
 - On 1 and 2 Halo also reveals the dock and keeps it up until 300 ms after
-  the animation (it assumes the 400 ms genie) so the swoop lands in a visible icon.
+  the animation (it assumes the 320 ms animation) so the swoop lands in a visible icon.
 
 Halo replies 0 (no dock icon): the mod lets Windows do its own animation.
 No Halo window: the taskbar fallback above.
@@ -54,11 +61,11 @@ No Halo window: the taskbar fallback above.
 ## Credits and licence
 
 Fork of **MacOS Minimize Animation** v3.1.6 (MIT) by **Abdullah Masood**
-(<https://github.com/Abdullah-Masood-05>). The Direct2D genie engine (mesh
-warp on the macOS lamp curve, window-only capture, translucent-window fix,
-frame pacing) was contributed to that mod by **Potassiumuncher**
-(<https://github.com/Potassiumuncher>). The maximize zoom was written for this
-fork; the way it hooks maximize/restore was studied in "Windows Animations"
+(<https://github.com/Abdullah-Masood-05>). The window-only capture and
+translucent-window fix come from the Direct2D genie engine contributed to that
+mod by **Potassiumuncher** (<https://github.com/Potassiumuncher>); the
+DirectComposition Scale effect replaced that engine's CPU mesh warp. The
+maximize zoom was written for this fork; the way it hooks maximize/restore was studied in "Windows Animations"
 by ReDrag (MIT), no code copied.
 
 Dropped from the original: the Classic style, app-launch animation, settings,
@@ -78,11 +85,14 @@ IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 
 #include <windows.h>
 #include <dwmapi.h>
-#include <d2d1.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <dcomp.h>
 #include <uiautomation.h>
 #include <math.h>
 #include <atomic>
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -100,9 +110,8 @@ IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-constexpr int kGenieMs = 400;  // Halo keeps the dock up for this + 300 ms
+constexpr int kGenieMs = 320;  // Halo keeps the dock up for this + 300 ms
 constexpr int kZoomMs = 280;
-constexpr int kTiles = 32;     // genie mesh resolution
 constexpr float kPi = 3.14159265f;
 
 enum Kind { Minimize, Restore, Maximize, Unmaximize };
@@ -133,7 +142,10 @@ ShowWindow_t ShowWindow_Original, ShowWindowAsync_Original;
 SetWindowPlacement_t SetWindowPlacement_Original;
 CloseWindow_t CloseWindow_Original;
 
-ID2D1Factory* g_d2dFactory = nullptr;
+ID3D11Device* g_d3d = nullptr;
+ID3D11DeviceContext* g_ctx = nullptr;
+IDXGIDevice* g_dxgi = nullptr;
+std::mutex g_d3dMutex;
 UINT g_haloMsg = 0;
 std::mutex g_mutex;
 std::unordered_map<HWND, std::shared_ptr<Snap>> g_cache;  // minimize snapshot, reused by restore
@@ -308,250 +320,258 @@ static std::shared_ptr<Snap> Capture(HWND hwnd, RECT* ext) {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// Rendering (DirectComposition: the DWM runs the animation, zero CPU per frame)
 // ---------------------------------------------------------------------------
-// The macOS "lamp" curve (Potassiumuncher): maps a mesh vertex (tx,ty in 0..1)
-// at progress p to its warped screen position, for window rect w and icon i.
-static void LampVertex(float tx, float ty, float p, const Geometry& w, const Geometry& i, float* outX, float* outY) {
-    float split = 0.3f;
-    float k = (p <= split) ? (p / split) : 1.0f;
-    float j = (p > split) ? ((p - split) / (1.0f - split)) : 0.0f;
-    float expandHeight = (i.y - w.y - w.height);
-    float fullHeight = (i.y - w.y) - (expandHeight * (1.0f - k));
-    float height = fullHeight - (j * fullHeight);
-    float y = ty * height;
-    float x = tx * (i.width) + tx * (w.width - i.width) * (1.0f - j) * (1.0f - ty) + tx * (w.width - i.width) * (1.0f - k) * ty;
-    float offsetX = (i.x - w.x) * (y / (fullHeight + 0.1f)) * k + (i.x - w.x) * j;
-    float offsetY = i.y - w.y - height - (expandHeight * (1.0f - k));
-    float effectX = sinf(((height - y) / fullHeight) * 2.0f * kPi + kPi) * (w.x + w.width * tx - (i.x + i.width * tx)) / 7.0f * k;
-    *outX = w.x + x + offsetX + effectX;
-    *outY = w.y + y + offsetY;
+// The captured window is uploaded ONCE into a DComp surface. Scale, translate
+// and opacity are IDCompositionAnimation objects (piecewise cubics), committed
+// once; the worker then just sleeps until the timeline has played out.
+
+// CSS-style cubic-bezier(x1,y1,x2,y2): y at time u.
+static double Bezier(double x1, double y1, double x2, double y2, double u) {
+    if (u <= 0) return 0;
+    if (u >= 1) return 1;
+    double lo = 0, hi = 1, s = u;
+    for (int i = 0; i < 40; i++) {
+        s = (lo + hi) / 2;
+        double x = 3 * (1 - s) * (1 - s) * s * x1 + 3 * (1 - s) * s * s * x2 + s * s * s;
+        (x < u ? lo : hi) = s;
+    }
+    return 3 * (1 - s) * (1 - s) * s * y1 + 3 * (1 - s) * s * s * y2 + s * s * s;
 }
 
-static D2D1_POINT_2F Bloat(D2D1_POINT_2F p, D2D1_POINT_2F c, float amount) {
-    float dx = p.x - c.x, dy = p.y - c.y, len = sqrtf(dx * dx + dy * dy);
-    return len < 0.001f ? p : D2D1::Point2F(p.x + dx / len * amount, p.y + dy / len * amount);
+// Minimize motion curves, u in 0..1. X (and scale) is the Material standard
+// ease-in-out; Y is a touch more front-loaded so the path bows into a slight arc.
+static double CurveX(double u) { return Bezier(0.4, 0.0, 0.2, 1.0, u); }
+static double CurveY(double u) { return Bezier(0.5, 0.0, 0.25, 1.0, u); }
+static double Fade(double u) {  // opacity 1 -> 0 over the last 30%
+    double s = std::min(std::max((u - 0.7) / 0.3, 0.0), 1.0);
+    return 1.0 - s * s * (3.0 - 2.0 * s);
+}
+static double Bump(double u) {  // restore spring: +1.5% overshoot, then settle
+    double s = std::min(std::max((u - 0.72) / 0.28, 0.0), 1.0);
+    return 0.015 * sin(s * kPi);
 }
 
-static ID2D1PathGeometry* QuadGeo(D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_POINT_2F c, D2D1_POINT_2F d) {
-    ID2D1PathGeometry* geo = nullptr;
-    g_d2dFactory->CreatePathGeometry(&geo);
-    if (!geo) return nullptr;
-    ID2D1GeometrySink* sink = nullptr;
-    geo->Open(&sink);
-    sink->BeginFigure(a, D2D1_FIGURE_BEGIN_FILLED);
-    sink->AddLine(b); sink->AddLine(c); sink->AddLine(d);
-    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-    sink->Close();
-    sink->Release();
-    return geo;
+// One animated property: value(u) over u in 0..1, sampled into cubic Hermite
+// segments between `knots` (the DWM evaluates the polynomials itself).
+struct Track {
+    std::function<double(double)> f;
+    std::vector<double> knots{0.0, 0.25, 0.5, 0.75, 1.0};
+};
+
+static IDCompositionAnimation* MakeAnim(IDCompositionDevice* dev, const Track& t, double durSec) {
+    IDCompositionAnimation* an = nullptr;
+    if (FAILED(dev->CreateAnimation(&an)) || !an) return nullptr;
+    const double h = 1e-4;
+    auto d = [&](double u) {  // derivative wrt u
+        double a = std::max(u - h, 0.0), b = std::min(u + h, 1.0);
+        return (t.f(b) - t.f(a)) / (b - a);
+    };
+    bool ok = true;
+    for (size_t i = 0; i + 1 < t.knots.size(); i++) {
+        double u0 = t.knots[i], u1 = t.knots[i + 1];
+        double T = (u1 - u0) * durSec;
+        double v0 = t.f(u0), v1 = t.f(u1);
+        double d0 = d(u0) / durSec, d1 = d(u1) / durSec;  // per second
+        double c = v0, l = d0;
+        double q = 3 * (v1 - v0) / (T * T) - (2 * d0 + d1) / T;
+        double k = -2 * (v1 - v0) / (T * T * T) + (d0 + d1) / (T * T);
+        ok &= SUCCEEDED(an->AddCubic(u0 * durSec, (float)c, (float)l, (float)q, (float)k));
+    }
+    ok &= SUCCEEDED(an->End(durSec, (float)t.f(1.0)));
+    if (!ok) { an->Release(); return nullptr; }
+    return an;
 }
 
-static RECT MonitorOf(const RECT& r) {
-    MONITORINFO mi = {sizeof(mi)};
-    return GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi) ? mi.rcMonitor : r;
+// One D3D device per process, made on first use (injected into every process,
+// so nothing is created until an animation actually runs).
+static IDXGIDevice* AcquireDxgiDevice() {
+    std::lock_guard<std::mutex> lock(g_d3dMutex);
+    if (!g_dxgi) {
+        ID3D11Device* d3d = nullptr;
+        ID3D11DeviceContext* ctx = nullptr;
+        D3D_FEATURE_LEVEL fl;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                       nullptr, 0, D3D11_SDK_VERSION, &d3d, &fl, &ctx);
+        if (FAILED(hr))
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                   nullptr, 0, D3D11_SDK_VERSION, &d3d, &fl, &ctx);
+        if (SUCCEEDED(hr) && SUCCEEDED(d3d->QueryInterface(__uuidof(IDXGIDevice), (void**)&g_dxgi))) {
+            g_d3d = d3d; g_ctx = ctx;
+        } else {
+            if (d3d) d3d->Release();
+            if (ctx) ctx->Release();
+            g_dxgi = nullptr;
+        }
+    }
+    if (g_dxgi) g_dxgi->AddRef();
+    return g_dxgi;
+}
+
+static void ReleaseDxgiDevice() {
+    std::lock_guard<std::mutex> lock(g_d3dMutex);
+    if (g_dxgi) { g_dxgi->Release(); g_dxgi = nullptr; }
+    if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
+    if (g_d3d) { g_d3d->Release(); g_d3d = nullptr; }
 }
 
 static RECT Union(const RECT& a, const RECT& b) {
     return {std::min(a.left, b.left), std::min(a.top, b.top), std::max(a.right, b.right), std::max(a.bottom, b.bottom)};
 }
 
+template <class T> static void Rel(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
 static DWORD WINAPI Worker(LPVOID param) {
     std::shared_ptr<Anim> a(*(std::shared_ptr<Anim>*)param);
     delete (std::shared_ptr<Anim>*)param;
     DpiScope dpi;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     const bool zoom = a->kind >= Maximize;
     const bool rising = a->kind == Restore;
     const Snap& snap = *a->snap;
-    const Geometry wGeom = {(float)a->from.left, (float)a->from.top, (float)snap.w, (float)snap.h};
-    const Geometry iGeom = a->icon;
+    const double sw = snap.w, sh = snap.h;
+    const double durMs = zoom ? kZoomMs : kGenieMs;
+    const double dur = durMs / 1000.0;
 
-    // Canvas: the box the effect can occupy, clamped to the screens involved but
-    // never clipping the window or its destination. The genie's sway pad is bounded
-    // by max(|w.x-i.x|, |w.right-i.right|)/7.
-    RECT dest = zoom ? a->toEst : RECT{(LONG)iGeom.x, (LONG)iGeom.y, (LONG)(iGeom.x + iGeom.width), (LONG)(iGeom.y + iGeom.height)};
+    // Canvas: a transparent window over everything the window can touch. The
+    // genie only shrinks toward the icon (plus a 1.5% spring overshoot), so the
+    // union of the two rects with a margin is enough.
+    RECT dest = zoom ? a->toEst : RECT{(LONG)a->icon.x, (LONG)a->icon.y, (LONG)(a->icon.x + a->icon.width), (LONG)(a->icon.y + a->icon.height)};
     RECT box = Union(a->from, dest);
-    if (!zoom) {
-        float sway = std::max(fabsf(wGeom.x - iGeom.x), fabsf(wGeom.x + wGeom.width - iGeom.x - iGeom.width)) / 7.0f;
-        int pad = (int)(std::max(wGeom.width / 2, sway) + 1);
-        box.left -= pad; box.right += pad;
-    }
-    RECT mons = Union(MonitorOf(a->from), MonitorOf(dest));
-    box = Union({std::max(box.left, mons.left), std::max(box.top, mons.top),
-                 std::min(box.right, mons.right), std::min(box.bottom, mons.bottom)},
-                Union(a->from, dest));
-    const int vLeft = box.left, vTop = box.top;
-    const int vW = std::max<int>(1, box.right - box.left), vH = std::max<int>(1, box.bottom - box.top - 1);
+    int pad = zoom ? 48 : (int)(std::max(sw, sh) * 0.06) + 32;
+    box = {box.left - pad, box.top - pad, box.right + pad, box.bottom + pad};
+    const int vLeft = box.left, vTop = box.top, vW = box.right - box.left, vH = box.bottom - box.top;
 
-    HDC screen = GetDC(nullptr), mem = CreateCompatibleDC(screen);
-    BITMAPINFO bmi = {{sizeof(BITMAPINFOHEADER), vW, -vH, 1, 32, BI_RGB}};
-    void* targetBits = nullptr;
-    HBITMAP target = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &targetBits, nullptr, 0);
-    HGDIOBJ oldBmp = SelectObject(mem, target);
-    HWND ghost = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+    HWND ghost = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
                                  L"STATIC", nullptr, WS_POPUP, vLeft, vTop, vW, vH, nullptr, nullptr, nullptr, nullptr);
 
-    ID2D1DCRenderTarget* rt = nullptr;
-    ID2D1Bitmap* bmp = nullptr;
-    ID2D1BitmapBrush* brush = nullptr;
-    if (g_d2dFactory) {
-        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-            D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-            0, 0, D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_FEATURE_LEVEL_DEFAULT);
-        g_d2dFactory->CreateDCRenderTarget(&props, &rt);
-        if (rt) {
-            rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            rt->CreateBitmap(D2D1::SizeU(snap.w, snap.h), snap.bits, snap.w * 4,
-                             D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)), &bmp);
-            if (bmp && !zoom)
-                rt->CreateBitmapBrush(bmp, D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
-                                      D2D1_BITMAP_INTERPOLATION_MODE_LINEAR), &brush);
+    IDXGIDevice* dxgi = ghost ? AcquireDxgiDevice() : nullptr;
+    IDCompositionDevice* dev = nullptr;
+    IDCompositionTarget* target = nullptr;
+    IDCompositionVisual* visual = nullptr;
+    IDCompositionSurface* surface = nullptr;
+    IDCompositionEffectGroup* effect = nullptr;
+    IDCompositionScaleTransform* scale = nullptr;
+    IDCompositionTranslateTransform* move = nullptr;
+    IDCompositionTransform* group = nullptr;
+    bool built = false;
+
+    if (dxgi && SUCCEEDED(DCompositionCreateDevice(dxgi, __uuidof(IDCompositionDevice), (void**)&dev)) &&
+        SUCCEEDED(dev->CreateTargetForHwnd(ghost, TRUE, &target)) && SUCCEEDED(dev->CreateVisual(&visual)) &&
+        SUCCEEDED(dev->CreateSurface(snap.w, snap.h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &surface)) &&
+        SUCCEEDED(dev->CreateEffectGroup(&effect)) && SUCCEEDED(dev->CreateScaleTransform(&scale)) &&
+        SUCCEEDED(dev->CreateTranslateTransform(&move))) {
+        // Upload the capture once.
+        ID3D11Texture2D* tex = nullptr;
+        POINT off = {};
+        if (SUCCEEDED(surface->BeginDraw(nullptr, __uuidof(ID3D11Texture2D), (void**)&tex, &off)) && tex) {
+            D3D11_BOX b = {(UINT)off.x, (UINT)off.y, 0, (UINT)(off.x + snap.w), (UINT)(off.y + snap.h), 1};
+            {
+                std::lock_guard<std::mutex> lock(g_d3dMutex);
+                if (g_ctx) g_ctx->UpdateSubresource(tex, 0, &b, snap.bits, snap.w * 4, 0);
+            }
+            tex->Release();
+            built = SUCCEEDED(surface->EndDraw());
         }
     }
 
-    // Frames are paced at 2x the refresh rate by a high-resolution timer (a rate
-    // limiter, not a vsync gate), progress follows real elapsed time.
-    double frameMs = 1000.0 / 240.0;
-    DWM_TIMING_INFO ti = {sizeof(ti)};
-    if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) && ti.rateRefresh.uiDenominator)
-        frameMs = 1000.0 / ((double)ti.rateRefresh.uiNumerator / ti.rateRefresh.uiDenominator * 2.0);
-    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
-    if (!timer) timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_MODIFY_STATE | SYNCHRONIZE);
-
-    LARGE_INTEGER freq, start, now, lastPresent = {};
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
-    const double durMs = zoom ? kZoomMs : kGenieMs;
-    int frames = 0;
-    double sumGap = 0, maxGap = 0;
-    bool first = true, swapped = false;
-    std::vector<std::vector<D2D1_POINT_2F>> grid(kTiles + 1, std::vector<D2D1_POINT_2F>(kTiles + 1));
-
-    while (rt && bmp && (zoom || brush)) {
-        QueryPerformanceCounter(&now);
-        const LARGE_INTEGER frameStart = now;
-        double elapsed = (now.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
-        bool last = elapsed >= durMs || a->abort.load() || g_unloading.load();
-        float raw = (float)std::min(elapsed / durMs, 1.0);
-
-        // Zoom: once the real window has its final size, swap in a fresh capture
-        // (sharp at the new size) halfway through; the rects are unchanged so it doesn't jump.
-        if (zoom && !swapped && raw > 0.5f && a->toReady.load()) {
-            swapped = true;
-            RECT ext;
-            auto fresh = Capture(a->hwnd, &ext);
-            if (fresh && abs((ext.right - ext.left) - (a->toFinal.right - a->toFinal.left)) < 4) {
-                ID2D1Bitmap* nb = nullptr;
-                rt->CreateBitmap(D2D1::SizeU(fresh->w, fresh->h), fresh->bits, fresh->w * 4,
-                                 D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)), &nb);
-                if (nb) { bmp->Release(); bmp = nb; a->snap = fresh; }
-            }
-        }
-
-        RECT bind = {0, 0, vW, vH};
-        rt->BindDC(mem, &bind);
-        rt->BeginDraw();
-        rt->Clear(D2D1::ColorF(0, 0, 0, 0));
-        bool degenerate = false;
+    // Motion, as functions of timeline position u (0..1).
+    Track sx, sy, tx, ty, op;
+    auto zoomTracks = [&](const RECT& to) {
+        double kx = (to.right - to.left) / sw, ky = (to.bottom - to.top) / sh;
+        double dx = (double)to.left - a->from.left, dy = (double)to.top - a->from.top;
+        auto e = [](double u) { return 1.0 - pow(1.0 - u, 3.0); };  // ease-out
+        sx.f = [=](double u) { return 1.0 + (kx - 1.0) * e(u); };
+        sy.f = [=](double u) { return 1.0 + (ky - 1.0) * e(u); };
+        tx.f = [=](double u) { return dx * e(u); };
+        ty.f = [=](double u) { return dy * e(u); };
+    };
+    if (built) {
         if (zoom) {
-            float e = 1.0f - powf(1.0f - raw, 3.0f);  // ease-out
-            const RECT& to = a->toReady.load() ? a->toFinal : a->toEst;
-            auto lerp = [&](LONG f, LONG t) { return (float)f + ((float)t - (float)f) * e; };
-            rt->DrawBitmap(bmp, D2D1::RectF(lerp(a->from.left, to.left) - vLeft, lerp(a->from.top, to.top) - vTop,
-                                            lerp(a->from.right, to.right) - vLeft, lerp(a->from.bottom, to.bottom) - vTop),
-                           1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            zoomTracks(a->toEst);
+            op.f = [](double) { return 1.0; };
+            sx.knots = sy.knots = tx.knots = ty.knots = {0.0, 0.5, 1.0};
+            op.knots = {0.0, 1.0};
+            scale->SetCenterX(0.0f); scale->SetCenterY(0.0f);
         } else {
-            float eased = raw * raw * (3.0f - 2.0f * raw);
-            float t = rising ? 1.0f - eased : eased;  // restore plays the warp in reverse
-            for (int y = 0; y <= kTiles; y++)
-                for (int x = 0; x <= kTiles; x++) {
-                    float px, py;
-                    LampVertex((float)x / kTiles, (float)y / kTiles, t, wGeom, iGeom, &px, &py);
-                    grid[y][x] = D2D1::Point2F(px - vLeft, py - vTop);
-                }
-            float l = grid[0][0].x, r = l, tp = grid[0][0].y, b = tp;
-            for (auto& row : grid) for (auto& p : row) { l = fminf(l, p.x); r = fmaxf(r, p.x); tp = fminf(tp, p.y); b = fmaxf(b, p.y); }
-            degenerate = (r - l) < 2.0f || (b - tp) < 2.0f;  // a collapsed mesh would flash as a line
-            ID2D1RoundedRectangleGeometry* mask = nullptr;
-            float rad = fminf(12.0f, fminf(r - l, b - tp) / 2.0f);
-            g_d2dFactory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(D2D1::RectF(l, tp, r, b), rad, rad), &mask);
-            if (mask) {
-                D2D1_LAYER_PARAMETERS lp = D2D1::LayerParameters();
-                lp.geometricMask = mask;
-                lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
-                rt->PushLayer(&lp, nullptr);
-                rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-                for (int y = 0; y < kTiles; y++)
-                    for (int x = 0; x < kTiles; x++) {
-                        D2D1_POINT_2F p1 = grid[y][x], p2 = grid[y][x + 1], p3 = grid[y + 1][x], p4 = grid[y + 1][x + 1];
-                        D2D1_POINT_2F c = D2D1::Point2F((p1.x + p2.x + p3.x + p4.x) / 4, (p1.y + p2.y + p3.y + p4.y) / 4);
-                        float qw = fmaxf(fabsf(p2.x - p1.x), fabsf(p4.x - p3.x)), qh = fmaxf(fabsf(p3.y - p1.y), fabsf(p4.y - p2.y));
-                        float bl = fmaxf(0.20f, fminf(0.40f, fminf(qw, qh) * 0.05f));  // overlap keeps seams closed
-                        ID2D1PathGeometry* quad = QuadGeo(Bloat(p1, c, bl), Bloat(p2, c, bl), Bloat(p4, c, bl), Bloat(p3, c, bl));
-                        if (!quad) continue;
-                        float sx = (float)x / kTiles * wGeom.width, sy = (float)y / kTiles * wGeom.height;
-                        float sw = wGeom.width / kTiles, sh = wGeom.height / kTiles;
-                        float m11 = (p2.x - p1.x) / sw, m12 = (p2.y - p1.y) / sw, m21 = (p3.x - p1.x) / sh, m22 = (p3.y - p1.y) / sh;
-                        brush->SetTransform(D2D1::Matrix3x2F(m11, m12, m21, m22, p1.x - sx * m11 - sy * m21, p1.y - sx * m12 - sy * m22));
-                        rt->FillGeometry(quad, brush);
-                        quad->Release();
-                    }
-                rt->PopLayer();
-                mask->Release();
+            // Shrink uniformly about the window's centre while that centre travels to the icon's.
+            double iconSize = std::max<double>(a->icon.width, 1.0);
+            double sEnd = iconSize / std::max(sw, sh);
+            double dx = a->icon.x + a->icon.width / 2 - (a->from.left + sw / 2);
+            double dy = a->icon.y + a->icon.height / 2 - (a->from.top + sh / 2);
+            // Minimize plays p = curve(u); restore is the exact reverse plus the spring settle.
+            auto px = [=](double u) { return rising ? CurveX(1.0 - u) - Bump(u) : CurveX(u); };
+            auto py = [=](double u) { return rising ? CurveY(1.0 - u) - Bump(u) : CurveY(u); };
+            sx.f = sy.f = [=](double u) { return 1.0 + (sEnd - 1.0) * px(u); };
+            tx.f = [=](double u) { return dx * px(u); };
+            ty.f = [=](double u) { return dy * py(u); };
+            op.f = [=](double u) { return rising ? Fade(1.0 - u) : Fade(u); };
+            if (rising) {
+                sx.knots = sy.knots = tx.knots = ty.knots = {0.0, 0.2, 0.4, 0.6, 0.72, 0.8, 0.86, 0.93, 1.0};
+                op.knots = {0.0, 0.3, 1.0};
+            } else {
+                op.knots = {0.0, 0.7, 1.0};
             }
+            scale->SetCenterX((float)(sw / 2)); scale->SetCenterY((float)(sh / 2));
         }
-        rt->EndDraw();
 
-        if (!degenerate) {
-            POINT dst = {vLeft, vTop}, src = {0, 0};
-            SIZE sz = {vW, vH};
-            BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-            UpdateLayeredWindow(ghost, screen, &dst, &sz, mem, &src, 0, &bf, ULW_ALPHA);
-            if (first) ShowWindow(ghost, SW_SHOWNOACTIVATE);
-            QueryPerformanceCounter(&now);
-            if (lastPresent.QuadPart) {
-                double gap = (now.QuadPart - lastPresent.QuadPart) * 1000.0 / freq.QuadPart;
-                sumGap += gap; maxGap = std::max(maxGap, gap);
+        // Static first pose (the window exactly where it was, or at the icon for a
+        // restore) so the ghost is on screen before the caller touches the real window.
+        scale->SetScaleX((float)sx.f(0)); scale->SetScaleY((float)sy.f(0));
+        move->SetOffsetX((float)tx.f(0)); move->SetOffsetY((float)ty.f(0));
+        effect->SetOpacity((float)op.f(0));
+        IDCompositionTransform* parts[2] = {scale, move};
+        built = SUCCEEDED(dev->CreateTransformGroup(parts, 2, &group)) &&
+                SUCCEEDED(visual->SetOffsetX((float)(a->from.left - vLeft))) &&
+                SUCCEEDED(visual->SetOffsetY((float)(a->from.top - vTop))) &&
+                SUCCEEDED(visual->SetContent(surface)) && SUCCEEDED(visual->SetTransform(group)) &&
+                SUCCEEDED(visual->SetEffect(effect)) && SUCCEEDED(target->SetRoot(visual)) && SUCCEEDED(dev->Commit());
+    }
+    if (built) {
+        ShowWindow(ghost, SW_SHOWNOACTIVATE);
+        dev->WaitForCommitCompletion();
+        DwmFlush();  // the ghost is on screen before the caller changes the real window
+    }
+    a->firstShown = true;
+
+    if (built && zoom) {  // the real window's final rect: known once the caller has resized it
+        for (int i = 0; i < 150 && !a->toReady.load() && !a->abort.load() && !g_unloading.load(); i++) Sleep(1);
+        if (a->toReady.load()) zoomTracks(a->toFinal);
+    }
+
+    if (built && !a->abort.load() && !g_unloading.load()) {
+        // Hand the whole timeline to the compositor: set once, commit once.
+        IDCompositionAnimation *asx = MakeAnim(dev, sx, dur), *asy = MakeAnim(dev, sy, dur), *atx = MakeAnim(dev, tx, dur),
+                               *aty = MakeAnim(dev, ty, dur), *aop = MakeAnim(dev, op, dur);
+        bool ok = asx && asy && atx && aty && aop &&
+                  SUCCEEDED(scale->SetScaleX(asx)) && SUCCEEDED(scale->SetScaleY(asy)) &&
+                  SUCCEEDED(move->SetOffsetX(atx)) && SUCCEEDED(move->SetOffsetY(aty)) &&
+                  SUCCEEDED(effect->SetOpacity(aop)) && SUCCEEDED(dev->Commit());
+        Rel(asx); Rel(asy); Rel(atx); Rel(aty); Rel(aop);
+        LARGE_INTEGER freq, t0, now;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&t0);
+        if (ok) {
+            // No rendering from here on: just wait out the timeline (plus a frame of slack).
+            for (;;) {
+                QueryPerformanceCounter(&now);
+                double elapsed = (now.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+                if (elapsed >= durMs + 40.0 || a->abort.load() || g_unloading.load()) break;
+                Sleep(4);
             }
-            lastPresent = now;
-            frames++;
-        }
-        if (last) break;
-        if (first && !degenerate) {
-            DwmFlush();  // the ghost is on screen before the caller changes the real window
-            first = false;
-            a->firstShown = true;
+            DwmFlush();
         }
         QueryPerformanceCounter(&now);
-        double wait = frameMs - (now.QuadPart - frameStart.QuadPart) * 1000.0 / freq.QuadPart;
-        if (timer && wait > 0.1) {
-            LARGE_INTEGER due;
-            due.QuadPart = -(LONGLONG)(wait * 10000.0);
-            SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
-            WaitForSingleObject(timer, 100);
-        } else {
-            SwitchToThread();
-        }
+        Wh_Log(L"genie kind=%d ok=%d dur=%dms waited=%.1fms canvas=%dx%d", (int)a->kind, (int)ok, (int)durMs,
+               (now.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart, vW, vH);
     }
-    Wh_Log(L"genie kind=%d frames=%d avg=%.2fms max=%.2fms dur=%dms canvas=%dx%d", (int)a->kind, frames,
-           frames > 1 ? sumGap / (frames - 1) : 0.0, maxGap, (int)durMs, vW, vH);
-
-    if (timer) CloseHandle(timer);
-    if (brush) brush->Release();
-    if (bmp) bmp->Release();
-    if (rt) rt->Release();
 
     // Reveal the real window under the ghost, then drop the ghost once DWM has composed it.
     if (a->cloaked) { Cloak(a->hwnd, FALSE); DwmFlush(); }
     SetTransitions(a->hwnd, TRUE);
     a->firstShown = true;
-    SelectObject(mem, oldBmp);
-    DeleteObject(target);
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
-    DestroyWindow(ghost);
+    Rel(group); Rel(scale); Rel(move); Rel(effect); Rel(surface); Rel(visual); Rel(target); Rel(dev); Rel(dxgi);
+    if (ghost) DestroyWindow(ghost);
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_active.erase(a->hwnd);
@@ -732,8 +752,6 @@ LRESULT WINAPI DefWindowProcW_Hook(HWND h, UINT msg, WPARAM w, LPARAM l) {
 
 BOOL Wh_ModInit() {
     g_haloMsg = RegisterWindowMessageW(L"Halo.DockIconForWindow");
-    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, __uuidof(ID2D1Factory), (void**)&g_d2dFactory)))
-        g_d2dFactory = nullptr;
     Wh_SetFunctionHook((void*)DefWindowProcW, (void*)DefWindowProcW_Hook, (void**)&DefWindowProcW_Original);
     Wh_SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook, (void**)&ShowWindow_Original);
     Wh_SetFunctionHook((void*)ShowWindowAsync, (void*)ShowWindowAsync_Hook, (void**)&ShowWindowAsync_Original);
@@ -749,7 +767,7 @@ void Wh_ModBeforeUninit() {
 }
 
 void Wh_ModUninit() {
-    if (g_d2dFactory) { g_d2dFactory->Release(); g_d2dFactory = nullptr; }
+    ReleaseDxgiDevice();
     std::lock_guard<std::mutex> lock(g_mutex);
     g_cache.clear();
 }
