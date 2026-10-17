@@ -11,6 +11,8 @@ bool Install(HWND target);
 void Remove();
 
 UINT Message();               // registered window message posted to `target`
+UINT EscapeMessage();         // posted to `target` on each Esc press while WatchEscape(true); Esc is not swallowed
+void WatchEscape(bool on);
 void OpenPalette();           // sends Win+Alt+Space; call when Message() arrives
 
 // The decision logic, separate from the hook so it can be unit tested.

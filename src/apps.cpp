@@ -166,7 +166,10 @@ void WindowTracker::OnEvent(DWORD event, HWND hwnd) {
     Update(hwnd);
     if (event == EVENT_SYSTEM_FOREGROUND) {
         auto it = std::find_if(m_wins.begin(), m_wins.end(), [&](Win const& w) { return w.hwnd == hwnd; });
-        if (it != m_wins.end()) std::rotate(m_wins.begin(), it, it + 1);
+        if (it != m_wins.end()) {
+            std::rotate(m_wins.begin(), it, it + 1);
+            if (onForeground) onForeground(m_wins.front().app);
+        }
     }
 }
 

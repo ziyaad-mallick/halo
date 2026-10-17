@@ -33,6 +33,7 @@
 #include "effects.h"
 #include "icons.h"
 #include "intellihide.h"
+#include "launcher.h"
 #include "label.h"
 #include "multimon.h"
 #include "winkey.h"
@@ -76,6 +77,8 @@ constexpr UINT kMsgTestMove = WM_APP + 2;   // wParam = pointer x, client px
 constexpr UINT kMsgTestLeave = WM_APP + 3;
 constexpr UINT kMsgIntellihideChanged = WM_APP + 5;  // wParam = overlap, lParam = fullscreen
 constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
+// Test hook (HALO_TEST=1): wParam 0 = open the launcher panel without Command Palette, 1 = close it, else Launcher::TestCommand.
+constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
@@ -125,7 +128,7 @@ private:
     LRESULT OnMessage(UINT, WPARAM, LPARAM);
     void InitComposition();
     void InitGraphics();
-    wuc::ContainerVisual BuildPill();
+    wuc::ContainerVisual BuildPill(int noiseHeight = 0);
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
     void RefreshDock();
@@ -136,6 +139,9 @@ private:
     void PointerLeave();
     void Reveal();
     void OpenLauncher();
+    halo::LauncherAnchor LauncherAnchorNow() const;
+    std::wstring LaunchTarget(RunningApp const& app) const;
+    void LaunchRecent(std::wstring const& target);
     LRESULT DockIconForWindow(HWND win, LPARAM op);
     void StartHide();
     RECT GetPillRectScreen() const;
@@ -159,6 +165,7 @@ private:
     std::unique_ptr<Dock> m_dock;
     std::unique_ptr<DockCluster> m_cluster;
     std::unique_ptr<halo::AppLabel> m_label;
+    std::unique_ptr<halo::Launcher> m_launcher;
     std::unique_ptr<halo::IntellihideDetector> m_intellihide;
     std::unique_ptr<halo::MultiMonitorFollower> m_multimon;
     bool m_trackingMouse = false;
@@ -260,6 +267,15 @@ bool Halo::Create(HINSTANCE inst) {
             Step(L"multi-monitor", [&] {
                 m_multimon = std::make_unique<halo::MultiMonitorFollower>(m_hwnd, kMsgMonitorSwitch);
                 m_multimon->SetCurrentMonitor(m_currentMon);
+            });
+            Step(L"launcher", [&] {
+                halo::LauncherHost host;
+                host.glass = [this](int noiseHeight) { return BuildPill(noiseHeight); };
+                host.appIcon = [this](std::wstring const& target) { return IconBrushFor(target); };
+                host.launch = [this](std::wstring const& target) { LaunchRecent(target); };
+                host.closed = [this] { if (!m_trackingMouse) PointerLeave(); };  // the dock may auto-hide again
+                m_launcher = std::make_unique<halo::Launcher>(inst, m_comp, m_gdev, std::move(host));
+                m_tracker->onForeground = [this](RunningApp const& app) { m_launcher->Note(LaunchTarget(app)); };
             });
         }
     }
@@ -380,7 +396,7 @@ wuc::CompositionBrush Halo::MakeNoiseBrush(int w, int h) {
 // grain and a 1px rim whose vertical gradient is bright on top and faintly
 // bright again at the bottom. Layers size relative to the container, which
 // the dock resizes and clips.
-wuc::ContainerVisual Halo::BuildPill() {
+wuc::ContainerVisual Halo::BuildPill(int noiseHeight) {
     auto pill = m_comp.CreateContainerVisual();
 
     auto glass = m_comp.CreateSpriteVisual();
@@ -404,7 +420,7 @@ wuc::ContainerVisual Halo::BuildPill() {
         auto noise = m_comp.CreateSpriteVisual();
         noise.RelativeSizeAdjustment({1, 1});
         noise.Opacity(0.025f);
-        noise.Brush(MakeNoiseBrush(m_monitor.right - m_monitor.left, static_cast<int>(std::ceil(m_metrics.pillHeight))));
+        noise.Brush(MakeNoiseBrush(m_monitor.right - m_monitor.left, noiseHeight ? noiseHeight : static_cast<int>(std::ceil(m_metrics.pillHeight))));
         pill.Children().InsertAtTop(noise);
     });
 
@@ -464,6 +480,7 @@ void Halo::RefreshDock() {
     // A new window (Paint, say) can land above us in the topmost band; take the top back
     // before the slow part, loading its icon.
     SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (m_launcher) m_launcher->Raise();  // the panel stays above the dock
     auto running = m_tracker->Apps();
     std::vector<bool> pinned(running.size());
     std::vector<Dock::Item> items;
@@ -588,6 +605,7 @@ void Halo::Activate(size_t item) {
         SetForegroundWindow(w);
     } else if (!it.launch.empty()) {
         // Bounce first: ShellExecute can block this thread for a while, the animation runs without it.
+        if (m_launcher) m_launcher->Note(it.launch);
         if (it.key.empty()) m_dock->Bounce(static_cast<int>(item));  // an app that is up (no window yet) doesn't bounce
         ShellExecuteW(nullptr, L"open", it.launch.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
@@ -617,11 +635,44 @@ void Halo::PointerLeave() {
     }
 }
 
-// The Windows key and the Start logo: Command Palette over a revealed dock.
-// Not the real Start, which brings the hidden taskbar back with it.
+// The Windows key and the Start logo: Command Palette over a revealed dock,
+// with the Launcher panel above it. Not the real Start, which brings the hidden
+// taskbar back with it. A second tap closes both (the palette toggles itself).
 void Halo::OpenLauncher() {
     Reveal();
+    if (m_launcher) {
+        if (m_launcher->IsOpen()) m_launcher->Hide();
+        else m_launcher->Show(LauncherAnchorNow());
+    }
     halo::winkey::OpenPalette();
+}
+
+// Above the dock's pill, ten logical px clear of it, centered on it.
+halo::LauncherAnchor Halo::LauncherAnchorNow() const {
+    RECT pill = GetPillRectScreen();
+    return {(pill.left + pill.right) / 2, pill.top - m_scale.px(10), m_dock ? m_dock->RestWidth() : 0.0f, m_scale.v, m_monitor};
+}
+
+// How the launcher names an app: its pin if it has one, else its Start entry, else its exe.
+std::wstring Halo::LaunchTarget(RunningApp const& app) const {
+    for (auto const& pin : m_apps)
+        if ((!pin.aumid.empty() && !_wcsicmp(pin.aumid.c_str(), app.aumid.c_str())) ||
+            (!pin.targetPath.empty() && !_wcsicmp(pin.targetPath.c_str(), app.exe.c_str())))
+            return pin.linkPath;
+    return app.aumid.empty() ? app.exe : L"shell:AppsFolder\\" + app.aumid;
+}
+
+// A recent app clicked in the panel: like a dock icon, it comes to the front if it is running, else starts.
+void Halo::LaunchRecent(std::wstring const& target) {
+    for (auto const& app : m_tracker->Apps()) {
+        if (_wcsicmp(LaunchTarget(app).c_str(), target.c_str())) continue;
+        if (HWND w = m_tracker->Front(app.key)) {
+            if (IsIconic(w)) SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
+            SetForegroundWindow(w);
+            return;
+        }
+    }
+    ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 // Takes input over the whole dock at once and springs it up from wherever it is.
@@ -641,6 +692,7 @@ void Halo::Reveal() {
 
 void Halo::StartHide() {
     if (m_state != State::Shown) return;
+    if (m_launcher && m_launcher->IsOpen()) return;  // the panel is up; its close brings the hide back
     m_state = State::Hiding;
     if (m_label) m_label->Hide();
     if (m_dock) m_dock->OnPointerLeave();  // magnification relaxes as the dock drops
@@ -703,6 +755,10 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     if (m == m_genieMsg && m) return DockIconForWindow(reinterpret_cast<HWND>(w), l);
     if (m == halo::winkey::Message()) { OpenLauncher(); return 0; }  // Win tapped alone
+    if (m == halo::winkey::EscapeMessage()) {                        // Esc, while the panel is up
+        if (m_launcher) m_launcher->Hide();
+        return 0;
+    }
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_MOUSEMOVE:
@@ -718,6 +774,13 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case kMsgTestMove: PointerMove(static_cast<float>(w), m_metrics.bottom - m_metrics.pillHeight / 2.0f); return 0;
         case kMsgTestLeave: PointerLeave(); return 0;
+        case kMsgTestLauncher:
+            if (m_launcher && !m_autoHide) {
+                if (w == 0 || w == 100) m_launcher->Show(LauncherAnchorNow(), w == 0);  // 100: as the Win key opens it, waiting on the palette
+                else if (w == 1) m_launcher->Hide();
+                else m_launcher->TestCommand(w);
+            }
+            return 0;
         case kMsgIntellihideChanged:
             if (w || l) {
                 if (!m_trackingMouse) StartHide();
