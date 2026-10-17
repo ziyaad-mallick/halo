@@ -12,14 +12,14 @@ WINLIBS=(-lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldw
 
 build_halo() {
   echo "== halo.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/icons.cpp src/apps.cpp \
+  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/icons.cpp src/apps.cpp src/winkey.cpp \
     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}"
 }
 
 build_guardian() {
   echo "== guardian.exe"
   "$CXX" "${COMMON[@]}" -mwindows src/guardian.cpp src/taskbar.cpp -o build/guardian.exe \
-    -lshell32 -luser32 -lole32
+    -lshell32 -luser32 -lole32 -ladvapi32
 }
 
 build_icons_test() {

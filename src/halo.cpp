@@ -31,6 +31,7 @@
 #include "dock.h"
 #include "effects.h"
 #include "icons.h"
+#include "winkey.h"
 
 // Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
 struct ICompositorDesktopInterop : IUnknown {
@@ -229,6 +230,7 @@ bool Halo::Create(HINSTANCE inst) {
     }
     if (!RegisterHotKey(m_hwnd, kHotkeyQuit, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_ESCAPE))
         Log(L"RegisterHotKey Ctrl+Win+Esc failed " + std::to_wstring(GetLastError()));
+    if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
 
     ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     return ok;
@@ -575,6 +577,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     if (m == m_genieMsg && m) return DockIconForWindow(reinterpret_cast<HWND>(w), l);
+    if (m == halo::winkey::Message()) { Reveal(); halo::winkey::OpenPalette(); return 0; }  // Win tapped alone
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_MOUSEMOVE:
@@ -634,6 +637,7 @@ int Halo::Run() {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    halo::winkey::Remove();
     UnregisterHotKey(m_hwnd, kHotkeyQuit);
     return static_cast<int>(msg.wParam);
 }

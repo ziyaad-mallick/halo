@@ -1,5 +1,7 @@
 // guardian.exe - no UI. Only this process hides Windows' taskbar, and it
-// guarantees the taskbar comes back whenever halo.exe goes away.
+// guarantees the taskbar comes back whenever halo.exe goes away. It is an
+// always-on switch: ON = halo running + taskbar hidden, OFF = halo gone +
+// taskbar restored. Win+Alt+T toggles; a second guardian.exe sends commands.
 #include <windows.h>
 #include <shellapi.h>
 
@@ -22,6 +24,10 @@ constexpr DWORD kHideAfterAliveMs = 3000;
 constexpr DWORD kCrashWindowMs = 120000;
 constexpr size_t kMaxCrashes = 3;
 constexpr UINT_PTR kRehideTimer = 1;
+constexpr DWORD kCloseWaitMs = 3000;  // how long halo gets to close itself before TerminateProcess
+constexpr int kHotkeyToggle = 1;      // Win+Alt+T
+enum Cmd : WPARAM { kCmdOn = 1, kCmdOff = 2, kCmdQuit = 3 };  // second instance -> first instance
+constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 class Handle {
 public:
@@ -96,10 +102,18 @@ public:
         g_self = this;
         SetConsoleCtrlHandler(&Guardian::CtrlHandler, TRUE);
 
+        cmdMsg_ = RegisterWindowMessageW(L"HaloGuardian.Command");
+        if (hwnd_ && !RegisterHotKey(hwnd_, kHotkeyToggle, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'T')) {
+            // On this Windows build something else owns Win+Alt+T (error 1409). A low-level hook sees the
+            // keys first and can swallow the T, so use that instead (runs only on keystrokes).
+            DWORD err = GetLastError();
+            hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &Guardian::KeyHook, GetModuleHandleW(nullptr), 0);
+            Log(L"RegisterHotKey Win+Alt+T failed (error %lu, taken); %ls", err,
+                hook_ ? L"using a low-level keyboard hook instead" : L"hook failed too: toggle unavailable, use guardian.exe / --off");
+        }
+
         Log(L"guardian started");
-        SafeHide();
-        hidden_ = true;
-        Launch();
+        TurnOn(L"startup");
 
         while (!quit_) {
             DWORD timeout = INFINITE;
@@ -135,15 +149,18 @@ public:
             }
         }
         Shutdown(L"loop exit");
+        if (hwnd_) UnregisterHotKey(hwnd_, kHotkeyToggle);
+        if (hook_) UnhookWindowsHookEx(hook_);
         return exitCode_;
     }
 
 private:
     static inline Guardian* g_self = nullptr;
     HWND hwnd_ = nullptr;
-    UINT taskbarCreated_ = 0;
+    HHOOK hook_ = nullptr;
+    UINT taskbarCreated_ = 0, cmdMsg_ = 0;
     Handle proc_;
-    bool hidden_ = false, pendingHide_ = false, relaunchPending_ = false, quit_ = false, down_ = false;
+    bool on_ = false, hidden_ = false, pendingHide_ = false, relaunchPending_ = false, quit_ = false, down_ = false;
     DWORD hideAt_ = 0, relaunchAt_ = 0;
     std::vector<DWORD> crashes_;
     int exitCode_ = 0;
@@ -189,10 +206,8 @@ private:
         pendingHide_ = false;
         if (down_) return;
         if (code == 0) {
-            Log(L"halo exited normally; restoring taskbar and exiting");
-            SafeRestore();
-            hidden_ = false;
-            quit_ = true;
+            Log(L"halo exited normally; going OFF (guardian stays alive)");
+            GoOff();
             return;
         }
         Log(L"halo died (exit code 0x%08lX); restoring taskbar", code);
@@ -206,19 +221,69 @@ private:
         crashes_.push_back(now);
         std::erase_if(crashes_, [now](DWORD t) { return now - t > kCrashWindowMs; });
         if (crashes_.size() >= kMaxCrashes) {
-            Log(L"%zu failures (%ls) within 2 minutes; giving up, taskbar restored", crashes_.size(), why);
-            SafeRestore();
-            hidden_ = false;
+            Log(L"%zu failures (%ls) within 2 minutes; giving up, going OFF (Win+Alt+T retries)", crashes_.size(),
+                why);
+            GoOff();
+            crashes_.clear();
             if (!noUi)
                 MessageBoxW(nullptr, L"Halo stopped after repeated crashes — Windows' taskbar restored",
                             L"Halo", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-            exitCode_ = 2;
-            quit_ = true;
             return;
         }
         relaunchPending_ = true;
         relaunchAt_ = now + kRelaunchDelayMs;
         Log(L"relaunching halo in %lu ms", kRelaunchDelayMs);
+    }
+
+    // OFF without a running halo: restore the taskbar, cancel anything pending.
+    void GoOff() {
+        on_ = false;
+        pendingHide_ = false;
+        relaunchPending_ = false;
+        SafeRestore();
+        hidden_ = false;
+    }
+
+    void TurnOn(const wchar_t* why) {
+        if (down_ || on_) return;
+        Log(L"ON (%ls): hiding taskbar, launching halo", why);
+        on_ = true;
+        crashes_.clear();
+        SafeHide();
+        hidden_ = true;
+        Launch();
+    }
+
+    // Ask halo to close (WM_CLOSE to its dock window), kill it after a timeout.
+    void CloseHalo() {
+        if (!proc_) return;
+        DWORD pid = GetProcessId(proc_.get());
+        EnumWindows(
+            [](HWND w, LPARAM l) -> BOOL {
+                wchar_t cls[64] = {};
+                GetClassNameW(w, cls, 63);
+                DWORD p = 0;
+                GetWindowThreadProcessId(w, &p);
+                if (p == static_cast<DWORD>(l) && wcscmp(cls, L"HaloDockWindow") == 0)
+                    PostMessageW(w, WM_CLOSE, 0, 0);
+                return TRUE;
+            },
+            static_cast<LPARAM>(pid));
+        if (WaitForSingleObject(proc_.get(), kCloseWaitMs) != WAIT_OBJECT_0) {
+            Log(L"halo ignored WM_CLOSE for %lu ms; TerminateProcess", kCloseWaitMs);
+            TerminateProcess(proc_.get(), 0xDEAD);
+            WaitForSingleObject(proc_.get(), 2000);
+        } else {
+            Log(L"halo closed cleanly");
+        }
+        proc_.reset();
+    }
+
+    void TurnOff(const wchar_t* why) {
+        if (down_) return;
+        Log(L"OFF (%ls): closing halo, restoring taskbar", why);
+        CloseHalo();
+        GoOff();
     }
 
     // Terminate halo (if running) and restore the taskbar. Idempotent.
@@ -234,6 +299,29 @@ private:
         SafeRestore();
         hidden_ = false;
         Log(L"taskbar restored; guardian exiting");
+    }
+
+    // Fallback for Win+Alt+T when RegisterHotKey is refused: swallow the T and post WM_HOTKEY.
+    static LRESULT CALLBACK KeyHook(int code, WPARAM w, LPARAM l) {
+        static bool win = false, alt = false, swallowed = false;
+        if (code == HC_ACTION && g_self) {
+            auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(l);
+            const bool down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
+            if (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN) win = down;
+            else if (k->vkCode == VK_LMENU || k->vkCode == VK_RMENU || k->vkCode == VK_MENU) alt = down;
+            else if (k->vkCode == 'T') {
+                if (down && win && alt) {
+                    if (!swallowed) PostMessageW(g_self->hwnd_, WM_HOTKEY, kHotkeyToggle, 0);
+                    swallowed = true;
+                    return 1;
+                }
+                if (!down && swallowed) {
+                    swallowed = false;
+                    return 1;
+                }
+            }
+        }
+        return CallNextHookEx(nullptr, code, w, l);
     }
 
     static BOOL WINAPI CtrlHandler(DWORD) {
@@ -262,7 +350,24 @@ private:
             }
             return 0;
         }
+        if (cmdMsg_ != 0 && m == cmdMsg_) {
+            if (w == kCmdOn) {
+                TurnOn(L"second instance");
+            } else if (w == kCmdOff) {
+                TurnOff(L"second instance");
+            } else if (w == kCmdQuit) {
+                TurnOff(L"--quit");
+                quit_ = true;
+            }
+            return 1;
+        }
         switch (m) {
+            case WM_HOTKEY:
+                if (w == kHotkeyToggle) {
+                    Log(L"Win+Alt+T pressed (state %ls)", on_ ? L"ON" : L"OFF");
+                    if (on_) TurnOff(L"hotkey"); else TurnOn(L"hotkey");
+                }
+                return 0;
             case WM_TIMER:
                 if (w == kRehideTimer) {
                     KillTimer(h, kRehideTimer);
@@ -293,25 +398,79 @@ bool HasFlag(int argc, wchar_t** argv, const wchar_t* flag) {
     return false;
 }
 
+// --autostart on|off: HKCU Run value "Halo" -> this guardian.exe.
+int Autostart(const wchar_t* arg) {
+    if (arg && _wcsicmp(arg, L"on") == 0) {
+        wchar_t buf[MAX_PATH * 2] = {};
+        DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH * 2);
+        std::wstring v = L"\"" + std::wstring(buf, n) + L"\"";
+        LSTATUS r = RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, L"Halo", REG_SZ, v.c_str(),
+                                    static_cast<DWORD>((v.size() + 1) * sizeof(wchar_t)));
+        Log(L"--autostart on: %ls (status %ld)", v.c_str(), r);
+        return r == ERROR_SUCCESS ? 0 : 1;
+    }
+    if (arg && _wcsicmp(arg, L"off") == 0) {
+        LSTATUS r = RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, L"Halo");
+        Log(L"--autostart off (status %ld)", r);
+        return (r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND) ? 0 : 1;
+    }
+    Log(L"--autostart needs on|off");
+    return 2;
+}
+
+// Hand a command to the running guardian. False if its window does not answer.
+bool SendCommand(WPARAM cmd) {
+    UINT msg = RegisterWindowMessageW(L"HaloGuardian.Command");
+    for (int i = 0; i < 20; ++i) {  // the first instance may still be creating its window
+        if (HWND w = FindWindowW(kWndClass, nullptr)) {
+            DWORD_PTR res = 0;
+            return SendMessageTimeoutW(w, msg, cmd, 0, SMTO_ABORTIFHUNG, 10000, &res) != 0;
+        }
+        Sleep(100);
+    }
+    return false;
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     const bool restore = argv && HasFlag(argc, argv, L"--restore");
+    const bool off = argv && HasFlag(argc, argv, L"--off");
+    const bool quit = argv && HasFlag(argc, argv, L"--quit");
     const bool noUi = argv && HasFlag(argc, argv, L"--no-ui");
-    if (argv) LocalFree(argv);
-
-    if (restore) {
-        Log(L"--restore: restoring native taskbar");
-        SafeRestore();
-        return 0;
+    int autostart = -1;
+    if (argv) {
+        for (int i = 1; i < argc; ++i)
+            if (_wcsicmp(argv[i], L"--autostart") == 0) {
+                autostart = Autostart(i + 1 < argc ? argv[i + 1] : nullptr);
+                break;
+            }
+        LocalFree(argv);
     }
+    if (autostart >= 0) return autostart;
 
     Handle mutex(CreateMutexW(nullptr, TRUE, kMutexName));
-    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
-        Log(L"another guardian is already running; exiting");
+    if (!mutex) {
+        Log(L"CreateMutex failed (%lu)", GetLastError());
         return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        const wchar_t* what = quit ? L"quit" : (off || restore) ? L"off" : L"on";
+        if (SendCommand(quit ? kCmdQuit : (off || restore) ? kCmdOff : kCmdOn)) {
+            Log(L"told the running guardian: %ls", what);
+            return 0;
+        }
+        Log(L"running guardian did not answer");
+        if (restore || off) SafeRestore();  // the emergency path must work even with a wedged guardian
+        return 1;
+    }
+    if (quit) return 0;
+    if (restore || off) {
+        Log(L"%ls: restoring native taskbar", restore ? L"--restore" : L"--off");
+        SafeRestore();
+        return 0;
     }
     try {
         Guardian g;
