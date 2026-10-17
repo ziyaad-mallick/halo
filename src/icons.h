@@ -10,6 +10,7 @@ struct PinnedApp {
     std::wstring name;        // display name (the .lnk file name without extension)
     std::wstring linkPath;    // full path to the .lnk
     std::wstring targetPath;  // resolved target (may be empty for shell items like Store apps)
+    std::wstring aumid;       // AppUserModelID if known (Store apps; .lnk with an explicit ID)
 };
 
 struct IconImage {
