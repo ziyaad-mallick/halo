@@ -57,6 +57,7 @@ build/guardian.exe --off      # OFF: taskbar back (also --restore; --quit exits)
 | `src/apps.cpp` | Window tracking, described below |
 | `src/icons.cpp` | Pins and icons, described below |
 | `src/winkey.cpp` | Win-key tap, described below |
+| `src/launcher.h/.cpp` | The Launcher panel above the dock, described below |
 | `src/taskbar.cpp` | Hides and restores `Shell_TrayWnd` (all monitors) |
 | `mods/halo-genie.wh.cpp` | Windhawk genie mod; `tools/install-genie.py [--include * --off --log]` installs it into portable Windhawk (`~/Windhawk`) |
 
@@ -80,6 +81,13 @@ build/guardian.exe --off      # OFF: taskbar back (also --restore; --quit exits)
 - Tapping Win alone reveals the dock and sends Win+Alt+Space, which opens PowerToys Command Palette.
 - It is an LL hook on its own thread. It swallows the Win release and re-injects VK 0xE8 down/up followed by Win up.
 - Its own injected input carries the marker `0x48414C4F` in dwExtraInfo.
+- While the Launcher panel is up (`WatchEscape(true)`) it also posts `EscapeMessage()` on each Esc press, without swallowing it.
+
+**`src/launcher.cpp`** (the Launcher panel)
+- A glass panel above the dock, opened with the Command Palette by the Win tap or the Start logo; a second tap closes both. A top-level window of its own (`HaloLauncherWindow`, no activation) on the dock's compositor, so Command Palette keeps the keyboard.
+- Recent apps: an MRU of launch targets in `%LOCALAPPDATA%\Halo\recent.txt`, fed by `WindowTracker::onForeground` and dock launches. Recent files: the newest non-folder `.lnk`s in FOLDERID_Recent. Bottom row: account picture from `C:\Users\Public\AccountPictures\<SID>`, display name, Settings, Power menu.
+- Dismissal: a foreground WinEvent hook that exists only while the panel is up (Command Palette seen, then anything else gets the foreground, or 800 ms pass without the palette), Esc, a second Win tap, or launching from the panel. The dock does not auto-hide while it is up.
+- Tests: `HALO_TEST=1` makes power actions log only (`HALO_TEST_POWER_DRYRUN=1` does too); `HALO_TEST_RECENT=<file>` swaps the MRU file; WM_APP+8 drives the panel (see `tools/launcher-shots.ps1`).
 
 **Geometry** (logical px, taken from Quiet Dock):
 - **Icons:** 28 at rest, magnified ×1.57 to 44 at the peak, with a cosine falloff over a 100 px radius.
