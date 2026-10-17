@@ -103,10 +103,14 @@ public:
         SetConsoleCtrlHandler(&Guardian::CtrlHandler, TRUE);
 
         cmdMsg_ = RegisterWindowMessageW(L"HaloGuardian.Command");
-        if (hwnd_ && !RegisterHotKey(hwnd_, kHotkeyToggle, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'T'))
-            Log(L"RegisterHotKey Win+Alt+T failed (error %lu): taken by another program; toggle unavailable, "
-                L"use guardian.exe / --off",
-                GetLastError());
+        if (hwnd_ && !RegisterHotKey(hwnd_, kHotkeyToggle, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'T')) {
+            // On this Windows build something else owns Win+Alt+T (error 1409). A low-level hook sees the
+            // keys first and can swallow the T, so use that instead (runs only on keystrokes).
+            DWORD err = GetLastError();
+            hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &Guardian::KeyHook, GetModuleHandleW(nullptr), 0);
+            Log(L"RegisterHotKey Win+Alt+T failed (error %lu, taken); %ls", err,
+                hook_ ? L"using a low-level keyboard hook instead" : L"hook failed too: toggle unavailable, use guardian.exe / --off");
+        }
 
         Log(L"guardian started");
         TurnOn(L"startup");
@@ -146,12 +150,14 @@ public:
         }
         Shutdown(L"loop exit");
         if (hwnd_) UnregisterHotKey(hwnd_, kHotkeyToggle);
+        if (hook_) UnhookWindowsHookEx(hook_);
         return exitCode_;
     }
 
 private:
     static inline Guardian* g_self = nullptr;
     HWND hwnd_ = nullptr;
+    HHOOK hook_ = nullptr;
     UINT taskbarCreated_ = 0, cmdMsg_ = 0;
     Handle proc_;
     bool on_ = false, hidden_ = false, pendingHide_ = false, relaunchPending_ = false, quit_ = false, down_ = false;
@@ -293,6 +299,29 @@ private:
         SafeRestore();
         hidden_ = false;
         Log(L"taskbar restored; guardian exiting");
+    }
+
+    // Fallback for Win+Alt+T when RegisterHotKey is refused: swallow the T and post WM_HOTKEY.
+    static LRESULT CALLBACK KeyHook(int code, WPARAM w, LPARAM l) {
+        static bool win = false, alt = false, swallowed = false;
+        if (code == HC_ACTION && g_self) {
+            auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(l);
+            const bool down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
+            if (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN) win = down;
+            else if (k->vkCode == VK_LMENU || k->vkCode == VK_RMENU || k->vkCode == VK_MENU) alt = down;
+            else if (k->vkCode == 'T') {
+                if (down && win && alt) {
+                    if (!swallowed) PostMessageW(g_self->hwnd_, WM_HOTKEY, kHotkeyToggle, 0);
+                    swallowed = true;
+                    return 1;
+                }
+                if (!down && swallowed) {
+                    swallowed = false;
+                    return 1;
+                }
+            }
+        }
+        return CallNextHookEx(nullptr, code, w, l);
     }
 
     static BOOL WINAPI CtrlHandler(DWORD) {

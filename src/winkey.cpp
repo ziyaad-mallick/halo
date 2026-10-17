@@ -25,12 +25,16 @@ LRESULT CALLBACK LowLevel(int code, WPARAM w, LPARAM l) {
         if (k->dwExtraInfo != kMine && (!(k->flags & LLKHF_INJECTED) || g_testMode)) {
             bool down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
             if (g_track.Feed(k->vkCode, down)) {
-                // Inject an unassigned key before the Win release goes through: no Start menu.
-                INPUT in[2] = {};
+                // Swallow this Win release and re-inject it right after an unassigned key, in one
+                // SendInput so the order is certain: the Start menu only opens on a Win release
+                // with nothing in between.
+                INPUT in[3] = {};
                 Key(in[0], kUnassigned, false);
                 Key(in[1], kUnassigned, true);
-                SendInput(2, in, sizeof(INPUT));
+                Key(in[2], static_cast<WORD>(k->vkCode), true);
+                SendInput(3, in, sizeof(INPUT));
                 PostMessageW(g_target, Message(), 0, 0);
+                return 1;
             }
         }
     }
