@@ -7,6 +7,7 @@
 // DWM recomputes the icons every frame, so a busy UI thread can't drop a
 // dock frame. Icon brushes sample 256px surfaces, so scaling stays sharp.
 
+#include <utility>
 #include <vector>
 
 #include <winrt/Windows.Foundation.Numerics.h>
@@ -50,6 +51,9 @@ public:
 
     // Index of the icon under x (parent coordinates) as currently drawn, or -1.
     int HitTest(float x, float y) const;
+
+    // Where icon i is centered with the dock at rest (no magnification), in the parent's coordinates.
+    std::pair<float, float> RestIconCenter(size_t i) const;
 
     // Width of the pill at rest and at full magnification, for sizing the window.
     float RestWidth() const;

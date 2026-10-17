@@ -24,6 +24,7 @@ public:
 
     std::vector<RunningApp> Apps() const;       // in the order the apps first appeared
     HWND Front(std::wstring const& key) const;  // the app's most recently active window, or null
+    std::wstring KeyOf(HWND hwnd) const;        // the app a tracked window belongs to, or empty
 
     void OnEvent(DWORD event, HWND hwnd);  // WinEvent callback target
 

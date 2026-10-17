@@ -101,6 +101,10 @@ float Dock::RestCenter(size_t i) const {
     return m_m.centerX - total / 2 + (static_cast<float>(i) + 0.5f) * pitch;
 }
 
+std::pair<float, float> Dock::RestIconCenter(size_t i) const {
+    return {RestCenter(i), m_m.bottom - m_m.pillHeight / 2};
+}
+
 float Dock::MagnificationAt(float pointerX, size_t i) const {
     float t = std::min(std::abs(pointerX - RestCenter(i)) / m_m.radius, 1.0f);
     float intensity = m_hovering ? 1.0f : 0.0f;
