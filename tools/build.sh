@@ -38,12 +38,19 @@ build_testwin() {
   "$CXX" "${COMMON[@]}" tools/testwin.cpp -o build/testwin.exe -lgdi32 -luser32
 }
 
+build_genie_selftest() {
+  echo "== genie_selftest.exe"
+  "$CXX" "${COMMON[@]}" tools/genie_selftest.cpp src/genie.cpp -o build/genie_selftest.exe \
+    -lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldwmapi -lgdi32 -luser32
+}
+
 case "${1:-halo}" in
   halo) build_halo ;;
   guardian) build_guardian ;;
   icons_test) build_icons_test ;;
   framecap) build_framecap ;;
   testwin) build_testwin ;;
+  genie_selftest) build_genie_selftest ;;
   all) build_halo; build_guardian; build_icons_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac
