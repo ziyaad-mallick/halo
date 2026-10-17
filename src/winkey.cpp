@@ -12,6 +12,7 @@ DWORD g_threadId = 0;
 HWND g_target = nullptr;
 bool g_testMode = false;  // HALO_TEST_WINKEY=1: also handle injected input (tests drive it with SendInput)
 Tracker g_track;
+bool g_swallowA = false;  // Win+A went down and we swallowed it; swallow its repeats and release too
 
 void Key(INPUT& in, WORD vk, bool up) {
     in.type = INPUT_KEYBOARD;
@@ -26,6 +27,23 @@ LRESULT CALLBACK LowLevel(int code, WPARAM w, LPARAM l) {
         auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(l);
         if (k->dwExtraInfo != kMine && (!(k->flags & LLKHF_INJECTED) || g_testMode)) {
             bool down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
+            // Win+A belongs to Halo's Control Center while the hook runs (RegisterHotKey can't take it
+            // from the shell). Feed() first so the Win release no longer counts as a lone tap, then cancel
+            // the Start menu with an unassigned key exactly like a tap does.
+            if (k->vkCode == 'A' && (g_swallowA || (down && g_track.winDown))) {
+                if (down && !g_swallowA) {
+                    g_swallowA = true;
+                    g_track.Feed(k->vkCode, true);
+                    INPUT in[2] = {};
+                    Key(in[0], kUnassigned, false);
+                    Key(in[1], kUnassigned, true);
+                    SendInput(2, in, sizeof(INPUT));
+                    PostMessageW(g_target, ControlCenterMessage(), 0, 0);
+                } else if (!down) {
+                    g_swallowA = false;
+                }
+                return 1;
+            }
             if (g_track.Feed(k->vkCode, down)) {
                 // Swallow this Win release and re-inject it right after an unassigned key, in one
                 // SendInput so the order is certain: the Start menu only opens on a Win release
@@ -47,6 +65,11 @@ LRESULT CALLBACK LowLevel(int code, WPARAM w, LPARAM l) {
 
 UINT Message() {
     static UINT m = RegisterWindowMessageW(L"Halo.WinKeyTap");
+    return m;
+}
+
+UINT ControlCenterMessage() {
+    static UINT m = RegisterWindowMessageW(L"Halo.WinA");
     return m;
 }
 

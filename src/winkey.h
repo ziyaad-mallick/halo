@@ -11,6 +11,7 @@ bool Install(HWND target);
 void Remove();
 
 UINT Message();               // registered window message posted to `target`
+UINT ControlCenterMessage();  // posted to `target` when Win+A is pressed (the keystroke is swallowed)
 void OpenPalette();           // sends Win+Alt+Space; call when Message() arrives
 
 // The decision logic, separate from the hook so it can be unit tested.
