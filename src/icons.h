@@ -12,7 +12,6 @@ struct PinnedApp {
                               // (both work with LoadJumboIcon and ShellExecute)
     std::wstring aumid;       // AppUserModelID; empty if the shortcut has none
     std::wstring targetPath;  // resolved target (may be empty for shell items like Store apps)
-    std::wstring aumid;       // AppUserModelID when known (may be empty)
 };
 
 struct IconImage {

@@ -103,6 +103,12 @@ bool Identify(HWND hwnd, RunningApp& app) {
         app.exe = ExeOf(real);
         if (app.aumid.empty()) app.aumid = AumidOfProcess(real);
     }
+    // File Explorer windows carry no ID; the pin knows it by this one.
+    constexpr wchar_t kExplorer[] = L"\\explorer.exe";
+    constexpr size_t kExplorerLen = ARRAYSIZE(kExplorer) - 1;
+    if (app.aumid.empty() && app.exe.size() >= kExplorerLen &&
+        !_wcsicmp(app.exe.c_str() + app.exe.size() - kExplorerLen, kExplorer))
+        app.aumid = L"Microsoft.Windows.Explorer";
     app.key = app.aumid.empty() ? Lower(app.exe) : app.aumid;
     return !app.key.empty();
 }

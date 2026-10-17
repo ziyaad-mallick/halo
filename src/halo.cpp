@@ -366,7 +366,10 @@ void Halo::RefreshDock() {
     size_t divider = items.size();
     for (size_t i = 0; i < running.size(); i++) {
         if (pinned[i] || running[i].exe.empty()) continue;
-        auto brush = IconBrushFor(running[i].exe);
+        // Packaged apps' exes often carry no icon; their Start entry has the logo.
+        wuc::CompositionBrush brush{nullptr};
+        if (!running[i].aumid.empty()) brush = IconBrushFor(L"shell:AppsFolder\\" + running[i].aumid);
+        if (!brush) brush = IconBrushFor(running[i].exe);
         if (!brush) continue;
         items.push_back({brush, true});
         m_items.push_back({{}, running[i].key});
@@ -397,7 +400,8 @@ void Halo::Layout(size_t icons) {
 // macOS: a running app comes to the front (its most recent window,
 // restored if minimized); one that isn't running is launched.
 void Halo::Activate(size_t item) {
-    Item const& it = m_items[item];    if (HWND w = it.key.empty() ? nullptr : m_tracker->Front(it.key)) {
+    Item const& it = m_items[item];
+    if (HWND w = it.key.empty() ? nullptr : m_tracker->Front(it.key)) {
         if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
         SetForegroundWindow(w);
     } else if (!it.launch.empty()) {
