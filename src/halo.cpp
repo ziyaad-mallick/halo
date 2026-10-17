@@ -29,6 +29,7 @@
 #include <vector>
 #include "apps.h"
 #include "cluster.h"
+#include "control_center.h"
 #include "dock.h"
 #include "effects.h"
 #include "icons.h"
@@ -79,6 +80,7 @@ constexpr UINT kMsgIntellihideChanged = WM_APP + 5;  // wParam = overlap, lParam
 constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 // Test hook (HALO_TEST=1): wParam 0 = open the launcher panel without Command Palette, 1 = close it, else Launcher::TestCommand.
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
+constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
 constexpr UINT kGenieHoldMs = 700;  // dock stays up for the 400 ms genie + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
@@ -168,6 +170,7 @@ private:
     std::unique_ptr<halo::Launcher> m_launcher;
     std::unique_ptr<halo::IntellihideDetector> m_intellihide;
     std::unique_ptr<halo::MultiMonitorFollower> m_multimon;
+    std::unique_ptr<halo::ControlCenter> m_cc;
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
     bool m_pressedStart = false;  // the button went down on the Start logo
@@ -281,7 +284,9 @@ bool Halo::Create(HINSTANCE inst) {
     }
     if (!RegisterHotKey(m_hwnd, kHotkeyQuit, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_ESCAPE))
         Log(L"RegisterHotKey Ctrl+Win+Esc failed " + std::to_wstring(GetLastError()));
-    if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
+    Step(L"control center", [&] { m_cc = std::make_unique<halo::ControlCenter>(inst, m_hwnd, m_comp, m_gdev); });
+    if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
+    else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
 
     ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     return ok;
@@ -759,6 +764,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         if (m_launcher) m_launcher->Hide();
         return 0;
     }
+    if (m == halo::winkey::ControlCenterMessage()) { if (m_cc) m_cc->Toggle(); return 0; }  // Win+A
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_MOUSEMOVE:
@@ -781,6 +787,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 else m_launcher->TestCommand(w);
             }
             return 0;
+        case kMsgTestControlCenter: if (m_cc && _wgetenv(L"HALO_TEST")) m_cc->Toggle(); return 0;
         case kMsgIntellihideChanged:
             if (w || l) {
                 if (!m_trackingMouse) StartHide();
@@ -793,6 +800,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_DISPLAYCHANGE:
             if (m_multimon) m_multimon->OnDisplayChange();
+            if (m_cc) m_cc->OnDisplayChange();
             return 0;
         case WM_TIMER:
             if (w == kHideTimer) {
@@ -843,7 +851,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
             return 0;
-        case WM_CLOSE: KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
+        case WM_CLOSE: m_cc.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);
