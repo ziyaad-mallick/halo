@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|framecap|all]
+# Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|framecap|testwin|all]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CXX="${HALO_CXX:-/c/Users/testi/Windhawk/Compiler/bin/clang++.exe}"
@@ -33,11 +33,17 @@ build_framecap() {
   "$CXX" "${COMMON[@]}" tools/framecap.cpp -o build/framecap.exe -ld3d11 -ldxgi -luser32
 }
 
+build_testwin() {
+  echo "== testwin.exe"
+  "$CXX" "${COMMON[@]}" tools/testwin.cpp -o build/testwin.exe -lgdi32 -luser32
+}
+
 case "${1:-halo}" in
   halo) build_halo ;;
   guardian) build_guardian ;;
   icons_test) build_icons_test ;;
   framecap) build_framecap ;;
+  testwin) build_testwin ;;
   all) build_halo; build_guardian; build_icons_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac

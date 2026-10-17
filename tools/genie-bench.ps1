@@ -1,4 +1,4 @@
-# Measures the genie animations on a window this script starts (charmap.exe), the same way for
+# Measures the genie animations on a window this script starts (testwin.exe), the same way for
 # any version of the mod: it sends WM_SYSCOMMAND to the window (so the mod's hook runs inside the
 # app, as for a real click) while build\framecap.exe records, with desktop duplication, when DWM
 # really presented each changed desktop frame. Per animation it reports:
@@ -59,11 +59,11 @@ if ($fg.ToString() -match 'Lock Screen') { 'SKIPPED: the PC is locked'; return }
 function Pct($sorted, $p) { if ($sorted.Count -eq 0) { return 0 }; $sorted[[Math]::Min($sorted.Count - 1, [int][Math]::Floor($p * $sorted.Count))] }
 
 $halo = if ($HaloPid) { Get-Process -Id $HaloPid } else { Get-Process halo -ErrorAction Stop | Select-Object -First 1 }
-$app = Start-Process charmap.exe -PassThru
+$app = Start-Process (Join-Path $PSScriptRoot "..\build\testwin.exe") -PassThru
 try {
     $h = [IntPtr]::Zero
     for ($i = 0; $i -lt 50 -and $h -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 100; $app.Refresh(); $h = [Gb]::MainWindow([uint32]$app.Id) }
-    if ($h -eq [IntPtr]::Zero) { throw 'charmap window not found' }
+    if ($h -eq [IntPtr]::Zero) { throw 'testwin window not found' }
     Start-Sleep -Seconds 3   # let Halo's tracker list it
     $lines = New-Object System.Collections.ArrayList
     $periodMs = 16.67

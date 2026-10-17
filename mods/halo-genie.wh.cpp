@@ -118,6 +118,7 @@ IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 #include <d2d1.h>
 #include <uiautomation.h>
 #include <math.h>
+#include <stdarg.h>
 #include <atomic>
 #include <algorithm>
 #include <memory>
@@ -141,6 +142,17 @@ constexpr int kGenieMs = 400;  // the CPU fallback's genie (Halo's GPU genie las
 constexpr int kZoomMs = 280;
 constexpr int kTiles = 32;     // genie mesh resolution
 constexpr float kPi = 3.14159265f;
+
+// Wh_Log, and OutputDebugString so tools/dbwin.ps1 can read it without the Windhawk UI.
+static void Dbg(const wchar_t* fmt, ...) {
+    wchar_t buf[300];
+    va_list args;
+    va_start(args, fmt);
+    vswprintf(buf, 300, fmt, args);
+    va_end(args);
+    Wh_Log(L"%s", buf);
+    OutputDebugStringW((std::wstring(L"[genie] ") + buf + L"\n").c_str());
+}
 
 enum Kind { Minimize, Restore, Maximize, Unmaximize };
 struct Geometry { float x, y, width, height; };
@@ -340,7 +352,7 @@ static std::shared_ptr<Snap> Capture(HWND hwnd, RECT* ext) {
         GdiFlush();
         QueryPerformanceCounter(&t1);
         QueryPerformanceFrequency(&qf);
-        Wh_Log(L"capture %dx%d PrintWindow %.1f ms", rawW, rawH, (t1.QuadPart - t0.QuadPart) * 1000.0 / qf.QuadPart);
+        Dbg(L"capture %dx%d PrintWindow %.1f ms", rawW, rawH, (t1.QuadPart - t0.QuadPart) * 1000.0 / qf.QuadPart);
         SelectObject(dc, old);
         DWORD *src = (DWORD*)raw, *dst = (DWORD*)s->bits;
         int dx = ext->left - win.left, dy = ext->top - win.top;
@@ -596,7 +608,7 @@ static DWORD WINAPI Worker(LPVOID param) {
             SwitchToThread();
         }
     }
-    Wh_Log(L"genie kind=%d frames=%d avg=%.2fms max=%.2fms dur=%dms canvas=%dx%d", (int)a->kind, frames,
+    Dbg(L"genie kind=%d frames=%d avg=%.2fms max=%.2fms dur=%dms canvas=%dx%d", (int)a->kind, frames,
            frames > 1 ? sumGap / (frames - 1) : 0.0, maxGap, (int)durMs, vW, vH);
 
     if (timer) CloseHandle(timer);
@@ -772,7 +784,7 @@ static bool HaloStart(const std::shared_ptr<Anim>& a) {
     if (!ok && a->done) { CloseHandle(a->done); a->done = nullptr; }
     LARGE_INTEGER t2;
     QueryPerformanceCounter(&t2);
-    Wh_Log(L"handoff kind=%d ok=%d snapshot copy %.1f ms, wait for Halo's first frame %.1f ms", (int)a->kind, (int)ok,
+    Dbg(L"handoff kind=%d ok=%d snapshot copy %.1f ms, wait for Halo's first frame %.1f ms", (int)a->kind, (int)ok,
            Ms(t0, t1), Ms(t1, t2));
     return ok;
 }
@@ -848,7 +860,7 @@ static auto Run(HWND h, Kind kind, F real) -> decltype(real()) {
         RECT fin;
         if (IsZoomed(h) == wasZoomed) PostMessageW(a->halo, g_haloOpMsg, kOpCancel, (LPARAM)a->id);  // nothing changed
         else if (ExtFrame(h, &fin))
-            Wh_Log(L"zoom kind=%d target estimate %ld,%ld,%ld,%ld final %ld,%ld,%ld,%ld", (int)kind, a->toEst.left, a->toEst.top,
+            Dbg(L"zoom kind=%d target estimate %ld,%ld,%ld,%ld final %ld,%ld,%ld,%ld", (int)kind, a->toEst.left, a->toEst.top,
                    a->toEst.right, a->toEst.bottom, fin.left, fin.top, fin.right, fin.bottom);
         Finish(a);
         return r;

@@ -154,6 +154,7 @@ private:
 
 bool Halo::Create(HINSTANCE inst) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    Log(L"built " __DATE__ " " __TIME__);
     m_autoHide = !_wgetenv(L"HALO_TEST");
 
     WNDCLASSEXW wc{sizeof(wc)};
