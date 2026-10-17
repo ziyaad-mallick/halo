@@ -4,6 +4,7 @@
 #pragma once
 #include <windows.h>
 #include <winrt/Windows.UI.Composition.h>
+#include <functional>
 #include <memory>
 
 namespace halo {
@@ -18,6 +19,9 @@ public:
     void Close();
     bool IsOpen() const;
     void OnDisplayChange();  // re-places the hot zone
+    RECT PanelRectScreen() const;  // screen px; empty while the panel is not shown
+    // Called with true when the panel is shown or changes size, false when it starts closing.
+    void SetVisibilityCallback(std::function<void(bool)> fn);
 
 private:
     struct Impl;

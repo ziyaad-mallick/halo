@@ -112,6 +112,7 @@ struct ControlCenter::Impl {
     std::vector<Item> items;
     Id drag = Id::None;
     ULONGLONG lastBrightSet = 0;
+    std::function<void(bool)> onVisibility;
 
     // ---- hot zone ----
     bool hotTracking = false;
@@ -305,6 +306,7 @@ void ControlCenter::Impl::Open() {
         ShowWindow(hwnd, SW_SHOW);
         Focus();
         Animate(true);
+        if (onVisibility) onVisibility(true);
         // Async sources fill in as they arrive.
         radios.Start(hwnd, kMsgRadios);
         media.Start(hwnd, kMsgMedia, [this] { if (st == St::Open) Render(); });
@@ -329,6 +331,7 @@ void ControlCenter::Impl::Focus() {
 void ControlCenter::Impl::Close() {
     if (st != St::Open) return;
     st = St::Closing;
+    if (onVisibility) onVisibility(false);
     // Nothing listens while the panel is hidden.
     speaker.Unbind();
     mic.Unbind();
@@ -542,6 +545,7 @@ void ControlCenter::Impl::ApplySize() {
     clip.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     rim.Size({wPx - s, hPx - s});
     surf.as<ICompositionDrawingSurfaceInterop>()->Resize({wPx, hPx});
+    if (onVisibility && st == St::Open) onVisibility(true);
 }
 
 void ControlCenter::Impl::Render() {
@@ -818,5 +822,11 @@ void ControlCenter::Open() { m->Open(); }
 void ControlCenter::Close() { m->Close(); }
 bool ControlCenter::IsOpen() const { return m->st == Impl::St::Open; }
 void ControlCenter::OnDisplayChange() { m->PlaceHotZone(); }
+RECT ControlCenter::PanelRectScreen() const {
+    RECT r{};
+    if (m->hwnd && m->st == Impl::St::Open) GetWindowRect(m->hwnd, &r);
+    return r;
+}
+void ControlCenter::SetVisibilityCallback(std::function<void(bool)> fn) { m->onVisibility = std::move(fn); }
 
 }  // namespace halo
