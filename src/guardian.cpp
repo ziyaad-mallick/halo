@@ -88,8 +88,10 @@ public:
         wc.lpszClassName = kWndClass;
         RegisterClassW(&wc);
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
-        hwnd_ = CreateWindowExW(0, kWndClass, L"HaloGuardian", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
-                                wc.hInstance, this);
+        // A hidden top-level window, not HWND_MESSAGE: message-only windows never
+        // receive broadcasts (TaskbarCreated, WM_QUERYENDSESSION/WM_ENDSESSION).
+        hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW, kWndClass, L"HaloGuardian", WS_POPUP, 0, 0, 0, 0, nullptr,
+                                nullptr, wc.hInstance, this);
         if (!hwnd_) Log(L"CreateWindowEx failed (%lu); continuing without message window", GetLastError());
         g_self = this;
         SetConsoleCtrlHandler(&Guardian::CtrlHandler, TRUE);
