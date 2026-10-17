@@ -94,11 +94,36 @@ int wmain(int argc, wchar_t** argv) {
     IDXGIAdapter* ad = nullptr;
     dxgi->GetAdapter(&ad);
     IDXGIOutput* out = nullptr;
-    ad->EnumOutputs(0, &out);
     IDXGIOutput1* out1 = nullptr;
-    out->QueryInterface(__uuidof(IDXGIOutput1), (void**)&out1);
     IDXGIOutputDuplication* dup = nullptr;
-    if (FAILED(out1->DuplicateOutput(dev, &dup))) return 4;
+    // Desktop duplication is per output; with more than one monitor the first output can
+    // be a screen that doesn't change. Probe them all; the first that shows a frame wins.
+    for (UINT i = 0; !out1; i++) {
+        IDXGIOutput* cand = nullptr;
+        if (FAILED(ad->EnumOutputs(i, &cand))) break;
+        IDXGIOutput1* c1 = nullptr;
+        if (SUCCEEDED(cand->QueryInterface(__uuidof(IDXGIOutput1), (void**)&c1))) {
+            IDXGIOutputDuplication* cd = nullptr;
+            if (SUCCEEDED(c1->DuplicateOutput(dev, &cd))) {
+                DXGI_OUTDUPL_FRAME_INFO probe;
+                IDXGIResource* probeRes = nullptr;
+                HRESULT hr = cd->AcquireNextFrame(900, &probe, &probeRes);
+                if (probeRes) probeRes->Release();
+                if (hr == S_OK) {
+                    cd->ReleaseFrame();
+                    out = cand;
+                    out1 = c1;
+                    dup = cd;
+                    fprintf(stderr, "using output %u\n", i);
+                    continue;
+                }
+                cd->Release();
+            }
+            c1->Release();
+        }
+        cand->Release();
+    }
+    if (!out1) { fwprintf(stderr, L"no output produced a frame in 0.9 s (locked screen? idle system?)\n"); return 4; }
     DXGI_OUTDUPL_DESC dd;
     dup->GetDesc(&dd);
     if (!cw) { cw = dd.ModeDesc.Width; ch = dd.ModeDesc.Height; }
