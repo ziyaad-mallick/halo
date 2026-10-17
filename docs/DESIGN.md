@@ -148,6 +148,27 @@ interop is more verbose.
 | **M5 polish** | Live previews, context menus, jump lists, drag-reorder, settings UI | |
 | **M6 ship** | Installer, code signing, update channel | |
 
+## Dock decisions (Ziyaad, 2026-10-17)
+
+Look: identical to Quiet Dock, the Windhawk dock it replaces. Logical px:
+rest icon 28, peak 44 (157%), cosine wave over 100 px, gap 10, padding 10;
+pill 50 tall, radius 20, floating 6 above the edge; glass = blur 40, tint
+#16161A at 50%, 2.5% grain, 1px vertical-gradient rim; running dot 4 px white
+at 70%. Icons are the stock Windows icons, never masked or restyled. No tray
+or clock pill on the dock (a menu bar may come later, separately).
+
+| Behaviour | Decision |
+|---|---|
+| Pins | Halo's own list, seeded once from the Windows taskbar pins; drag to reorder, drag off to remove, right-click > Keep in Dock |
+| Click on the frontmost app | Minimize it (the Windows habit); other clicks activate, macOS-style |
+| Launch | Icon bounces until the app's window appears (max 3) |
+| Right-click | Glass menu: the app's jump list items, its open windows, then Keep in Dock / Open at Login / Quit |
+| Left end | The Windows Start button |
+| Hiding | Intellihide: visible until a window overlaps the dock, spring reveal at the edge |
+| Monitors | One dock that follows the cursor to whichever screen's bottom edge it touches |
+| Extras | App name label on hover; Recent apps (last 3, after the divider). No badges, no Recycle Bin for now |
+| Minimize / restore / maximize | Genie swoop into and out of the app's dock icon: a fork of the MIT "MacOS Minimize Animation" Windhawk mod (`mods/halo-genie.wh.cpp`) that asks Halo where the icon is; maximize gets a matching swoop |
+
 ## Risks and open questions
 
 - **Blur behind a custom-shaped Win32 composition window.** The options are
