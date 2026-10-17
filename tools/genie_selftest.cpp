@@ -3,16 +3,20 @@
 // snapshot into the Local\HaloGenie.<id> file mapping, creates the .ready/.done events
 // with a null DACL (id = pid<<32|seq, the mod's format), then calls Genie::OnMessage(1, id)
 // and waits the way the mod waits. A minimize (kind 0) and a restore (kind 1) run in the
-// empty bottom-right corner of the primary monitor; the overlay is created beneath the
-// live halo.exe's dock in z order (SetWindowPos(m_overlay, m_dock, ...) in Genie::Start
-// puts it behind m_dock), so the real dock stays clickable and nothing here takes input.
+// empty bottom-right corner of the primary monitor, below the live halo.exe's dock in z.
 // Nothing is launched and nothing runs on a timer.
+//
+// Before the animations it draws two markers on the same region so a desktop-capture run
+// (tools/genie-shots.sh) can tell "the genie strips never rendered" apart from "the whole
+// overlay never rendered": a static red rect (400 ms) and a keyframe-animated blue square
+// (300 ms), both known-good composition recipes.
+//
 //   bash tools/build.sh genie_selftest
-//   build/genie_selftest.exe            # stdout: one PASS/FAIL line per animation
-// To record the DWM frames it presents, run framecap beside it first:
-//   build/framecap.exe 6000 build\selftest.csv build\selftest-shots <x> <y> <w> <h> 1
-// (crop region: the mirror of the rects below; the selftest logs each animation's window
-// and target rect so the framecap region can be read straight off its output).
+//   tools/genie-shots.sh 1440,620,440,560        # the region the markers + animation use
+// Or by hand:
+//   build/framecap.exe 6000 build\selftest.csv build\selftest-shots <x> <y> <w> <h> 1 &
+//   build/genie_selftest.exe
+// Expected on stdout: markers ok, then ready/done PASS lines per animation.
 #include <windows.h>
 #include <d2d1.h>
 #include <d2d1_1.h>
@@ -28,10 +32,14 @@
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Composition.Desktop.h>
 #include <stdio.h>
+#include <chrono>
 #include <string>
 #include <vector>
 #include "../src/genie.h"
 #include "../src/interop.h"
+#include <dwmapi.h>
+
+using namespace std::chrono_literals;
 
 // The interop helper the MinGW d2d1.h headers don't declare for C.
 extern "C" HRESULT WINAPI D2D1CreateDevice(IDXGIDevice*, D2D1_CREATION_PROPERTIES const*, ID2D1Device**);
@@ -65,6 +73,20 @@ void Fill(std::vector<uint8_t>& px, int w, int h, int stride) {
         }
 }
 
+void Pump(DWORD ms) {
+    DWORD start = GetTickCount();
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (GetTickCount() - start >= ms) return;
+        DWORD left = ms - (GetTickCount() - start);
+        if (left) Sleep(left < 4 ? left : 4);
+    }
+}
+
 // Waits for an event while pumping: the STA compositor and the scoped-batch Completed
 // callback only run while this thread pumps. True on WAIT_OBJECT_0 within ms.
 bool PumpedWait(HANDLE ev, DWORD ms) {
@@ -72,11 +94,7 @@ bool PumpedWait(HANDLE ev, DWORD ms) {
     for (;;) {
         if (WaitForSingleObject(ev, 15) == WAIT_OBJECT_0) return true;
         if (GetTickCount() - start >= ms) return false;
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        Pump(12);
     }
 }
 
@@ -94,25 +112,91 @@ void Log(wchar_t const* fmt, ...) {
 
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
 
-// One kind. Returns false on failure. Reads both rects: the animation always runs between
-// `anim` (the snapshot's place, 400x500) and a 44 px icon-sized box near it: minimize sweeps
-// the big rect into the icon; restore grows out of the icon (hdr.window = where it lands).
-bool Play(Genie& genie, wuc::Compositor const&, int kind, RECT anim, std::vector<uint8_t> const& px) {
+// Is DWM actually compositing right now? Counts composition frames over ~ms. When the
+// display is asleep (the owner away), animations and batches don't advance and every
+// timing below lies, so callers gate on this.
+int DwmFrames(DWORD ms) {
+    DWM_TIMING_INFO ti{sizeof(ti)}, prev{};
+    int frames = 0;
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < ms) {
+        if (DwmGetCompositionTimingInfo(nullptr, &ti) == 0 && ti.cFrame != prev.cFrame) frames++;
+        prev = ti;
+        Sleep(16);
+    }
+    return frames;
+}
+
+// Waits until DWM composes steadily (the display is awake). False: it never started.
+bool WaitForDwm(DWORD timeoutMs) {
+    DWORD start = GetTickCount();
+    for (;;) {
+        int f = DwmFrames(320);
+        if (f >= 8) return true;  // ~25 compositions/s
+        if (GetTickCount() - start > timeoutMs) {
+            Log(L"display appears idle (%d compositions / 320 ms) - timings would be meaningless", f);
+            return false;
+        }
+    }
+}
+
+// Shows a small composition surface over `rect` on its own topmost popup window, pumps for
+// `ms`, and closes it. `animate` adds a keyframe-animated square (the known-good recipe).
+void Marker(HINSTANCE inst, wuc::Compositor const& comp, RECT rect, bool animate, DWORD ms) {
+    static bool classname = [] {
+        WNDCLASSW wc{sizeof(wc)};
+        wc.lpfnWndProc = WndProc;
+        wc.lpszClassName = L"HaloSelftestMarker";
+        return RegisterClassW(&wc) != 0;
+    }();
+    (void)classname;
+    int w = rect.right - rect.left, h = rect.bottom - rect.top;
+    HWND wnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                               L"HaloSelftestMarker", L"", WS_POPUP, rect.left, rect.top, w, h, nullptr, nullptr, inst,
+                               nullptr);
+    wuc::Desktop::DesktopWindowTarget t{nullptr};
+    auto interop = comp.as<ICompositorDesktopInterop>();
+    winrt::check_hresult(interop->CreateDesktopWindowTarget(wnd, TRUE, winrt::put_abi(t)));
+    wuc::ContainerVisual root = comp.CreateContainerVisual();
+    root.RelativeSizeAdjustment({1, 1});
+    t.Root(root);
+    wuc::SpriteVisual bg = comp.CreateSpriteVisual();
+    bg.Size({(float)w * 0.8f, (float)h * 0.8f});
+    bg.Offset({(float)w * 0.1f, (float)h * 0.1f, 0});
+    bg.Brush(comp.CreateColorBrush({220, 40, 40, 255}));
+    root.Children().InsertAtTop(bg);
+    if (animate) {
+        wuc::SpriteVisual sq = comp.CreateSpriteVisual();
+        sq.Size({40, 40});
+        sq.Offset({10, 10, 0});
+        sq.Brush(comp.CreateColorBrush({80, 200, 255, 255}));
+        root.Children().InsertAtTop(sq);
+        auto kf = comp.CreateVector3KeyFrameAnimation();
+        kf.Duration(300ms);
+        kf.InsertKeyFrame(1.0f, {(float)w - 60, (float)h - 60, 0});
+        sq.StartAnimation(L"Offset", kf);
+    }
+    ShowWindow(wnd, SW_SHOWNOACTIVATE);
+    Pump(ms);
+    DestroyWindow(wnd);
+}
+
+// One handshake with the animation, exactly as the mod does it.
+bool Play(Genie& genie, int kind, RECT anim, std::vector<uint8_t> const& px) {
     wchar_t const* name = kind == 0 ? L"minimize" : L"restore";
     unsigned long long id = (unsigned long long)GetCurrentProcessId() << 32 | (unsigned)(kind + 1);
     RECT window = anim;
-    RECT target = {anim.left + (anim.right - anim.left) / 3, anim.bottom - kIcon, anim.left + (anim.right - anim.left) / 3 + kIcon, anim.bottom};
+    RECT target = {anim.left + (anim.right - anim.left) / 3, anim.bottom - kIcon,
+                   anim.left + (anim.right - anim.left) / 3 + kIcon, anim.bottom};
 
     SECURITY_DESCRIPTOR sd;
     InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
     SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);  // as HaloStart does
     SECURITY_ATTRIBUTES sa{sizeof(sa), &sd, FALSE};
 
-    std::wstring base = L"Local\\HaloGenie." + [&] {
-        wchar_t b[64];
-        swprintf(b, 64, L"%llx", id);
-        return std::wstring(b);
-    }();
+    wchar_t hex[32];
+    swprintf(hex, 32, L"%llx", id);
+    std::wstring base = L"Local\\HaloGenie." + std::wstring(hex);  // Equals Genie::Start's NameOf
     size_t bytes = sizeof(GenieHeader) + px.size();
     HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, (DWORD)(bytes >> 32), (DWORD)bytes,
                                         base.c_str());
@@ -146,7 +230,7 @@ bool Play(Genie& genie, wuc::Compositor const&, int kind, RECT anim, std::vector
         ULONGLONG readyMs = GetTickCount64() - t0;
         bool ended = PumpedWait(done, 2000);
         ULONGLONG doneMs = GetTickCount64() - t0;
-        bool good = ended && doneMs >= readyMs && doneMs - readyMs >= 350 && doneMs - readyMs < 1600;
+        bool good = ended && doneMs - readyMs >= 350 && doneMs - readyMs < 1600;
         Log(L"%ls: ready %.0f ms, done %.0f ms (%.0f ms animation) %ls", name, (double)readyMs, (double)doneMs,
             (double)(doneMs - readyMs), ended ? (good ? L"PASS" : L"UNEXPECTED TIMING") : L"FAILED: no .done");
         pass = pass && good;
@@ -203,19 +287,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     Genie genie(comp, gdev, hwnd);
     Log(L"genie constructed over class HaloSelftest");
 
-    std::vector<uint8_t> px;
-    Fill(px, kAnimW, kAnimH, kAnimW * 4);
-
-    // Keep the two animations inside the bottom-right corner: the live dock pill is
-    // centred, so this region is wallpaper only.
     RECT screen = ScreenRect();
     RECT anim = {screen.right - kAnimGap - kAnimW, screen.bottom - kAnimGap - kAnimH, screen.right - kAnimGap,
                  screen.bottom - kAnimGap};
 
+    // Markers first (recorded by framecap when tools/genie-shots.sh drives this): a big red
+    // rect proves the region and the composition pipeline, then a keyframe-animating blue
+    // square proves plain animations run here.
+    if (!WaitForDwm(8000)) return 3;  // display asleep: timing can't be trusted, rerun later
+    Log(L"marker static");
+    Marker(inst, comp, anim, false, 400);
+    Log(L"marker animated");
+    Marker(inst, comp, anim, true, 500);
+
+    std::vector<uint8_t> px;
+    Fill(px, kAnimW, kAnimH, kAnimW * 4);
+
     int failures = 0;
-    failures += Play(genie, comp, 0, anim, px) ? 0 : 1;   // minimize
+    failures += Play(genie, 0, anim, px) ? 0 : 1;
     Sleep(400);
-    failures += Play(genie, comp, 1, anim, px) ? 0 : 1;   // restore
+    failures += Play(genie, 1, anim, px) ? 0 : 1;
     Log(failures ? L"%d FAILURES" : L"both animations passed", failures);
     return failures ? 1 : 0;
 }
