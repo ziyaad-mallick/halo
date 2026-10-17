@@ -482,8 +482,9 @@ void Halo::Activate(size_t item) {
         if (IsIconic(w)) SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
         SetForegroundWindow(w);
     } else if (!it.launch.empty()) {
+        // Bounce first: ShellExecute can block this thread for a while, the animation runs without it.
+        if (it.key.empty()) m_dock->Bounce(static_cast<int>(item));  // an app that is up (no window yet) doesn't bounce
         ShellExecuteW(nullptr, L"open", it.launch.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        m_dock->Bounce(static_cast<int>(item));
     }
 }
 

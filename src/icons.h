@@ -27,5 +27,7 @@ std::vector<PinnedApp> LoadPinnedApps();
 
 // Largest available icon for a file, .lnk or shell:AppsFolder\<AUMID> item (256x256 "jumbo" via the shell
 // system image list SHIL_JUMBO, falling back to SHIL_EXTRALARGE 48x48).
+// Packaged apps (shell:AppsFolder) get the unplated Square44x44Logo the taskbar shows, read from
+// the package; if that fails, or taskbarLogo is false, the Start tile from the shell.
 // Returns false on failure.
-bool LoadJumboIcon(const std::wstring& path, IconImage& out);
+bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo = true);

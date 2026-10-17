@@ -8,6 +8,8 @@
 #include <commoncontrols.h>
 #include <shobjidl.h>
 #include <propsys.h>
+#include <appmodel.h>
+#include <wincodec.h>
 
 #include <cstddef>
 #include <cstring>
@@ -239,8 +241,145 @@ bool HBitmapToBgra(HBITMAP bmp, IconImage& out) {
     return true;
 }
 
+// The taskbar draws a packaged app from its Square44x44Logo, in the "unplated"
+// variant (no tile plate) that matches the system theme; the shell's image
+// factory returns the Start tile instead. Finds that file in the package.
+// The name is "<stem>.<qualifiers><ext>", qualifiers like targetsize-256,
+// altform-unplated or scale-200 joined by '_' or '.'; contrast and other
+// qualifiers are skipped. Higher tier wins, then the larger size.
+std::wstring BestLogoFile(const std::wstring& logo, bool light) {
+    const auto slash = logo.find_last_of(L"\\/");
+    const std::wstring dir = slash == std::wstring::npos ? L"" : logo.substr(0, slash + 1);
+    const std::wstring file = logo.substr(dir.size());
+    const auto dot = file.rfind(L'.');
+    const std::wstring stem = file.substr(0, dot), ext = file.substr(dot);
+    const std::wstring want = light ? L"lightunplated" : L"unplated";
+
+    std::wstring best;
+    int bestTier = -1, bestSize = 0;
+    WIN32_FIND_DATAW fd = {};
+    HANDLE find = FindFirstFileW((dir + stem + L".*" + ext).c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return logo;
+    do {
+        std::wstring q = fd.cFileName;
+        q = q.substr(stem.size() + 1, q.size() - stem.size() - 1 - ext.size());
+        std::wstring altform;
+        int target = 0, scale = 0;
+        bool other = false;
+        for (std::size_t pos = 0; pos < q.size();) {
+            std::size_t end = q.find_first_of(L"_.", pos);
+            if (end == std::wstring::npos) end = q.size();
+            const std::wstring t = q.substr(pos, end - pos);
+            pos = end + 1;
+            if (t.starts_with(L"targetsize-")) target = _wtoi(t.c_str() + 11);
+            else if (t.starts_with(L"scale-")) scale = _wtoi(t.c_str() + 6);
+            else if (t.starts_with(L"altform-")) altform = t.substr(8);
+            else other = true;
+        }
+        if (other) continue;
+        int tier, size;
+        if (altform == want && target) tier = 4, size = target;
+        else if (altform.empty() && scale) tier = 3, size = scale;
+        else if (altform.empty() && target) tier = 2, size = target;
+        else continue;
+        if (tier > bestTier || (tier == bestTier && size > bestSize)) {
+            best = dir + fd.cFileName, bestTier = tier, bestSize = size;
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return best.empty() ? logo : best;
+}
+
+// Value of attribute `name` in the tag text `tag`, or empty.
+std::wstring XmlAttr(const std::wstring& tag, const std::wstring& name) {
+    auto at = tag.find(L" " + name + L"=");
+    if (at == std::wstring::npos) return {};
+    at += name.size() + 2;
+    const auto end = tag.find(tag[at], at + 1);
+    return end == std::wstring::npos ? L"" : tag.substr(at + 1, end - at - 1);
+}
+
+// The Square44x44Logo of application `appId` in a package's AppxManifest.xml.
+std::wstring ManifestLogo(const std::wstring& pkgDir, const std::wstring& appId) {
+    HANDLE f = CreateFileW((pkgDir + L"\\AppxManifest.xml").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    Owned<HANDLE, &CloseHandle> file(f);
+    std::string utf8(GetFileSize(f, nullptr), '\0');
+    DWORD got = 0;
+    if (!ReadFile(f, utf8.data(), static_cast<DWORD>(utf8.size()), &got, nullptr)) return {};
+    std::wstring xml(utf8.size(), L'\0');
+    xml.resize(MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(got), xml.data(),
+                                   static_cast<int>(xml.size())));
+
+    for (std::size_t at = 0; (at = xml.find(L"<Application ", at)) != std::wstring::npos; at += 13) {
+        const std::wstring app = xml.substr(at, xml.find(L'>', at) - at);
+        if (_wcsicmp(XmlAttr(app, L"Id").c_str(), appId.c_str()) != 0) continue;
+        const std::size_t close = xml.find(L"</Application>", at);
+        const std::size_t ve = xml.find(L"VisualElements", at);
+        if (ve == std::wstring::npos || ve > close) return {};
+        return XmlAttr(xml.substr(ve, xml.find(L'>', ve) - ve), L"Square44x44Logo");
+    }
+    return {};
+}
+
+// Decodes an image file to premultiplied BGRA.
+bool DecodeImage(const std::wstring& path, IconImage& out) {
+    ComRef<IWICImagingFactory> factory;
+    ComRef<IWICBitmapDecoder> decoder;
+    ComRef<IWICBitmapFrameDecode> frame;
+    ComRef<IWICFormatConverter> conv;
+    UINT w = 0, h = 0;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
+                                reinterpret_cast<void**>(factory.put()))) ||
+        FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                  WICDecodeMetadataCacheOnDemand, decoder.put())) ||
+        FAILED(decoder->GetFrame(0, frame.put())) || FAILED(factory->CreateFormatConverter(conv.put())) ||
+        FAILED(conv->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                WICBitmapPaletteTypeCustom)) ||
+        FAILED(conv->GetSize(&w, &h)) || w == 0 || h == 0) {
+        return false;
+    }
+    std::vector<uint8_t> px(static_cast<std::size_t>(w) * h * 4);
+    if (FAILED(conv->CopyPixels(nullptr, w * 4, static_cast<UINT>(px.size()), px.data()))) return false;
+    out.width = w;
+    out.height = h;
+    out.bgra = std::move(px);
+    return true;
+}
+
+// What the taskbar shows for a packaged app, given its AUMID ("<family>!<app id>").
+bool LoadPackagedLogo(const std::wstring& aumid, IconImage& out) {
+    const auto bang = aumid.find(L'!');
+    if (bang == std::wstring::npos) return false;
+    const std::wstring family = aumid.substr(0, bang);
+    UINT32 count = 0, chars = 0;
+    FindPackagesByPackageFamily(family.c_str(), PACKAGE_FILTER_HEAD, &count, nullptr, &chars, nullptr, nullptr);
+    if (count == 0) return false;
+    std::vector<PWSTR> names(count);
+    std::vector<wchar_t> buf(chars);
+    if (FindPackagesByPackageFamily(family.c_str(), PACKAGE_FILTER_HEAD, &count, names.data(), &chars, buf.data(),
+                                    nullptr) != ERROR_SUCCESS || count == 0) {
+        return false;
+    }
+    UINT32 len = 0;
+    GetPackagePathByFullName(names[0], &len, nullptr);
+    std::wstring dir(len, L'\0');
+    if (len == 0 || GetPackagePathByFullName(names[0], &len, dir.data()) != ERROR_SUCCESS) return false;
+    dir.resize(wcslen(dir.c_str()));
+
+    const std::wstring logo = ManifestLogo(dir, aumid.substr(bang + 1));
+    if (logo.empty()) return false;
+    DWORD light = 0, size = sizeof light;  // the taskbar follows the system theme, not the apps'
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+    return DecodeImage(BestLogoFile(dir + L"\\" + logo, light != 0), out);
+}
+
 // 256px icon of a shell:AppsFolder\<AUMID> item (Store apps have no file for the image list).
-bool LoadAppsFolderIcon(const std::wstring& path, IconImage& out) {
+bool LoadAppsFolderIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
+    if (taskbarLogo && LoadPackagedLogo(path.substr(wcslen(kAppsFolder)), out)) return true;
+    out = {};
     ComRef<IShellItemImageFactory> factory;
     if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_IShellItemImageFactory,
                                            reinterpret_cast<void**>(factory.put())))) {
@@ -364,9 +503,9 @@ std::vector<PinnedApp> LoadPinnedApps() {
     return apps;
 }
 
-bool LoadJumboIcon(const std::wstring& path, IconImage& out) {
+bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
     out = {};
-    if (path.starts_with(kAppsFolder)) return LoadAppsFolderIcon(path, out);
+    if (path.starts_with(kAppsFolder)) return LoadAppsFolderIcon(path, out, taskbarLogo);
 
     SHFILEINFOW sfi = {};
     if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof sfi, SHGFI_SYSICONINDEX) == 0) {

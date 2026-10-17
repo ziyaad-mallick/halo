@@ -42,6 +42,10 @@ void Start(CompositionObject const& target, wchar_t const* property, Composition
     }
 }
 
+// A bounce eases out on the way up and in on the way down.
+CubicBezierEasingFunction BounceUp(Compositor const& c) { return c.CreateCubicBezierEasingFunction({0.3f, 0.5f}, {0.5f, 1.0f}); }
+CubicBezierEasingFunction BounceDown(Compositor const& c) { return c.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.7f, 0.5f}); }
+
 // Expression parameter name of icon j's property set.
 std::wstring Param(size_t j) { return L"s" + std::to_wstring(j); }
 
@@ -445,9 +449,8 @@ void Dock::Bounce(int index) {
         const float rest = IconY();
         auto a = m_compositor.CreateScalarKeyFrameAnimation();
         a.InsertKeyFrame(0.0f, rest);
-        a.InsertKeyFrame(0.5f, rest - m_m.restSize / 2,
-                         m_compositor.CreateCubicBezierEasingFunction({0.3f, 0.5f}, {0.5f, 1.0f}));
-        a.InsertKeyFrame(1.0f, rest, m_compositor.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.7f, 0.5f}));
+        a.InsertKeyFrame(0.5f, rest - m_m.restSize / 2, BounceUp(m_compositor));
+        a.InsertKeyFrame(1.0f, rest, BounceDown(m_compositor));
         a.Duration(std::chrono::milliseconds(kBounceMs));
         a.IterationCount(kBounces);
         Start(e.icon, L"Offset.Y", a, L"bounce");
@@ -455,12 +458,18 @@ void Dock::Bounce(int index) {
     }
 }
 
-// The app opened: let the icon come down from wherever the bounce has it.
+// The app opened: like macOS, finish the bounce it is in rather than cutting it short. The same
+// curves as Bounce for what is left of this cycle, from wherever the icon is now; then it rests.
 void Dock::Settle(Entry& e) {
     if (!Bouncing(e)) return;
+    const float elapsed =
+        std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - e.bounceStart).count();
+    const float phase = std::fmod(elapsed, static_cast<float>(kBounceMs)) / kBounceMs;
     e.bounceStart = {};
     auto a = m_compositor.CreateScalarKeyFrameAnimation();
-    a.InsertKeyFrame(1.0f, IconY(), m_easeOut);
-    a.Duration(std::chrono::milliseconds(120));
+    if (phase < 0.5f)  // still rising: on up to the top first
+        a.InsertKeyFrame((0.5f - phase) / (1 - phase), IconY() - m_m.restSize / 2, BounceUp(m_compositor));
+    a.InsertKeyFrame(1.0f, IconY(), BounceDown(m_compositor));
+    a.Duration(std::chrono::milliseconds(std::max(1, static_cast<int>((1 - phase) * kBounceMs))));
     Start(e.icon, L"Offset.Y", a, L"settle");
 }
