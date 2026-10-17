@@ -9,6 +9,7 @@
 #include <wincodec.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cwchar>
 #include <string>
 #include <utility>
@@ -158,6 +159,19 @@ int wmain() {
                 std::wprintf(L"     png:    WRITE FAILED %ls\n", pngPath.c_str());
                 ++failures;
             }
+
+            // The shell's own image (Start tile for packaged apps) beside it, for tools/icons-sheet.ps1.
+            IconImage before;
+            const bool same = LoadJumboIcon(app.linkPath, before, false) && before.bgra == img.bgra;
+            std::size_t moved = 0;  // pixels where any channel moved by more than 8
+            if (before.bgra.size() == img.bgra.size()) {
+                for (std::size_t k = 0; k < img.bgra.size(); ++k) {
+                    if (std::abs(int{img.bgra[k]} - int{before.bgra[k]}) > 8) { ++moved; k |= 3; }
+                }
+            }
+            std::wprintf(L"     before: %ls (before %dx%d, %zu px differ)\n",
+                         same ? L"same image" : L"differs (taskbar logo used)", before.width, before.height, moved);
+            SavePng(factory.get(), before, pngPath.substr(0, pngPath.size() - 4) + L".before.png");
             std::wprintf(L"\n");
         }
 
