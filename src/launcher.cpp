@@ -1230,12 +1230,6 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-        case WM_NCHITTEST: {  // the shadow margins (sides, bottom) are not part of the panel: clicks go to what is beneath
-            POINT pt{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
-            ScreenToClient(m_hwnd, &pt);
-            if (pt.x < m_shadowM || pt.x >= m_shadowM + m_w || pt.y >= kTop * m_s + m_h) return HTTRANSPARENT;
-            return HTCLIENT;
-        }
         case WM_TIMER:
             if (w == kStackTimer) {
                 KillTimer(m_hwnd, kStackTimer);
@@ -1266,6 +1260,12 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (m_open) OnHover(-1, -1);
             return 0;
         case WM_LBUTTONDOWN:
+            // The shadow margins (sides, bottom) are outside the panel. HTTRANSPARENT would only pass the
+            // click to windows on this thread, so treat it as a click outside: dismiss, like macOS.
+            if (m_open && (mx < m_shadowM || mx >= m_shadowM + m_w || my >= kTop * m_s + m_h)) {
+                Close();
+                return 0;
+            }
             if (m_open) {
                 auto const* hit = HitAt(mx - m_shadowM, my - kTop * m_s);
                 m_pressedIndex = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
