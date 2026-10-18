@@ -84,7 +84,7 @@ constexpr UINT kMsgTestMove = WM_APP + 2;   // wParam = pointer x, client px
 constexpr UINT kMsgTestLeave = WM_APP + 3;
 constexpr UINT kMsgIntellihideChanged = WM_APP + 5;  // wParam = overlap, lParam = fullscreen
 constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
-// Test hook (HALO_TEST=1): wParam 0 = open the launcher panel without Command Palette, 1 = close it, else Launcher::TestCommand.
+// Test hook (HALO_TEST=1): wParam 0 = open the launcher panel, 1 = close it, else Launcher::TestCommand.
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
 constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Control Center) / kRight (notifications)
@@ -938,16 +938,14 @@ void Halo::PointerLeave() {
     }
 }
 
-// The Windows key and the Start logo: Command Palette over a revealed dock,
-// with the Launcher panel above it. Not the real Start, which brings the hidden
-// taskbar back with it. A second tap closes both (the palette toggles itself).
+// The Windows key and the Start logo: the Launcher panel (search, recent apps and files) above a
+// revealed dock. Not the real Start, which brings the hidden taskbar back with it. A second tap closes it.
 void Halo::OpenLauncher() {
     Reveal();
     if (m_launcher) {
         if (m_launcher->IsOpen()) m_launcher->Hide();
         else m_launcher->Show(LauncherAnchorNow());
     }
-    halo::winkey::OpenPalette();
 }
 
 // Above the dock's pill, ten logical px clear of it, centered on it.
@@ -1112,7 +1110,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case kMsgTestLeave: PointerLeave(); return 0;
         case kMsgTestLauncher:
             if (m_launcher && !m_autoHide) {
-                if (w == 0 || w == 100) m_launcher->Show(LauncherAnchorNow(), w == 0);  // 100: as the Win key opens it, waiting on the palette
+                if (w == 0) m_launcher->Show(LauncherAnchorNow());
                 else if (w == 1) m_launcher->Hide();
                 else m_launcher->TestCommand(w);
             }
