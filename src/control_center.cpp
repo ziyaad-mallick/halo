@@ -19,6 +19,7 @@
 #include "effects.h"
 #include "motion.h"
 #include "services.h"
+#include "theme.h"
 
 // Interop interfaces missing from the MinGW SDK headers (same layouts as halo.cpp).
 struct ICompositorDesktopInterop : IUnknown {
@@ -90,8 +91,45 @@ winrt::Windows::Foundation::IReference<wfn::float3> Ref3(float v) {
 }
 bool In(D2D1_RECT_F const& r, float x, float y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
 
-const D2D1_COLOR_F kText = ColorF(1, 1, 1, 0.95f), kDim = ColorF(1, 1, 1, 0.58f), kOff = ColorF(1, 1, 1, 0.17f),
-                   kAccent = ColorF(0x0A84FF), kFill = ColorF(1, 1, 1, 0.94f), kOnFill = ColorF(0x1C1C1E);
+// Ink and fills come from the shared palette (light by default, HALO_THEME=dark for the old look).
+const D2D1_COLOR_F kText = theme::P().text, kDim = theme::P().dim, kOff = theme::P().off, kAccent = theme::P().accent,
+                   kOnAccent = theme::P().onAccent,
+                   kFill = theme::Dark() ? ColorF(1, 1, 1, 0.94f) : ColorF(1, 1, 1, 1.0f),
+                   kOnFill = theme::Dark() ? ColorF(0x1C1C1E) : ColorF(0.11f, 0.11f, 0.12f, 0.62f);
+// A subtle chip over a tile: the old white-alpha wash in dark, a faint ink wash in light.
+D2D1_COLOR_F Wash(float darkAlpha) { return theme::Dark() ? ColorF(1, 1, 1, darkAlpha) : ColorF(0, 0, 0, darkAlpha * 0.5f); }
+
+// A soft drop shadow that follows a rounded-rect mask. Lives under the clipped glass, so it
+// must be a sibling of the clipped container, not a child.
+wuc::SpriteVisual MakeShadow(wuc::Compositor const& comp, wuc::CompositionGraphicsDevice const& gdev, float wPx, float hPx,
+                             float radPx, float blur, float dy, theme::Argb col) {
+    if (col.a == 0 || blur <= 0) return nullptr;
+    try {
+        auto surface = gdev.CreateDrawingSurface({wPx, hPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                                 winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+        auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
+        winrt::com_ptr<ID2D1DeviceContext> dc;
+        POINT off{};
+        if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) return nullptr;
+        dc->Clear(ColorF(0, 0.0f));
+        winrt::com_ptr<ID2D1SolidColorBrush> b;
+        dc->CreateSolidColorBrush(ColorF(1, 1, 1, 1), b.put());
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(off.x + 0.0f, off.y + 0.0f, off.x + wPx, off.y + hPx), radPx, radPx), b.get());
+        interop->EndDraw();
+        auto mask = comp.CreateSurfaceBrush(surface);
+        mask.Stretch(wuc::CompositionStretch::Fill);
+        auto sh = comp.CreateDropShadow();
+        sh.BlurRadius(blur);
+        sh.Color(theme::C(col));
+        sh.Offset({0, dy, 0});
+        sh.Mask(mask);
+        auto v = comp.CreateSpriteVisual();
+        v.Size({wPx, hPx});
+        v.Brush(mask);
+        v.Shadow(sh);
+        return v;
+    } catch (...) { return nullptr; }
+}
 
 // Results of the slow reads (hotspot, SSID) done off the UI thread.
 struct Late {
@@ -115,7 +153,8 @@ struct ControlCenter::Impl {
     RECT mon{}, rect{};  // rect: the panel (pill) on screen, physical px; the window is this plus the margin
     float height = 0;    // panel height, logical
     wuc::Desktop::DesktopWindowTarget target{nullptr};
-    wuc::ContainerVisual root{nullptr}, pill{nullptr}, fx{nullptr};
+    wuc::ContainerVisual root{nullptr}, pill{nullptr}, inner{nullptr}, fx{nullptr};
+    wuc::SpriteVisual shadowV{nullptr};
     wuc::SpriteVisual content{nullptr}, pv{nullptr};
     wuc::ShapeVisual hv{nullptr};
     wuc::CompositionDrawingSurface surf{nullptr}, pvSurf{nullptr};
@@ -454,7 +493,7 @@ void ControlCenter::Impl::Teardown() {
     if (surf) surf.Close();
     if (pvSurf) pvSurf.Close();
     surf = nullptr; pvSurf = nullptr; content = nullptr; pv = nullptr; hv = nullptr; hvGeo = nullptr;
-    pill = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr;
+    pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr;
     items.clear();
     st = St::Closed;
     rect = {};
@@ -470,7 +509,8 @@ void ControlCenter::Impl::Pulse(Item const& it) {
     auto geo = comp.CreateEllipseGeometry();
     geo.Radius({rad * s, rad * s});
     auto shape = comp.CreateSpriteShape(geo);
-    shape.StrokeBrush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0xB0, 0xFF, 0xFF, 0xFF)));
+    shape.StrokeBrush(comp.CreateColorBrush(theme::Dark() ? winrt::Windows::UI::ColorHelper::FromArgb(0xB0, 0xFF, 0xFF, 0xFF)
+                                                         : winrt::Windows::UI::ColorHelper::FromArgb(0x90, 0x00, 0x7A, 0xFF)));
     shape.StrokeThickness(2 * s);
     auto v = comp.CreateShapeVisual();
     v.Size({1, 1});
@@ -909,6 +949,8 @@ void ControlCenter::Impl::ApplySize() {
     SIZE wp = WindowPx();
     SetWindowPos(hwnd, nullptr, 0, 0, wp.cx, wp.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     pill.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
+    inner.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
+    if (shadowV) shadowV.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     content.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     clip.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     rim.Size({wPx - s, hPx - s});
@@ -942,6 +984,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
     winrt::com_ptr<ID2D1GradientStopCollection> stops;
     winrt::com_ptr<ID2D1LinearGradientBrush> lg;
     D2D1_GRADIENT_STOP gs[2] = {{0.0f, ColorF(1, 1, 1, 0.15f)}, {1.0f, ColorF(1, 1, 1, 0.075f)}};
+    const bool darkTheme = theme::Dark();
     dc->CreateGradientStopCollection(gs, 2, stops.put());
     dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}), stops.get(), lg.put());
 
@@ -950,10 +993,22 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         dc->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), br.get());
     };
     auto tile = [&](D2D1_RECT_F r, float rad) {
-        lg->SetStartPoint({0, r.top});
-        lg->SetEndPoint({0, r.bottom});
-        dc->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), lg.get());
-        br->SetColor(ColorF(1, 1, 1, 0.09f));
+        if (darkTheme) {
+            lg->SetStartPoint({0, r.top});
+            lg->SetEndPoint({0, r.bottom});
+            dc->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), lg.get());
+            br->SetColor(ColorF(1, 1, 1, 0.09f));
+        } else {  // a brighter white card with a whisper of lift underneath and a hairline edge
+            br->SetColor(ColorF(0, 0, 0, 0.035f));
+            dc->FillRoundedRectangle(D2D1::RoundedRect({r.left, r.top + 1.5f, r.right, r.bottom + 1.0f}, rad, rad), br.get());
+            br->SetColor(theme::P().fill);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), br.get());
+            br->SetColor(ColorF(1, 1, 1, 0.55f));
+            dc->DrawRoundedRectangle(D2D1::RoundedRect({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, rad, rad), br.get(), 1.0f);
+            br->SetColor(ColorF(0, 0, 0, 0.05f));
+            dc->DrawRoundedRectangle(D2D1::RoundedRect({r.left - 0.25f, r.top - 0.25f, r.right + 0.25f, r.bottom + 0.25f}, rad, rad), br.get(), 0.5f);
+            return;
+        }
         dc->DrawRoundedRectangle(D2D1::RoundedRect({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, rad, rad), br.get(), 1.0f);
     };
     auto txt = [&](std::wstring const& t, IDWriteTextFormat* f, D2D1_RECT_F r, D2D1_COLOR_F c) {
@@ -968,10 +1023,19 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
     // A round control: accent when on, glass when off; a glyph, or a custom mark for dark mode.
     auto icon = [&](float cx, float cy, float rad, bool on, bool avail, wchar_t g, IDWriteTextFormat* f, bool darkMark) {
         float a = avail ? 1.0f : 0.45f;
-        circle(cx, cy, rad, on ? ColorF(0x0A84FF, a) : ColorF(1, 1, 1, 0.17f * a));
+        if (on) circle(cx, cy, rad, theme::A(kAccent, a));
+        else {
+            if (!darkTheme) {  // faint lift under an idle round control
+                br->SetColor(ColorF(0, 0, 0, 0.04f * a));
+                dc->FillEllipse(D2D1::Ellipse({cx, cy + 1.0f}, rad, rad), br.get());
+                br->SetColor(ColorF(1, 1, 1, 0.9f * a));
+                dc->FillEllipse(D2D1::Ellipse({cx, cy}, rad, rad), br.get());
+            }
+            circle(cx, cy, rad, theme::A(kOff, a));
+        }
         if (darkMark) {  // half-filled disc
             float k = rad * 0.34f;
-            br->SetColor(ColorF(1, 1, 1, a));
+            br->SetColor(theme::A(on ? kOnAccent : kText, a));
             dc->DrawEllipse(D2D1::Ellipse({cx, cy}, k, k), br.get(), 1.6f);
             winrt::com_ptr<ID2D1Factory> fac;
             dc->GetFactory(fac.put());
@@ -985,7 +1049,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 dc->FillGeometry(pg.get(), br.get());
             }
         } else {
-            glyph(g, f, {cx - rad, cy - rad, cx + rad, cy + rad}, ColorF(1, 1, 1, a));
+            glyph(g, f, {cx - rad, cy - rad, cx + rad, cy + rad}, theme::A(on ? kOnAccent : kText, a));
         }
     };
 
@@ -1023,8 +1087,8 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     if (on) for (auto const& d : svc::BtDevices()) if (d.connected) { sub = d.name; break; }
                 }
                 float a = avail ? 1.0f : 0.45f, tx = r.left + 54, rt = r.right - 24;
-                txt(wifi ? L"Wi-Fi" : L"Bluetooth", fTitle.get(), {tx, cy - 18, rt, cy}, ColorF(1, 1, 1, 0.95f * a));
-                txt(sub, fSub.get(), {tx, cy + 1, rt, cy + 17}, ColorF(1, 1, 1, 0.58f * a));
+                txt(wifi ? L"Wi-Fi" : L"Bluetooth", fTitle.get(), {tx, cy - 18, rt, cy}, theme::A(kText, a));
+                txt(sub, fSub.get(), {tx, cy + 1, rt, cy + 17}, theme::A(kDim, a));
                 bool open = expand == (wifi ? Expand::Wifi : Expand::Bluetooth);
                 glyph(open ? 0xE70E : 0xE76C, fIconS.get(), {r.right - 26, cy - 10, r.right - 8, cy + 10}, kDim);  // chevron up / right
                 break;
@@ -1047,11 +1111,11 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             case Id::Power: icon(cx, cy, 22, powerOpen, true, 0xE7E8, fIcon.get(), false); break;
             case Id::Mic: icon(cx, cy, 22, micMuted, mic.Available(), micMuted ? 0xEC54 : 0xE720, fIcon.get(), false); break;
             case Id::PowSleep: case Id::PowRestart: case Id::PowShut:
-                box(r, 14, ColorF(1, 1, 1, 0.10f));
+                box(r, 14, Wash(0.10f));
                 txt(it.id == Id::PowSleep ? L"Sleep" : it.id == Id::PowRestart ? L"Restart" : L"Shut down", fBtn.get(), r, kText);
                 break;
             case Id::Battery: {
-                box(r, 16, ColorF(1, 1, 1, 0.12f));
+                box(r, 16, Wash(0.12f));
                 if (battery.hasBattery) {
                     int lvl = std::min(10, battery.percent / 10);
                     wchar_t g = static_cast<wchar_t>((battery.ac ? 0xEBAB : 0xEBA0) + lvl);
@@ -1074,7 +1138,9 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             case Id::Bright: case Id::Vol: {
                 float h = r.bottom - r.top, f = it.id == Id::Vol ? volume : bright / 100.0f;
                 box(r, h / 2, kOff);
-                box({r.left, r.top, r.left + h + f * (r.right - r.left - h), r.bottom}, h / 2, kFill);
+                D2D1_RECT_F fr{r.left, r.top, r.left + h + f * (r.right - r.left - h), r.bottom};
+                if (!darkTheme) { box({fr.left, fr.top + 1.0f, fr.right, fr.bottom + 1.0f}, h / 2, ColorF(0, 0, 0, 0.10f)); }
+                box(fr, h / 2, kFill);
                 wchar_t g = it.id == Id::Bright ? 0xE706 : (muted || volume <= 0.001f ? 0xE74F : 0xE767);
                 glyph(g, fIconS.get(), {r.left, r.top, r.left + h, r.bottom}, kOnFill);
                 break;
@@ -1099,7 +1165,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     auto const& d = svc::BtDevices()[it.arg];
                     name = d.name; mark = d.connected; sub = d.connected ? L"Connected" : L"";
                 }
-                if (mark) box(r, 12, ColorF(1, 1, 1, 0.07f));
+                if (mark) box(r, 12, Wash(0.07f));
                 txt(name, fSub.get(), {r.left + 12, r.top, r.right - (sub.empty() ? 36 : 112), r.bottom}, mark ? kText : kDim);
                 if (!sub.empty()) txt(sub, fSubR.get(), {r.right - 104, r.top, r.right - 36, r.bottom}, kDim);
                 if (mark) glyph(0xE73E, fIconS.get(), {r.right - 32, r.top, r.right - 8, r.bottom}, kAccent);
@@ -1109,7 +1175,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 auto const& ms = media.State();
                 bool ok = it.id == Id::Prev ? ms.canPrev : it.id == Id::Next ? ms.canNext : true;
                 wchar_t g = it.id == Id::Prev ? 0xE892 : it.id == Id::Next ? 0xE893 : (ms.playing ? 0xE769 : 0xE768);
-                glyph(g, fIcon.get(), r, ColorF(1, 1, 1, ok ? 0.95f : 0.3f));
+                glyph(g, fIcon.get(), r, theme::A(kText, ok ? 1.0f : 0.3f));
                 break;
             }
             default: break;
@@ -1214,6 +1280,14 @@ void ControlCenter::Impl::BuildVisuals() {
     pill.Size({wPx, hPx});
     pill.Offset({pad, pad, 0});
     root.Children().InsertAtTop(pill);
+    // The shadow sits beside the clipped panel (a clip would cut it off), both riding the pill's motion.
+    if (auto sh = MakeShadow(comp, gdev, wPx, hPx, kRadius * s, theme::P().shadowBlur * s, theme::P().shadowY * s, theme::P().shadow)) {
+        shadowV = sh;
+        pill.Children().InsertAtTop(sh);
+    }
+    inner = comp.CreateContainerVisual();
+    inner.Size({wPx, hPx});
+    pill.Children().InsertAtTop(inner);
 
     auto glass = comp.CreateSpriteVisual();
     glass.RelativeSizeAdjustment({1, 1});
@@ -1223,23 +1297,23 @@ void ControlCenter::Impl::BuildVisuals() {
         brush.SetSourceParameter(L"backdrop", comp.CreateHostBackdropBrush());
         glass.Brush(brush);
     } catch (...) { svc::Log(L"blur brush failed"); }
-    pill.Children().InsertAtTop(glass);
+    inner.Children().InsertAtTop(glass);
 
     auto tint = comp.CreateSpriteVisual();
     tint.RelativeSizeAdjustment({1, 1});
-    tint.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x80, 0x16, 0x16, 0x1A)));
-    pill.Children().InsertAtTop(tint);
+    tint.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(theme::P().tint.a, theme::P().tint.r, theme::P().tint.g, theme::P().tint.b)));
+    inner.Children().InsertAtTop(tint);
 
     try {
         auto noise = comp.CreateSpriteVisual();
         noise.RelativeSizeAdjustment({1, 1});
-        noise.Opacity(0.025f);
+        noise.Opacity(theme::P().noise);
         if (!noiseBrush || noiseW != static_cast<int>(wPx)) {  // generated once per scale, then shared by every open
             noiseBrush = NoiseBrush(static_cast<int>(wPx), static_cast<int>(std::ceil(kMaxH * s)));
             noiseW = static_cast<int>(wPx);
         }
         noise.Brush(noiseBrush);
-        pill.Children().InsertAtTop(noise);
+        inner.Children().InsertAtTop(noise);
     } catch (...) {}
 
     surf = gdev.CreateDrawingSurface({wPx, hPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -1249,7 +1323,7 @@ void ControlCenter::Impl::BuildVisuals() {
     auto sb = comp.CreateSurfaceBrush(surf);
     sb.Stretch(wuc::CompositionStretch::None);
     content.Brush(sb);
-    pill.Children().InsertAtTop(content);
+    inner.Children().InsertAtTop(content);
 
     // The hover highlight: one rounded rect that fades and glides between controls.
     hv = comp.CreateShapeVisual();
@@ -1257,14 +1331,14 @@ void ControlCenter::Impl::BuildVisuals() {
     hv.Opacity(0);
     hvGeo = comp.CreateRoundedRectangleGeometry();
     auto hs = comp.CreateSpriteShape(hvGeo);
-    hs.FillBrush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x26, 0xFF, 0xFF, 0xFF)));
+    hs.FillBrush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(theme::Dark() ? 0x26 : 0x12, theme::Dark() ? 0xFF : 0x00, theme::Dark() ? 0xFF : 0x00, theme::Dark() ? 0xFF : 0x00)));
     hv.Shapes().Append(hs);
-    pill.Children().InsertAtTop(hv);
+    inner.Children().InsertAtTop(hv);
     hvShown = false;
 
     fx = comp.CreateContainerVisual();
     fx.RelativeSizeAdjustment({1, 1});
-    pill.Children().InsertAtTop(fx);
+    inner.Children().InsertAtTop(fx);
 
     const float t = s;  // 1 px rim, inset by half its width so it stays inside the clip
     rim = comp.CreateRoundedRectangleGeometry();
@@ -1275,22 +1349,26 @@ void ControlCenter::Impl::BuildVisuals() {
     gradient.MappingMode(wuc::CompositionMappingMode::Relative);
     gradient.StartPoint({0, 0});
     gradient.EndPoint({0, 1});
-    auto stop = [&](float at, uint8_t a) {
-        gradient.ColorStops().Append(comp.CreateColorGradientStop(at, winrt::Windows::UI::ColorHelper::FromArgb(a, 0xFF, 0xFF, 0xFF)));
-    };
-    stop(0.0f, 0x70); stop(0.35f, 0x18); stop(0.7f, 0x0A); stop(1.0f, 0x26);
+    auto stop = [&](float at, theme::Argb c) { gradient.ColorStops().Append(comp.CreateColorGradientStop(at, theme::C(c))); };
+    stop(0.0f, theme::P().rimTop); stop(0.35f, theme::P().rimMid); stop(0.7f, theme::P().rimLow); stop(1.0f, theme::P().rimBottom);
     auto sprite = comp.CreateSpriteShape(rim);
     sprite.StrokeBrush(gradient);
     sprite.StrokeThickness(t);
     auto rimVisual = comp.CreateShapeVisual();
     rimVisual.RelativeSizeAdjustment({1, 1});
     rimVisual.Shapes().Append(sprite);
-    pill.Children().InsertAtTop(rimVisual);
+    if (theme::P().edge.a) {  // the 1px hairline that separates light glass from a light wallpaper
+        auto edge = comp.CreateSpriteShape(rim);
+        edge.StrokeBrush(comp.CreateColorBrush(theme::C(theme::P().edge)));
+        edge.StrokeThickness(t);
+        rimVisual.Shapes().Append(edge);
+    }
+    inner.Children().InsertAtTop(rimVisual);
 
     clip = comp.CreateRoundedRectangleGeometry();
     clip.CornerRadius({kRadius * s, kRadius * s});
     clip.Size({wPx, hPx});
-    pill.Clip(comp.CreateGeometricClip(clip));
+    inner.Clip(comp.CreateGeometricClip(clip));
 }
 
 // ---------------------------------------------------------------------------------------------
