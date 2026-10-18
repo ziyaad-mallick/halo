@@ -157,6 +157,14 @@ pill 50 tall, radius 20, floating 6 above the edge; glass = blur 40, tint
 at 70%. Icons are the stock Windows icons, never masked or restyled. No tray
 or clock pill on the dock (a menu bar may come later, separately).
 
+**2026-10-18: light by default.** He asked for "light, airy, aesthetic" across
+dock, Start panel and Control Center. All colours now come from `src/theme.h`:
+frosted white glass (blur 40, tint #F8F8FB at 84%), dark ink (#1C1C1F), a 1px
+black-7% hairline outside the rim, and a soft shadow (black 18%, blur 28, y 8).
+Sizes are unchanged. `HALO_THEME=dark` restores the glass described above.
+Halo is now the logon shell (HKCU Run → `%LOCALAPPDATA%\Halo\app\guardian.exe`;
+ship builds with `tools/install.ps1`), and Quiet Dock's Windhawk mods are disabled.
+
 | Behaviour | Decision |
 |---|---|
 | Pins | Halo's own list, seeded once from the Windows taskbar pins; drag to reorder, drag off to remove, right-click > Keep in Dock |
