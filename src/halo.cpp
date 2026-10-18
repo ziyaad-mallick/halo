@@ -135,6 +135,7 @@ struct Scale {
 
 class Halo {
 public:
+    ~Halo();
     bool Create(HINSTANCE inst);
     int Run();
 
@@ -220,6 +221,14 @@ private:
     winrt::com_ptr<ID2D1Device> m_d2d;
     wuc::CompositionGraphicsDevice m_gdev{nullptr};
 };
+
+// Members die in reverse declaration order, so m_comp/m_dq (declared last) are gone before
+// m_label's destructor calls m_parent.Children().Remove() on a visual of the dead compositor, which
+// throws winrt::hresult_error out of a noexcept destructor -> terminate on every exit. Drop the
+// visual owners while the compositor is still alive.
+Halo::~Halo() {
+    m_label.reset();
+}
 
 bool Halo::Create(HINSTANCE inst) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
