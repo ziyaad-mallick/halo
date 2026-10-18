@@ -17,7 +17,6 @@
 #include <winrt/Windows.UI.Composition.Desktop.h>
 #include <winrt/Windows.UI.Notifications.Management.h>
 #include <winrt/Windows.UI.Notifications.h>
-#include <winrt/Windows.UI.ViewManagement.h>
 #include <winrt/Windows.UI.h>
 #include <algorithm>
 #include <atomic>
@@ -65,12 +64,12 @@ namespace {
 // Logical px; everything is scaled by the monitor DPI.
 constexpr float kWStd = 360;          // panel width when standalone (attached, it follows the Control Center)
 constexpr float kEdge = 10;           // gap to the screen edge (right and top)
-constexpr float kPad = 14, kIcon = 32, kTextX = kPad + kIcon + 10, kRadius = 18, kGap = 10, kPeek = 10;
+constexpr float kPad = 12, kIcon = 32, kTextX = kPad + kIcon + 10, kRadius = 16, kGap = 8, kPeek = 10;  // the Control Center's grid
 constexpr float kHeaderY = 12, kTitleY = 30, kBodyY = 48, kLine = 15, kMinH = 62, kCollapseH = 28;
 constexpr float kHeadH = 38, kMoreH = 28, kEmptyH = 56;
 constexpr float kCalHeadStd = 74, kCalNav = 26, kCalDow = 18, kCalRowStd = 26, kCalHStd = kCalHeadStd + kCalNav + 4 + kCalDow + 2 + 6 * kCalRowStd + 12;
 constexpr int kMaxCards = 6, kMaxCardsAttached = 3;
-constexpr float kAttachGap = 10, kAttachMargin = 8;  // below the Control Center; to the screen bottom
+constexpr float kAttachGap = 8, kAttachMargin = 8;  // above the Control Center; to the screen top
 constexpr UINT kMsgData = WM_APP + 1;
 constexpr UINT_PTR kTimerGone = 1, kTimerClose = 2;
 constexpr wchar_t kClass[] = L"HaloNotifications", kMsgClass[] = L"HaloNotificationsMsg";
@@ -348,7 +347,8 @@ struct NotificationCenter::Impl {
     void Place();
     void ApplyGeometry();
     void Dismissed() { if (api->onDismiss) api->onDismiss(); else Close(); }
-    float2 Travel() const { return {(kW + 2 * motion::kPad) * s, 0}; }  // in from the right screen edge
+    // Attached: up out of the Control Center below it (the window's bottom edge clips it). Standalone: in from the right.
+    float2 Travel() const { return attached ? float2{0, (winH + motion::kPad) * s} : float2{(kW + 2 * motion::kPad) * s, 0}; }
     void AnimateIn(Card& c, int order);
     void AnimateOut(Card& c);
     int CardAt(float x, float y, int* part);
@@ -771,19 +771,19 @@ void NotificationCenter::Impl::BuildFonts() {
     };
     const auto SB = DWRITE_FONT_WEIGHT_SEMI_BOLD, R = DWRITE_FONT_WEIGHT_NORMAL;
     const auto L_ = DWRITE_TEXT_ALIGNMENT_LEADING, C = DWRITE_TEXT_ALIGNMENT_CENTER;
-    mk(fApp, SB, 11, L_, false);
-    mk(fTime, R, 11, DWRITE_TEXT_ALIGNMENT_TRAILING, false);
-    mk(fTitle, SB, 12.5f, L_, false);
-    mk(fBody, R, 11.5f, L_, true);
-    mk(fPill, SB, 11.5f, C, false, true);
+    mk(fApp, SB, 12, L_, false);
+    mk(fTime, R, 12, DWRITE_TEXT_ALIGNMENT_TRAILING, false);
+    mk(fTitle, SB, 14, L_, false);
+    mk(fBody, R, 12, L_, true);
+    mk(fPill, SB, 12, C, false, true);
     mk(fCount, SB, 10.5f, C, false, true);
     mk(fHead, SB, 15, L_, false, true);
     mk(fClear, SB, 12, C, false, true);
     mk(fBig, SB, 28, L_, false);
-    mk(fCalDow, SB, 11.5f, L_, false);
+    mk(fCalDow, SB, 12, L_, false);
     mk(fNav, SB, 13, L_, false, true);
-    mk(fDay, R, 12.5f, C, false, true);
-    mk(fDayB, SB, 12.5f, C, false, true);
+    mk(fDay, R, 13, C, false, true);
+    mk(fDayB, SB, 13, C, false, true);
     mk(fDow, SB, 10.5f, C, false, true);
 }
 
@@ -1298,10 +1298,10 @@ void NotificationCenter::Impl::Place() {
     const int hPx = std::max(1, static_cast<int>(std::ceil((h + 2 * motion::kPad) * s)));
     int x = work.right - wPx + static_cast<int>((motion::kPad - kEdge) * s);
     int yy = work.top + static_cast<int>((kEdge - motion::kPad) * s);
-    if (attached) {  // directly under the Control Center, same left edge
+    if (attached) {  // directly above the Control Center, same left edge
         const int pad = static_cast<int>(std::lround(motion::kPad * s));
         x = anchorRc.left - pad;
-        yy = anchorRc.bottom + static_cast<int>(std::lround(kAttachGap * s)) - pad;
+        yy = anchorRc.top - static_cast<int>(std::lround(kAttachGap * s)) - hPx + pad;
     }
     SetWindowPos(hwnd, HWND_TOPMOST, x, yy, wPx, hPx, SWP_NOACTIVATE);
 }
@@ -1335,8 +1335,8 @@ void NotificationCenter::Impl::ApplyGeometry() {
         return;
     }
     kW = (anchorRc.right - anchorRc.left) / s;
-    const float top = anchorRc.bottom + kAttachGap * s;
-    availH = std::max(120.0f, (mi.rcMonitor.bottom - top) / s - kAttachMargin);
+    const float bottom = anchorRc.top - kAttachGap * s;
+    availH = std::max(120.0f, (bottom - mi.rcMonitor.top) / s - kAttachMargin);
     // Compact calendar: just the month row, the weekday letters and the grid. Shorter rows only if even
     // the calendar alone would not fit (cards are dropped first, see Update).
     kCalHead = 4;
@@ -1351,10 +1351,6 @@ void NotificationCenter::Impl::Open() {
     visible = true;
     try {
         ApplyGeometry();
-        try {
-            auto c = winrt::Windows::UI::ViewManagement::UISettings().GetColorValue(winrt::Windows::UI::ViewManagement::UIColorType::Accent);
-            accent = ColorF(c.R / 255.0f, c.G / 255.0f, c.B / 255.0f, 1);
-        } catch (...) {}
         GetLocalTime(&today);
         calYear = today.wYear;
         calMonth = today.wMonth;
@@ -1426,7 +1422,7 @@ void NotificationCenter::Open() { m->Open(); }
 void NotificationCenter::Close() { m->Close(); }
 bool NotificationCenter::IsOpen() const { return m->st == Impl::St::Open; }
 HWND NotificationCenter::Hwnd() const { return m->st == Impl::St::Closed ? nullptr : m->hwnd; }
-// Attach under the Control Center panel (physical px); an empty rect detaches. Re-lays out while open.
+// Attach above the Control Center panel (physical px); an empty rect detaches. Re-lays out while open.
 void NotificationCenter::SetAnchor(RECT ccPanel) {
     m->attached = ccPanel.right > ccPanel.left;
     m->anchorRc = ccPanel;

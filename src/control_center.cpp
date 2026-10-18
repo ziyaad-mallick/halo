@@ -51,8 +51,9 @@ namespace {
 // Grid, in logical px (all drawing is scaled by the monitor DPI): 14 outer inset, 10 between modules,
 // 24 panel radius, 18 module radius. The window is the panel plus motion::kPad of empty margin on every
 // side, so the spring's overshoot never clips; everything below is in panel ("pill") coordinates.
-constexpr float kW = 340, kInset = 14, kGap = 10, kRadius = 24, kTileR = 18;
-constexpr float kPillH = 60, kRowH = 68, kSliderH = 52, kMediaH = 88, kHeadH = 76, kActH = 60, kPowH = 48;
+// On an 8 px grid, with concentric corners: tile radius = panel radius - inset.
+constexpr float kW = 344, kInset = 12, kGap = 8, kRadius = 28, kTileR = 16;
+constexpr float kPillH = 56, kRowH = 64, kSliderH = 56, kMediaH = 88, kHeadH = 72, kActH = 56, kPowH = 48;
 constexpr float kMaxH = 900, kMargin = 8;
 constexpr int kMaxOutputs = 6;
 
@@ -179,7 +180,7 @@ struct ControlCenter::Impl {
     wuc::ContainerVisual chipLayer{nullptr};
     wuc::CompositionPropertySet ptr{nullptr};  // "P": the pointer in pill px, read by the hovered chip's lean
     int hotChip = -1;
-    wuc::CompositionRoundedRectangleGeometry clip{nullptr}, rim{nullptr}, hvGeo{nullptr};
+    wuc::CompositionRoundedRectangleGeometry clip{nullptr}, rim{nullptr}, hvGeo{nullptr}, specGeo{nullptr};
     bool hvShown = false;
 
     // Kept across opens: the DirectWrite factory and formats, and the grain texture.
@@ -205,7 +206,7 @@ struct ControlCenter::Impl {
     std::vector<Item> items;
     Item hover, pressed;
     bool tracking = false, synced = false, settling = false, held = false, needSync = false;
-    bool byPointer = false, entered = false, fromRight = false;  // opened from the screen edge; the pointer has been over the panel
+    bool byPointer = false, entered = false;  // opened from the screen edge; the pointer has been over the panel
     ULONGLONG outSince = 0;
     bool powerOpen = false;
     WORD lastMin = 0xFFFF;
@@ -219,15 +220,12 @@ struct ControlCenter::Impl {
         : api(a), inst(i), owner(o), comp(std::move(c)), gdev(std::move(g)) {}
 
     void RegisterClasses();
-    void Open(bool pointer, bool right);
+    void Open(bool pointer);
     void Close();
     void Teardown();
     void CheckPointer();
-    // Down out of the top edge, or in from the right edge: the way the pointer came.
-    wfn::float2 Travel() const {
-        const float pad = std::lround(motion::kPad * s);
-        return fromRight ? wfn::float2{std::ceil(kW * s) + pad, 0} : wfn::float2{0, -(std::ceil(height * s) + pad)};
-    }
+    // Up out of the bottom edge, like the Windows taskbar's Quick Settings flyout.
+    wfn::float2 Travel() const { return {0, std::ceil(height * s) + std::lround(motion::kPad * s)}; }
     void Settle();
     void Focus();
     void BuildFonts();
@@ -283,6 +281,7 @@ void ControlCenter::Impl::RegisterClasses() {
 LRESULT CALLBACK ControlCenter::Impl::HotThunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (self && m == kMsgMedia) { self->media.Pull(); return 0; }
     if (self && m == WM_TIMER && w == kTimerChord) {
         KillTimer(h, kTimerChord);
         svc::SendWinChord(self->chordKey, self->chordShift);
@@ -390,7 +389,6 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (svc::brightness::Supported()) bright = svc::brightness::Level();
             Render();
             return 0;
-        case kMsgMedia: media.Pull(); return 0;
         case kMsgWifi: case kMsgBt: Render(); return 0;
         case kMsgLate: {
             std::unique_ptr<Late> r(reinterpret_cast<Late*>(l));
@@ -425,10 +423,9 @@ SIZE ControlCenter::Impl::WindowPx() const {
     return {static_cast<LONG>(std::ceil(kW * s)) + 2 * pad, static_cast<LONG>(std::ceil(height * s)) + 2 * pad};
 }
 
-void ControlCenter::Impl::Open(bool pointer, bool right) {
+void ControlCenter::Impl::Open(bool pointer) {
     if (st == St::Open) return;
     byPointer = pointer;
-    fromRight = right;
     entered = false;
     outSince = 0;
     if (st == St::Closing) Teardown();
@@ -459,7 +456,7 @@ void ControlCenter::Impl::Open(bool pointer, bool right) {
         Layout();
         const int pad = static_cast<int>(std::lround(motion::kPad * s)), mg = static_cast<int>(std::lround(kMargin * s));
         int wPx = static_cast<int>(std::ceil(kW * s)), hPx = static_cast<int>(std::ceil(height * s));
-        rect = {mon.right - wPx - mg, mon.top + mg, 0, 0};
+        rect = {mon.right - wPx - mg, mon.bottom - mg - hPx, 0, 0};  // the bottom right, where Quick Settings opens
         rect.right = rect.left + wPx;
         rect.bottom = rect.top + hPx;
         SIZE wp = WindowPx();
@@ -484,7 +481,6 @@ void ControlCenter::Impl::Open(bool pointer, bool right) {
         SetTimer(hwnd, kTimerLeave, kLeaveTickMs, nullptr);
         // Async sources fill in as they arrive.
         radios.Start(hwnd, kMsgRadios);
-        media.Start(hwnd, kMsgMedia, [this] { if (st == St::Open) Render(); });
         svc::brightness::Probe(hwnd, kMsgBright);
         StartLate();
         if (api->onShown) api->onShown();
@@ -515,7 +511,6 @@ void ControlCenter::Impl::Close() {
     speaker.Unbind();
     mic.Unbind();
     radios.Stop();
-    media.Stop();
     svc::WifiStop();
     svc::BtStop();
     SetHover(nullptr);
@@ -533,7 +528,6 @@ void ControlCenter::Impl::Teardown() {
     speaker.Unbind();
     mic.Unbind();
     radios.Stop();
-    media.Stop();
     svc::WifiStop();
     svc::BtStop();
     drag = Id::None;
@@ -551,7 +545,7 @@ void ControlCenter::Impl::Teardown() {
     chips.clear();
     hotChip = -1;
     surf = nullptr; content = nullptr; chipLayer = nullptr; ptr = nullptr; hv = nullptr; hvGeo = nullptr;
-    pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr;
+    pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr; specGeo = nullptr;
     items.clear();
     st = St::Closed;
     rect = {};
@@ -568,7 +562,7 @@ void ControlCenter::Impl::Pulse(Item const& it) {
     geo.Radius({rad * s, rad * s});
     auto shape = comp.CreateSpriteShape(geo);
     shape.StrokeBrush(comp.CreateColorBrush(theme::Dark() ? winrt::Windows::UI::ColorHelper::FromArgb(0xB0, 0xFF, 0xFF, 0xFF)
-                                                         : winrt::Windows::UI::ColorHelper::FromArgb(0x90, 0x00, 0x7A, 0xFF)));
+                                                         : winrt::Windows::UI::ColorHelper::FromArgb(0x90, 0x0F, 0x76, 0x6E)));
     shape.StrokeThickness(2 * s);
     auto v = comp.CreateShapeVisual();
     v.Size({1, 1});
@@ -753,8 +747,8 @@ void ControlCenter::Impl::CheckPointer() {
         }
     }
     if (!in && !entered) {
-        const long w = mon.right - mon.left, h = mon.bottom - mon.top;
-        in = (p.y <= mon.top + slack && p.x >= mon.right - w / 5) || (p.x >= mon.right - 1 - slack && p.y <= mon.top + h / 5);
+        const long w = mon.right - mon.left;
+        in = p.y >= mon.bottom - 1 - slack && p.x >= mon.right - w / 5;
     }
     if (in) { outSince = 0; return; }
     const ULONGLONG now = GetTickCount64();
@@ -1089,15 +1083,17 @@ void ControlCenter::Impl::Layout() {
 void ControlCenter::Impl::ApplySize() {
     int wPx = static_cast<int>(std::ceil(kW * s)), hPx = static_cast<int>(std::ceil(height * s));
     if (rect.bottom - rect.top == hPx) return;
-    rect.bottom = rect.top + hPx;
+    rect.top = rect.bottom - hPx;  // anchored at the bottom: it grows upward
     SIZE wp = WindowPx();
-    SetWindowPos(hwnd, nullptr, 0, 0, wp.cx, wp.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    const int pad = static_cast<int>(std::lround(motion::kPad * s));
+    SetWindowPos(hwnd, nullptr, rect.left - pad, rect.top - pad, wp.cx, wp.cy, SWP_NOZORDER | SWP_NOACTIVATE);
     pill.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     inner.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     if (shadowV) shadowV.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     content.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     clip.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     rim.Size({wPx - s, hPx - s});
+    if (specGeo) specGeo.Size({wPx - 3 * s, hPx - 3 * s});
     surf.as<ICompositionDrawingSurfaceInterop>()->Resize({wPx, hPx});
     if (st == St::Open && api->onResized) api->onResized();
 }
@@ -1140,6 +1136,12 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
     const bool darkTheme = theme::Dark();
     dc->CreateGradientStopCollection(gs, 2, stops.put());
     dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}), stops.get(), lg.put());
+    // Thickness: the tile's edge is lit along the top and shaded along the bottom (static, drawn once).
+    winrt::com_ptr<ID2D1GradientStopCollection> edgeStops;
+    winrt::com_ptr<ID2D1LinearGradientBrush> edge;
+    D2D1_GRADIENT_STOP es[4] = {{0.0f, ColorF(1, 1, 1, 0.16f)}, {0.35f, ColorF(1, 1, 1, 0)}, {0.7f, ColorF(0, 0, 0, 0)}, {1.0f, ColorF(0, 0, 0, 0.18f)}};
+    dc->CreateGradientStopCollection(es, 4, edgeStops.put());
+    dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}), edgeStops.get(), edge.put());
 
     auto box = [&](D2D1_RECT_F r, float rad, D2D1_COLOR_F c) {
         br->SetColor(c);
@@ -1163,6 +1165,9 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             return;
         }
         dc->DrawRoundedRectangle(D2D1::RoundedRect({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, rad, rad), br.get(), 1.0f);
+        edge->SetStartPoint({0, r.top});
+        edge->SetEndPoint({0, r.bottom});
+        dc->DrawRoundedRectangle(D2D1::RoundedRect({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, rad, rad), edge.get(), 1.0f);
     };
     auto txt = [&](std::wstring const& t, IDWriteTextFormat* f, D2D1_RECT_F r, D2D1_COLOR_F c) {
         br->SetColor(c);
@@ -1379,16 +1384,16 @@ void ControlCenter::Impl::BuildFonts() {
     const auto L = DWRITE_TEXT_ALIGNMENT_LEADING, C = DWRITE_TEXT_ALIGNMENT_CENTER, T = DWRITE_TEXT_ALIGNMENT_TRAILING;
     const auto N = DWRITE_PARAGRAPH_ALIGNMENT_NEAR, M = DWRITE_PARAGRAPH_ALIGNMENT_CENTER;
     const auto SB = DWRITE_FONT_WEIGHT_SEMI_BOLD, R = DWRITE_FONT_WEIGHT_NORMAL;
-    mk(fTitle, L"Segoe UI Variable Text", SB, 13, L, M);
-    mk(fSub, L"Segoe UI Variable Text", R, 11.5f, L, M);
-    mk(fSubR, L"Segoe UI Variable Text", R, 11.5f, T, M);
+    mk(fTitle, L"Segoe UI Variable Text", SB, 14, L, M);
+    mk(fSub, L"Segoe UI Variable Text", R, 12, L, M);
+    mk(fSubR, L"Segoe UI Variable Text", R, 12, T, M);
     mk(fBatt, L"Segoe UI Variable Text", SB, 14, L, M);
     mk(fIcon, L"Segoe Fluent Icons", R, 18, C, M);
     mk(fIconS, L"Segoe Fluent Icons", R, 14, C, M);
-    mk(fCap, L"Segoe UI Variable Text", R, 11, C, N);
+    mk(fCap, L"Segoe UI Variable Text", R, 12, C, N);
     mk(fTime, L"Segoe UI Variable Display", SB, 34, L, N);
     mk(fDate, L"Segoe UI Variable Text", R, 12, L, N);
-    mk(fBtn, L"Segoe UI Variable Text", SB, 12.5f, C, M);
+    mk(fBtn, L"Segoe UI Variable Text", SB, 14, C, M);
 }
 
 // Same recipe as the dock pill (Halo::BuildPill): blurred backdrop, #16161A tint at 50%, 2.5% grain,
@@ -1514,6 +1519,22 @@ void ControlCenter::Impl::BuildVisuals() {
         edge.StrokeThickness(t);
         rimVisual.Shapes().Append(edge);
     }
+    // A specular line just inside the rim along the top: light catching the glass's thickness. Static.
+    auto spec = comp.CreateRoundedRectangleGeometry();
+    spec.Offset({t * 1.5f, t * 1.5f});
+    spec.CornerRadius({kRadius * s - t * 1.5f, kRadius * s - t * 1.5f});
+    spec.Size({wPx - 3 * t, hPx - 3 * t});
+    auto sheen = comp.CreateLinearGradientBrush();
+    sheen.MappingMode(wuc::CompositionMappingMode::Absolute);
+    sheen.StartPoint({0, 0});
+    sheen.EndPoint({0, 72 * s});  // fixed depth, so it does not stretch with the panel's height
+    sheen.ColorStops().Append(comp.CreateColorGradientStop(0.0f, winrt::Windows::UI::ColorHelper::FromArgb(theme::Dark() ? 0x38 : 0x80, 0xFF, 0xFF, 0xFF)));
+    sheen.ColorStops().Append(comp.CreateColorGradientStop(1.0f, winrt::Windows::UI::ColorHelper::FromArgb(0, 0xFF, 0xFF, 0xFF)));
+    auto specShape = comp.CreateSpriteShape(spec);
+    specShape.StrokeBrush(sheen);
+    specShape.StrokeThickness(t);
+    rimVisual.Shapes().Append(specShape);
+    specGeo = spec;
     inner.Children().InsertAtTop(rimVisual);
 
     chipLayer = comp.CreateContainerVisual();
@@ -1537,15 +1558,19 @@ ControlCenter::ControlCenter(HINSTANCE inst, HWND owner, wuc::Compositor comp, w
     // Whether the display has a brightness control is learned off-thread; learn it now, not on the first
     // open, or the Display slider turns up mid-open and the panel grows under the pointer.
     svc::brightness::Probe(m->hot, 0);
+    // Now Playing is followed all the time (GSMTC only calls back on changes), so the media tile is
+    // already right when the panel opens instead of arriving a moment later.
+    m->media.Start(m->hot, kMsgMedia, [p = m.get()] { if (p->st == Impl::St::Open) p->Render(); });
 }
 
 ControlCenter::~ControlCenter() {
+    m->media.Stop();
     m->Teardown();
     if (m->hot) DestroyWindow(m->hot);
 }
 
 void ControlCenter::Toggle() { IsOpen() ? Close() : Open(); }
-void ControlCenter::Open(bool byPointer, bool fromRight) { m->Open(byPointer, fromRight); }
+void ControlCenter::Open(bool byPointer) { m->Open(byPointer); }
 void ControlCenter::Close() { m->Close(); }
 bool ControlCenter::IsOpen() const { return m->st == Impl::St::Open; }
 // The panel itself (physical px), not the padded window.

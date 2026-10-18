@@ -10,10 +10,7 @@ namespace halo::edge {
 namespace {
 
 constexpr UINT kCornerDwellMs = 120;   // resting in the hot zone this long opens the Control Center
-constexpr float kZone = 0.2f;          // the hot zone: this fraction of the top edge (from the right) and of the right edge (from the top)
-constexpr DWORD kPushMs = 140;        // how long the pointer must keep pushing into the right edge
-constexpr int kPushEvents = 6;        // ... and in how many move events
-constexpr DWORD kPushGapMs = 70;      // a pause longer than this means the hand stopped: start over
+constexpr float kZone = 0.2f;          // the hot zone: this fraction of the bottom edge, from the right
 constexpr DWORD kCooldownMs = 700;    // after a gesture fires
 constexpr float kNearBand = 160;      // logical px from an edge where the strips turn click-through
 constexpr float kStrip = 4;           // touch strip thickness, logical px
@@ -40,20 +37,11 @@ void Fire(WPARAM which) { PostMessageW(g_target, g_msg, which, 0); }
 struct Mouse {
     bool inCorner = false;
     UINT_PTR cornerTimer = 0;
-    POINT last{-1, -1};
-    DWORD pushStart = 0, lastPush = 0, cooldownUntil = 0;
-    int pushEvents = 0, pushDy = 0;
+    DWORD cooldownUntil = 0;
 } g_m;
 
-// The right fifth of the top edge (kTop: the Control Center alone), or the top fifth of the right edge
-// (kRight: the Control Center with the notification column). 0: neither.
-WPARAM Zone(POINT p) {
-    const long w = g_rightX - g_left, h = g_bottom - g_topY;
-    if (p.y <= g_topY + 1 && p.x >= g_rightX - static_cast<long>(w * kZone)) return kTop;
-    if (p.x >= g_rightX - 1 && p.y <= g_topY + static_cast<long>(h * kZone)) return kRight;
-    return 0;
-}
-bool InCorner(POINT p) { return Zone(p) != 0; }
+// The right fifth of the bottom edge, where the Windows taskbar keeps Quick Settings.
+bool InCorner(POINT p) { return p.y >= g_bottom - 1 && p.x >= g_rightX - static_cast<long>((g_rightX - g_left) * kZone); }
 
 void CALLBACK CornerTimer(HWND, UINT, UINT_PTR id, DWORD) {
     KillTimer(nullptr, id);
@@ -61,7 +49,7 @@ void CALLBACK CornerTimer(HWND, UINT, UINT_PTR id, DWORD) {
     POINT p;
     if (g_m.inCorner && GetCursorPos(&p) && InCorner(p) && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
         g_m.cooldownUntil = GetTickCount() + kCooldownMs;
-        Fire(Zone(p));
+        Fire(kBottom);
     }
 }
 
@@ -86,26 +74,6 @@ void OnMove(POINT p, DWORD t) {
         CancelCorner();
     }
 
-    // The hook sees every move report, even once the cursor is pinned against the edge, so a hand
-    // that keeps pushing right produces a run of reports at the edge with almost no vertical travel.
-    const bool atEdge = p.x >= g_rightX - 1 && !InCorner(p);
-    const bool wasAtEdge = g_m.last.x >= g_rightX - 1;
-    if (atEdge && wasAtEdge && !cooling) {
-        if (!g_m.pushEvents || t - g_m.lastPush > kPushGapMs) { g_m.pushEvents = 0; g_m.pushDy = 0; g_m.pushStart = t; }
-        g_m.pushEvents++;
-        g_m.pushDy += std::abs(p.y - g_m.last.y);
-        g_m.lastPush = t;
-        if (g_m.pushDy > 24) {
-            g_m.pushEvents = 0;  // sliding along the edge (a scrollbar drag), not pushing into it
-        } else if (g_m.pushEvents >= kPushEvents && t - g_m.pushStart >= kPushMs) {
-            g_m.pushEvents = 0;
-            g_m.cooldownUntil = t + kCooldownMs;
-            Fire(kRight);
-        }
-    } else if (!atEdge) {
-        g_m.pushEvents = 0;
-    }
-    g_m.last = p;
 }
 
 LRESULT CALLBACK MouseHook(int code, WPARAM w, LPARAM l) {
@@ -113,7 +81,7 @@ LRESULT CALLBACK MouseHook(int code, WPARAM w, LPARAM l) {
         auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(l);
         if ((m->dwExtraInfo & kTouchSignatureMask) != kTouchSignature) {  // touch and pen: the strips
             if (w == WM_MOUSEMOVE) OnMove(m->pt, m->time);
-            else if (w == WM_LBUTTONDOWN || w == WM_RBUTTONDOWN) { CancelCorner(); g_m.pushEvents = 0; }
+            else if (w == WM_LBUTTONDOWN || w == WM_RBUTTONDOWN) CancelCorner();
         }
     }
     return CallNextHookEx(nullptr, code, w, l);

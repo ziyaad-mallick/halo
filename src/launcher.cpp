@@ -92,7 +92,7 @@ constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
 constexpr int kMaxApps = 6, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
 constexpr UINT_PTR kRefreshTimer = 1;
-constexpr float kPanelRadius = 24;  // local: theme.h has no panel-radius token
+constexpr float kPanelRadius = 28;  // local: theme.h has no panel-radius token
 // Icon motion, matched to the dock: hover swells and lifts on a spring, a press squashes, a click bounces.
 constexpr float kHoverScale = 1.18f, kHoverLift = 3, kPressScale = 0.94f, kBounceRise = 8;
 constexpr float kHoverDamping = 0.6f;
@@ -951,7 +951,7 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
     const float dy = oy - m_bodyTop;
     auto at = [&](D2D1_RECT_F r) { return R(r.left + ox, r.top + dy, r.right + ox, r.bottom + dy); };
 
-    auto fLabel = txt.Format(L"Segoe UI Variable Text", 11 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    auto fLabel = txt.Format(L"Segoe UI Variable Text", 12 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     auto fRow = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
     auto fName = txt.Format(L"Segoe UI Variable Text", 12 * s, DWRITE_FONT_WEIGHT_NORMAL);
 

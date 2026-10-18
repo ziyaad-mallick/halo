@@ -167,7 +167,7 @@ private:
     void OpenLauncher();
     // Control Center + notifications + calendar are one column on the primary monitor, opened, toggled and
     // closed together: Win+A, Win+N, the edge gestures and the test messages all come through here.
-    void OpenPanel(bool byPointer = false, bool withNotifs = true, bool fromRight = false);
+    void OpenPanel(bool byPointer = false, bool withNotifs = true);
     void ClosePanel();
     void TogglePanel() { if (m_cc && m_cc->IsOpen()) ClosePanel(); else OpenPanel(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
@@ -1046,12 +1046,12 @@ LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return self ? self->OnMessage(m, w, l) : DefWindowProcW(h, m, w, l);
 }
 
-// withNotifs: the notification column comes too (Win+A, the right edge); the top edge brings the Control
-// Center alone, and moving on to the right edge then adds the column.
-void Halo::OpenPanel(bool byPointer, bool withNotifs, bool fromRight) {
+// withNotifs: the notification column comes too, stacked above it (Win+A / Win+N, touch); the bottom-right
+// corner brings the Control Center alone.
+void Halo::OpenPanel(bool byPointer, bool withNotifs) {
     if (!m_cc) return;
     if (!m_cc->IsOpen()) {
-        m_cc->Open(byPointer, fromRight);
+        m_cc->Open(byPointer);
         if (!m_cc->IsOpen()) return;
         Log(L"panel: opened");
     } else if (!withNotifs || (m_notif && m_notif->IsOpen())) {
@@ -1130,8 +1130,8 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             halo::edge::OnDisplayChange();
             return 0;
         case kMsgEdge:
-            Log(w == halo::edge::kTop ? L"edge: top" : L"edge: right");
-            OpenPanel(true, w == halo::edge::kRight, w == halo::edge::kRight);
+            Log(w == halo::edge::kBottom ? L"edge: bottom right" : w == halo::edge::kTop ? L"edge: top" : L"edge: right");
+            OpenPanel(true, w != halo::edge::kBottom);  // the bottom-right corner: Quick Settings alone
             return 0;
         case WM_TIMER:
             if (w == kHideTimer) {
