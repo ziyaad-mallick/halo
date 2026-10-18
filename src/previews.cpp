@@ -1,3 +1,4 @@
+#include "theme.h"
 #include "previews.h"
 
 #include <windows.ui.composition.interop.h>
@@ -161,7 +162,7 @@ bool Previews::Show(std::vector<HWND> const& windows, int centerX, int pillTop, 
     m_plateShape.CornerRadius({12 * s, 12 * s});
     m_plateShape.Size({cardW, cardH});
     auto sprite = m_comp.CreateSpriteShape(m_plateShape);
-    sprite.FillBrush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x24, 0xFF, 0xFF, 0xFF)));
+    sprite.FillBrush(m_comp.CreateColorBrush(winrt::Windows::UI::Color{static_cast<uint8_t>(halo::theme::P().line.a*255+0.5f),static_cast<uint8_t>(halo::theme::P().line.r*255+0.5f),static_cast<uint8_t>(halo::theme::P().line.g*255+0.5f),static_cast<uint8_t>(halo::theme::P().line.b*255+0.5f)}));
     m_plate = m_comp.CreateShapeVisual();
     m_plate.Size({cardW, cardH});
     m_plate.Shapes().Append(sprite);
@@ -191,7 +192,7 @@ bool Previews::Show(std::vector<HWND> const& windows, int centerX, int pillTop, 
             DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
             fmt->SetTrimming(&trim, sign.get());
             winrt::com_ptr<ID2D1SolidColorBrush> brush;
-            dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.92f), brush.put());
+            dc->CreateSolidColorBrush(halo::theme::P().text, brush.put());
             for (auto const& c : m_cards) {
                 D2D1_RECT_F r = D2D1::RectF(off.x + c.card.left + kCardPad * s, off.y + c.card.top + kCardPad * s,
                                             off.x + c.card.right - (kCardPad + kCloseSize + 2) * s,
@@ -221,8 +222,8 @@ bool Previews::Show(std::vector<HWND> const& windows, int centerX, int pillTop, 
         try {
             dc->Clear(D2D1::ColorF(0, 0.0f));
             winrt::com_ptr<ID2D1SolidColorBrush> disc, ink;
-            dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.20f), disc.put());
-            dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.95f), ink.put());
+            dc->CreateSolidColorBrush(halo::theme::A(halo::theme::P().text, 0.15f), disc.put());
+            dc->CreateSolidColorBrush(halo::theme::P().text, ink.put());
             float cx = off.x + d / 2, cy = off.y + d / 2, a = d * 0.28f;
             dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), d / 2, d / 2), disc.get());
             dc->DrawLine({cx - a, cy - a}, {cx + a, cy + a}, ink.get(), 1.4f * s);

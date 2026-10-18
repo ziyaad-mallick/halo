@@ -12,6 +12,7 @@
 //
 // Drawn cleanly into a CompositionDrawingSurface using DirectWrite and Direct2D.
 
+#include "theme.h"
 #include <windows.h>
 #include <d2d1_1.h>
 #include <dwrite.h>
@@ -370,19 +371,19 @@ private:
                             offset.x + pillW - 0.5f, offset.y + pillH - 0.5f),
                 radius, radius);
 
-            // Dark frosted glass fill: #16161A at 88% alpha
+            // Frosted label fill (theme labelBg)
             winrt::com_ptr<ID2D1SolidColorBrush> bgBrush;
-            dc->CreateSolidColorBrush(D2D1::ColorF(0x16161A, 0.88f), bgBrush.put());
+            dc->CreateSolidColorBrush(halo::theme::P().labelBg, bgBrush.put());
             dc->FillRoundedRectangle(rrect, bgBrush.get());
 
-            // 1px rim stroke: white at 18% alpha
+            // 1px rim stroke (theme labelRim)
             winrt::com_ptr<ID2D1SolidColorBrush> rimBrush;
-            dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f), rimBrush.put());
+            dc->CreateSolidColorBrush(halo::theme::P().labelRim, rimBrush.put());
             dc->DrawRoundedRectangle(rrect, rimBrush.get(), 1.0f);
 
-            // Text fill: crisp white at 95% alpha
+            // Text fill (theme labelText)
             winrt::com_ptr<ID2D1SolidColorBrush> textBrush;
-            dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), textBrush.put());
+            dc->CreateSolidColorBrush(halo::theme::P().labelText, textBrush.put());
             D2D1_POINT_2F textOrigin = D2D1::Point2F(static_cast<float>(offset.x) + padX,
                                                     static_cast<float>(offset.y) + padY);
             dc->DrawTextLayout(textOrigin, layout.get(), textBrush.get());
