@@ -1,7 +1,8 @@
 // Screen-edge gestures on the primary monitor, for the Control Center and the Notification Center.
 //
 // Mouse (a WH_MOUSE_LL hook on its own thread; a few comparisons per move, no polling):
-//   - resting in the top-right corner for kCornerDwellMs without clicking -> kTop
+//   - resting in the hot zone (the right fifth of the top edge, the top fifth of the right edge)
+//     for kCornerDwellMs without clicking                              -> kTop
 //   - pushing on into the right edge after the pointer has reached it    -> kRight
 // Touch (two invisible strips, top edge and right edge, that only ever see touch and pen: whenever
 // a real mouse comes near an edge they turn click-through, so they never steal a mouse click):

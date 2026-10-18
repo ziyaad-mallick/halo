@@ -1,9 +1,10 @@
 // Shared colour tokens for every Halo surface (dock, cluster, labels,
 // previews, launcher, Control Center, notifications).
 //
-// Light ("airy") is the default: frosted white glass, dark ink, a hairline
-// outer edge and a soft shadow. HALO_THEME=dark brings back the original
-// #16161A@50% liquid glass. Read once per process.
+// Follows the Windows app mode (Settings > Personalization > Colors): light is
+// frosted white glass, dark ink, a hairline outer edge and a soft shadow; dark
+// is the original #16161A@50% liquid glass. HALO_THEME=light|dark overrides.
+// Read once per process.
 #pragma once
 #include <windows.h>
 #include <cstdint>
@@ -18,7 +19,11 @@ struct Argb { uint8_t a, r, g, b; };
 inline bool Dark() {
     static const bool dark = [] {
         wchar_t v[16] = {};
-        return GetEnvironmentVariableW(L"HALO_THEME", v, 16) && _wcsicmp(v, L"dark") == 0;
+        if (GetEnvironmentVariableW(L"HALO_THEME", v, 16)) return _wcsicmp(v, L"dark") == 0;
+        DWORD light = 1, size = sizeof(light);
+        RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+        return light == 0;
     }();
     return dark;
 }

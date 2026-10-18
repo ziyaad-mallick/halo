@@ -167,7 +167,7 @@ private:
     void OpenLauncher();
     // Control Center + notifications + calendar are one column on the primary monitor, opened, toggled and
     // closed together: Win+A, Win+N, the edge gestures and the test messages all come through here.
-    void OpenPanel();
+    void OpenPanel(bool byPointer = false);
     void ClosePanel();
     void TogglePanel() { if (m_cc && m_cc->IsOpen()) ClosePanel(); else OpenPanel(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
@@ -1055,9 +1055,9 @@ LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return self ? self->OnMessage(m, w, l) : DefWindowProcW(h, m, w, l);
 }
 
-void Halo::OpenPanel() {
+void Halo::OpenPanel(bool byPointer) {
     if (!m_cc || m_cc->IsOpen()) return;
-    m_cc->Open();
+    m_cc->Open(byPointer);
     if (!m_cc->IsOpen()) return;
     Log(L"panel: opened");
     if (m_notif) {
@@ -1134,7 +1134,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case kMsgEdge:
             Log(w == halo::edge::kTop ? L"edge: top" : L"edge: right");
-            OpenPanel();  // kTop and kRight alike
+            OpenPanel(true);  // kTop and kRight alike
             return 0;
         case WM_TIMER:
             if (w == kHideTimer) {

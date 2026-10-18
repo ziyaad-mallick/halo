@@ -15,7 +15,9 @@ public:
                   winrt::Windows::UI::Composition::CompositionGraphicsDevice gdev);
     ~ControlCenter();
     void Toggle();
-    void Open();
+    // byPointer: opened from the screen edge. It shows without taking the keyboard and hides on its own
+    // once the pointer leaves it (a keyboard-opened panel hides once the pointer has been over it and left).
+    void Open(bool byPointer = false);
     void Close();
     bool IsOpen() const;
 

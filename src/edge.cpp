@@ -9,7 +9,8 @@
 namespace halo::edge {
 namespace {
 
-constexpr UINT kCornerDwellMs = 220;
+constexpr UINT kCornerDwellMs = 120;   // resting in the hot zone this long opens the Control Center
+constexpr float kZone = 0.2f;          // the hot zone: this fraction of the top edge (from the right) and of the right edge (from the top)
 constexpr DWORD kPushMs = 140;        // how long the pointer must keep pushing into the right edge
 constexpr int kPushEvents = 6;        // ... and in how many move events
 constexpr DWORD kPushGapMs = 70;      // a pause longer than this means the hand stopped: start over
@@ -44,7 +45,12 @@ struct Mouse {
     int pushEvents = 0, pushDy = 0;
 } g_m;
 
-bool InCorner(POINT p) { return p.x >= g_rightX - 2 && p.y <= g_topY + 1; }
+// The right fifth of the top edge, or the top fifth of the right edge.
+bool InCorner(POINT p) {
+    const long w = g_rightX - g_left, h = g_bottom - g_topY;
+    return (p.y <= g_topY + 1 && p.x >= g_rightX - static_cast<long>(w * kZone)) ||
+           (p.x >= g_rightX - 1 && p.y <= g_topY + static_cast<long>(h * kZone));
+}
 
 void CALLBACK CornerTimer(HWND, UINT, UINT_PTR id, DWORD) {
     KillTimer(nullptr, id);
@@ -79,7 +85,7 @@ void OnMove(POINT p, DWORD t) {
 
     // The hook sees every move report, even once the cursor is pinned against the edge, so a hand
     // that keeps pushing right produces a run of reports at the edge with almost no vertical travel.
-    const bool atEdge = p.x >= g_rightX - 1 && p.y > g_topY + 1;
+    const bool atEdge = p.x >= g_rightX - 1 && !InCorner(p);
     const bool wasAtEdge = g_m.last.x >= g_rightX - 1;
     if (atEdge && wasAtEdge && !cooling) {
         if (!g_m.pushEvents || t - g_m.lastPush > kPushGapMs) { g_m.pushEvents = 0; g_m.pushDy = 0; g_m.pushStart = t; }
