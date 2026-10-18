@@ -1,6 +1,7 @@
 #define SECURITY_WIN32
 #include "launcher.h"
 #include "motion.h"
+#include "theme.h"
 #include "winkey.h"
 
 #include <windows.ui.composition.interop.h>
@@ -63,6 +64,12 @@ constexpr int kMaxApps = 8, kMaxFiles = 6, kKeepApps = 12;
 constexpr int kGraceMs = 800;     // how long Command Palette has to take the keyboard
 constexpr UINT_PTR kRefreshTimer = 1;
 constexpr UINT_PTR kStackTimer = 2;
+constexpr float kPanelRadius = 24;  // local: theme.h has no panel-radius token
+
+inline winrt::Windows::UI::Color Col(D2D1_COLOR_F c) {
+    auto b = [](float v) { return static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    return winrt::Windows::UI::ColorHelper::FromArgb(b(c.a), b(c.r), b(c.g), b(c.b));
+}
 
 constexpr wchar_t kMenuItems[5][10] = {L"Sleep", L"Restart", L"Shut down", L"Lock", L"Sign out"};
 
@@ -431,7 +438,7 @@ void Launcher::Build() {
     }
 
     // Two columns: the apps grid (4 x 2) and the files, a hairline between, the user row under both.
-    float gridY = 20 + kLabelH + 6, gapDiv = 12;
+    float gridY = 24 + kLabelH + 8, gapDiv = 16;
     float rowH = kRowH, pitchY = kGridPitchY, bottomH = kBottomH;
     size_t shown = kMaxFiles;
     auto heightFor = [&] { return gridY + std::max(2 * pitchY, shown * rowH) + gapDiv + 1 + bottomH; };
@@ -525,7 +532,7 @@ void Launcher::Build() {
     m_panel.Size({m_w, m_h});
     m_panel.Offset({0, kTop * s, 0});
     auto clip = m_comp.CreateRoundedRectangleGeometry();
-    clip.CornerRadius({20 * s, 20 * s});
+    clip.CornerRadius({kPanelRadius * s, kPanelRadius * s});
     clip.Size({m_w, m_h});
     if (m_stackW > 0) {  // under the palette: square at the seam, rounded at the bottom
         clip.Offset({0, -40 * s});
@@ -543,10 +550,26 @@ void Launcher::Build() {
     m_content.Size({m_w, m_h});
     m_panel.Children().InsertAtTop(m_content);
 
+    {   // 1 px hairline around the panel (separates light glass from a light wallpaper); inset so the clip keeps all of it
+        const float t = std::max(1.0f, std::round(s));
+        auto edgeShape = m_comp.CreateRoundedRectangleGeometry();
+        float top = m_stackW > 0 ? -40 * s : 0;
+        edgeShape.Offset({t / 2, top + t / 2});
+        edgeShape.Size({m_w - t, m_h - top - t});
+        edgeShape.CornerRadius({kPanelRadius * s - t / 2, kPanelRadius * s - t / 2});
+        auto edgeSprite = m_comp.CreateSpriteShape(edgeShape);
+        edgeSprite.StrokeBrush(m_comp.CreateColorBrush(theme::C(theme::P().edge)));
+        edgeSprite.StrokeThickness(t);
+        auto edge = m_comp.CreateShapeVisual();
+        edge.Size({m_w, m_h});
+        edge.Shapes().Append(edgeSprite);
+        m_panel.Children().InsertAtTop(edge);
+    }
+
     auto plate = [&](wuc::CompositionRoundedRectangleGeometry& shape) {
         shape = m_comp.CreateRoundedRectangleGeometry();
         auto sprite = m_comp.CreateSpriteShape(shape);
-        sprite.FillBrush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x24, 0xFF, 0xFF, 0xFF)));
+        sprite.FillBrush(m_comp.CreateColorBrush(Col(theme::P().fillHover)));
         auto v = m_comp.CreateShapeVisual();
         v.Size({m_w, m_h});
         v.Shapes().Append(sprite);
@@ -589,7 +612,7 @@ void Launcher::Build() {
     m_menu.Opacity(0.0f);
     m_menu.IsVisible(false);
     auto menuClip = m_comp.CreateRoundedRectangleGeometry();
-    menuClip.CornerRadius({16 * s, 16 * s});
+    menuClip.CornerRadius({18 * s, 18 * s});
     menuClip.Size({m_menuW, m_menuH});
     m_menu.Clip(m_comp.CreateGeometricClip(menuClip));
     if (m_host.glass) {
@@ -599,7 +622,10 @@ void Launcher::Build() {
         // Over the panel's own text the dock's 50% tint is not enough; the backdrop is the desktop, not the panel.
         auto veil = m_comp.CreateSpriteVisual();
         veil.Size({m_menuW, m_menuH});
-        veil.Brush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0xB0, 0x16, 0x16, 0x1A)));
+        // theme::P().veil is the full-screen dim; this one frosts the menu, so it follows the glass tint.
+        auto const& tp = theme::P();
+        veil.Brush(m_comp.CreateColorBrush(theme::Dark() ? theme::C({0xB0, 0x16, 0x16, 0x1A})
+                                                          : theme::C({0xD8, tp.tint.r, tp.tint.g, tp.tint.b})));
         m_menu.Children().InsertAtTop(veil);
     }
     m_menuHover = plate(m_menuHoverShape);
@@ -630,24 +656,25 @@ void Launcher::DrawPanel(ID2D1DeviceContext* dc, float ox, float oy) {
     dc->Clear(D2D1::ColorF(0, 0.0f));
     dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
-    winrt::com_ptr<ID2D1SolidColorBrush> white, soft, dim, line;
-    dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), white.put());
-    dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.85f), soft.put());
-    dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.50f), dim.put());
-    dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.12f), line.put());
+    auto const& pal = theme::P();
+    winrt::com_ptr<ID2D1SolidColorBrush> white, soft, dim, line;  // "white" = primary ink
+    dc->CreateSolidColorBrush(pal.text, white.put());
+    dc->CreateSolidColorBrush(pal.textSoft, soft.put());
+    dc->CreateSolidColorBrush(pal.dim, dim.put());
+    dc->CreateSolidColorBrush(pal.line, line.put());
     auto at = [&](D2D1_RECT_F r) { return R(r.left + ox, r.top + oy, r.right + ox, r.bottom + oy); };
 
-    auto fLabel = txt.Format(L"Segoe UI Variable Text", 12 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    auto fLabel = txt.Format(L"Segoe UI Variable Text", 11 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     auto fRow = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
     auto fName = txt.Format(L"Segoe UI Variable Text", 14 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     auto fGlyph = txt.Format(L"Segoe Fluent Icons", 16 * s, DWRITE_FONT_WEIGHT_NORMAL);
     auto fChevron = txt.Format(L"Segoe Fluent Icons", 10 * s, DWRITE_FONT_WEIGHT_NORMAL);
 
-    txt.Draw(dc, L"Recent apps", fLabel.get(), at(m_appsLabel), dim.get());
+    txt.Draw(dc, L"RECENT APPS", fLabel.get(), at(m_appsLabel), dim.get());
     if (m_apps.empty())
         txt.Draw(dc, L"Apps you open show up here", fRow.get(),
                  at(R(m_appsLabel.left, m_appsLabel.bottom + 4 * s, m_appsLabel.right, m_appsLabel.bottom + 44 * s)), dim.get());
-    txt.Draw(dc, L"Recent files", fLabel.get(), at(m_filesLabel), dim.get());
+    txt.Draw(dc, L"RECENT FILES", fLabel.get(), at(m_filesLabel), dim.get());
     if (m_files.empty())
         txt.Draw(dc, L"No recent files", fRow.get(),
                  at(R(m_filesLabel.left, m_filesLabel.bottom + 6 * s, m_filesLabel.right, m_filesLabel.bottom + (6 + kRowH) * s)),
@@ -702,11 +729,13 @@ void Launcher::DrawPanel(ID2D1DeviceContext* dc, float ox, float oy) {
     }
     if (!drew) {
         winrt::com_ptr<ID2D1SolidColorBrush> fill;
-        dc->CreateSolidColorBrush(D2D1::ColorF(0x4C6FE0, 1.0f), fill.put());
+        dc->CreateSolidColorBrush(pal.accent, fill.put());
         dc->FillEllipse(circle(av), fill.get());
         auto fInitial = txt.Format(L"Segoe UI Variable Text", 15 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         std::wstring initial = m_user.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(std::towupper(m_user[0])));
-        txt.Draw(dc, initial, fInitial.get(), av, white.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        winrt::com_ptr<ID2D1SolidColorBrush> onAccent;
+        dc->CreateSolidColorBrush(pal.onAccent, onAccent.put());
+        txt.Draw(dc, initial, fInitial.get(), av, onAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     // A hairline ring so a dark picture still has an edge on dark glass.
     dc->DrawEllipse(circle(av), line.get(), 1.0f);
@@ -732,7 +761,7 @@ void Launcher::DrawMenu(ID2D1DeviceContext* dc, float ox, float oy) {
     dc->Clear(D2D1::ColorF(0, 0.0f));
     dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     winrt::com_ptr<ID2D1SolidColorBrush> white;
-    dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), white.put());
+    dc->CreateSolidColorBrush(theme::P().text, white.put());
     auto fRow = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
     for (int i = 0; i < 5; i++) {
         auto r = m_menuRows[i];
@@ -1020,10 +1049,10 @@ void Launcher::OnHover(float x, float y) {
         Highlight(nullptr, 0, true);
     } else if (hit->kind == Kind::MenuItem) {
         auto r = m_menuRows[hit->index];
-        Highlight(&r, 8, true);
+        Highlight(&r, 10, true);
     } else {
         D2D1_RECT_F r = hit->r;
-        Highlight(&r, hit->kind == Kind::File ? 8 : 10, false);
+        Highlight(&r, hit->kind == Kind::File ? 10 : 14, false);
         if (m_menuOpen) Highlight(nullptr, 0, true);
     }
 }
