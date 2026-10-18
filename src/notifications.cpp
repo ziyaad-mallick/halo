@@ -32,6 +32,7 @@
 #include "icons.h"
 #include "motion.h"
 #include "services.h"
+#include "theme.h"
 
 #ifndef HALO_COMPOSITION_INTEROP_DEFINED
 #define HALO_COMPOSITION_INTEROP_DEFINED
@@ -74,7 +75,43 @@ constexpr UINT kMsgData = WM_APP + 1;
 constexpr UINT_PTR kTimerGone = 1, kTimerClose = 2;
 constexpr wchar_t kClass[] = L"HaloNotifications", kMsgClass[] = L"HaloNotificationsMsg";
 
-const D2D1_COLOR_F kText = ColorF(1, 1, 1, 0.94f), kDim = ColorF(1, 1, 1, 0.58f);
+const D2D1_COLOR_F kText = theme::P().text, kDim = theme::P().dim;
+// A subtle wash over glass: white-alpha in dark, a fainter ink wash in light.
+D2D1_COLOR_F Wash(float darkAlpha) { return theme::Dark() ? ColorF(1, 1, 1, darkAlpha) : ColorF(0, 0, 0, darkAlpha * 0.5f); }
+
+// A soft drop shadow that follows a rounded-rect mask. Lives under the clipped glass, so it
+// must be a sibling of the clipped container, not a child.
+wuc::SpriteVisual MakeShadow(wuc::Compositor const& comp, wuc::CompositionGraphicsDevice const& gdev, float wPx, float hPx,
+                             float radPx, float blur, float dy, theme::Argb col) {
+    if (col.a == 0 || blur <= 0) return nullptr;
+    try {
+        auto surface = gdev.CreateDrawingSurface({wPx, hPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                                 winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+        auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
+        winrt::com_ptr<ID2D1DeviceContext> dc;
+        POINT off{};
+        if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) return nullptr;
+        dc->Clear(ColorF(0, 0.0f));
+        winrt::com_ptr<ID2D1SolidColorBrush> b;
+        dc->CreateSolidColorBrush(ColorF(1, 1, 1, 1), b.put());
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(off.x + 0.0f, off.y + 0.0f, off.x + wPx, off.y + hPx), radPx, radPx), b.get());
+        interop->EndDraw();
+        auto mask = comp.CreateSurfaceBrush(surface);
+        mask.Stretch(wuc::CompositionStretch::Fill);
+        auto sh = comp.CreateDropShadow();
+        sh.BlurRadius(blur);
+        sh.Color(theme::C(col));
+        sh.Offset({0, dy, 0});
+        sh.Mask(mask);
+        auto v = comp.CreateSpriteVisual();
+        v.Size({wPx, hPx});
+        v.Brush(mask);
+        v.Shadow(sh);
+        return v;
+    } catch (...) { return nullptr; }
+}
+
+
 
 struct IconPx {
     UINT w = 0, h = 0;
@@ -283,7 +320,7 @@ struct NotificationCenter::Impl {
     // calendar
     SYSTEMTIME today{};
     int calYear = 0, calMonth = 0;
-    D2D1_COLOR_F accent = ColorF(0.04f, 0.52f, 1.0f, 1);
+    D2D1_COLOR_F accent = theme::P().accent;
 
     winrt::com_ptr<IDWriteFactory> dw;
     winrt::com_ptr<IDWriteTextFormat> fApp, fTime, fTitle, fBody, fPill, fCount, fHead, fClear, fBig, fCalDow, fNav, fDay, fDayB, fDow;
@@ -800,7 +837,7 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
             float inset = (7.0f * i) * s;
             peek.Size({wPx - 2 * inset, 20 * s});
             peek.Offset({inset, hPx + (i == 1 ? 5.0f : 10.0f) * s - 20 * s, 0});
-            peek.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(i == 1 ? 0x30 : 0x1A, 0xFF, 0xFF, 0xFF)));
+            peek.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(theme::Dark() ? (i == 1 ? 0x30 : 0x1A) : (i == 1 ? 0x78 : 0x48), 0xFF, 0xFF, 0xFF)));
             auto g = comp.CreateRoundedRectangleGeometry();
             g.CornerRadius({kRadius * s, kRadius * s});
             g.Size(peek.Size());
@@ -809,6 +846,12 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
         }
     }
 
+    {
+        const float rr = (c.row.kind == K::Collapse || c.row.kind == K::More || c.row.kind == K::Header) ? c.row.h / 2 * s : kRadius * s;
+        auto col = theme::P().shadow;
+        col.a = static_cast<uint8_t>(col.a * 0.7f);
+        if (auto sh = MakeShadow(comp, gdev, wPx, hPx, rr, theme::P().shadowBlur * 0.5f * s, 3.0f * s, col)) c.outer.Children().InsertAtTop(sh);
+    }
     c.vis = comp.CreateContainerVisual();
     c.vis.Size({wPx, hPx});
     c.outer.Children().InsertAtTop(c.vis);
@@ -825,13 +868,13 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
 
     auto tint = comp.CreateSpriteVisual();
     tint.RelativeSizeAdjustment({1, 1});
-    tint.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x80, 0x16, 0x16, 0x1A)));
+    tint.Brush(comp.CreateColorBrush(theme::Dark() ? theme::C(theme::P().tint) : winrt::Windows::UI::ColorHelper::FromArgb(0xA0, 0xFF, 0xFF, 0xFF)));
     c.vis.Children().InsertAtTop(tint);
 
     if (noise) {
         auto n = comp.CreateSpriteVisual();
         n.RelativeSizeAdjustment({1, 1});
-        n.Opacity(0.025f);
+        n.Opacity(theme::P().noise);
         n.Brush(noise);
         c.vis.Children().InsertAtTop(n);
     }
@@ -860,12 +903,19 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
         gradient.ColorStops().Append(comp.CreateColorGradientStop(at, winrt::Windows::UI::ColorHelper::FromArgb(a, 0xFF, 0xFF, 0xFF)));
     };
     stop(0.0f, 0x70); stop(0.35f, 0x18); stop(0.7f, 0x0A); stop(1.0f, 0x26);
+    if (!theme::Dark()) { gradient.ColorStops().Clear(); for (auto [at, c] : {std::pair{0.0f, theme::P().rimTop}, {0.35f, theme::P().rimMid}, {0.7f, theme::P().rimLow}, {1.0f, theme::P().rimBottom}}) gradient.ColorStops().Append(comp.CreateColorGradientStop(at, theme::C(c))); }
     auto sprite = comp.CreateSpriteShape(c.rim);
     sprite.StrokeBrush(gradient);
     sprite.StrokeThickness(t);
     auto rimVisual = comp.CreateShapeVisual();
     rimVisual.RelativeSizeAdjustment({1, 1});
     rimVisual.Shapes().Append(sprite);
+    if (theme::P().edge.a) {  // hairline edge for light glass
+        auto edge = comp.CreateSpriteShape(c.rim);
+        edge.StrokeBrush(comp.CreateColorBrush(theme::C(theme::P().edge)));
+        edge.StrokeThickness(t);
+        rimVisual.Shapes().Append(edge);
+    }
     c.vis.Children().InsertAtTop(rimVisual);
 
     c.clip = comp.CreateRoundedRectangleGeometry();
@@ -890,7 +940,7 @@ void NotificationCenter::Impl::Draw(Card& c, bool hover, int part) {
         dc->CreateSolidColorBrush(kText, br.put());
         const bool interactive = r.kind == K::Notif || r.kind == K::Group || r.kind == K::Collapse;
         if (hover && interactive) {
-            br->SetColor(ColorF(1, 1, 1, 0.06f));
+            br->SetColor(theme::Dark() ? ColorF(1, 1, 1, 0.06f) : ColorF(1, 1, 1, 0.35f));
             dc->FillRectangle(D2D1::RectF(0, 0, kW, r.h), br.get());
         }
         switch (r.kind) {
@@ -921,7 +971,7 @@ void NotificationCenter::Impl::DrawHeader(ID2D1DeviceContext* dc, ID2D1SolidColo
     dc->DrawText(L"Notifications", 13, fHead.get(), D2D1::RectF(kPad + 4, 0, kW - 100, r.h), br);
     if (!Visible()) return;
     const D2D1_ROUNDED_RECT btn = D2D1::RoundedRect(D2D1::RectF(kW - kPad - 58, 7, kW - kPad + 2, r.h - 7), 12, 12);
-    br->SetColor(ColorF(1, 1, 1, part == 2 ? 0.26f : 0.12f));
+    br->SetColor(Wash(part == 2 ? 0.26f : 0.12f));
     dc->FillRoundedRectangle(btn, br);
     br->SetColor(kText);
     dc->DrawText(L"Clear", 5, fClear.get(), btn.rect, br);
@@ -941,7 +991,7 @@ void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColor
                 bb->SetInterpolationMode(D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                 bb->SetTransform(D2D1::Matrix3x2F::Scale(kIcon / ic->second.w, kIcon / ic->second.h) * D2D1::Matrix3x2F::Translation(ir.rect.left, ir.rect.top));
                 // plate behind transparent logos so they read on the dark glass
-                br->SetColor(ColorF(1, 1, 1, 0.10f));
+                br->SetColor(theme::Dark() ? ColorF(1, 1, 1, 0.10f) : ColorF(1, 1, 1, 0.85f));
                 dc->FillRoundedRectangle(ir, br);
                 dc->FillRoundedRectangle(ir, bb.get());
                 drawn = true;
@@ -953,7 +1003,7 @@ void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColor
         br->SetColor(ColorF(0.25f + (hsh & 0xFF) / 700.0f, 0.3f + ((hsh >> 8) & 0xFF) / 700.0f, 0.5f + ((hsh >> 16) & 0xFF) / 600.0f, 1));
         dc->FillRoundedRectangle(ir, br);
         std::wstring letter = r.n.app.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(towupper(r.n.app[0])));
-        br->SetColor(kText);
+        br->SetColor(theme::P().onAccent);
         dc->DrawText(letter.c_str(), 1, fPill.get(), ir.rect, br);
     }
 
@@ -973,21 +1023,21 @@ void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColor
         std::wstring cnt = std::to_wstring(r.count);
         float cw = 12.0f + 7.0f * cnt.size();
         D2D1_ROUNDED_RECT chip = D2D1::RoundedRect(D2D1::RectF(tx + appW + 6, kHeaderY + 0.5f, tx + appW + 6 + cw, kHeaderY + 15.5f), 7.5f, 7.5f);
-        br->SetColor(ColorF(1, 1, 1, 0.20f));
+        br->SetColor(Wash(0.20f));
         dc->FillRoundedRectangle(chip, br);
         br->SetColor(kText);
         dc->DrawText(cnt.c_str(), static_cast<UINT32>(cnt.size()), fCount.get(), chip.rect, br);
     }
     if (r.clearBtn) {  // the small text button, left of the time
         const D2D1_ROUNDED_RECT btn = D2D1::RoundedRect(D2D1::RectF(kW - kPad - 118, kHeaderY - 3, kW - kPad - 70, kHeaderY + 17), 10, 10);
-        br->SetColor(ColorF(1, 1, 1, clearHover ? 0.26f : 0.12f));
+        br->SetColor(Wash(clearHover ? 0.26f : 0.12f));
         dc->FillRoundedRectangle(btn, br);
         br->SetColor(kText);
         dc->DrawText(L"Clear", 5, fClear.get(), btn.rect, br);
     }
     if (hover) {
         const D2D1_POINT_2F ctr = D2D1::Point2F(kW - kPad - 9, kHeaderY + 8);
-        br->SetColor(ColorF(1, 1, 1, closeHover ? 0.32f : 0.16f));
+        br->SetColor(Wash(closeHover ? 0.32f : 0.16f));
         dc->FillEllipse(D2D1::Ellipse(ctr, 9, 9), br);
         br->SetColor(kText);
         dc->DrawLine(D2D1::Point2F(ctr.x - 3.2f, ctr.y - 3.2f), D2D1::Point2F(ctr.x + 3.2f, ctr.y + 3.2f), br, 1.4f);
@@ -1027,14 +1077,14 @@ void NotificationCenter::Impl::DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidCo
     // month nav
     SYSTEMTIME mo{};
     mo.wYear = static_cast<WORD>(calYear); mo.wMonth = static_cast<WORD>(calMonth); mo.wDay = 1;
-    br->SetColor(part == 5 ? kText : ColorF(1, 1, 1, 0.82f));
+    br->SetColor(part == 5 ? kText : theme::P().textSoft);
     if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &mo, L"MMMM yyyy", buf, 96, nullptr))
         dc->DrawText(buf, static_cast<UINT32>(wcslen(buf)), fNav.get(), D2D1::RectF(kPad, kCalHead, kW / 2 + 40, kCalHead + kCalNav), br);
     const float cy = kCalHead + kCalNav / 2;
     for (int d = 0; d < 2; ++d) {
         float cx = kW - kPad - 26 - 14 + d * 28 + 14 - 0;  // centres: prev at kW-kPad-40, next at kW-kPad-12
         cx = kW - kPad - 40 + d * 28;
-        br->SetColor(ColorF(1, 1, 1, part == 3 + d ? 0.22f : 0.0f));
+        br->SetColor(theme::A(Wash(0.22f), part == 3 + d ? 1.0f : 0.0f));
         dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 12, 12), br);
         br->SetColor(kText);
         float dir = d ? 1.0f : -1.0f;
@@ -1075,7 +1125,7 @@ void NotificationCenter::Impl::DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidCo
             dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cyy), std::min(12.0f, kCalRow / 2 - 1), std::min(12.0f, kCalRow / 2 - 1)), br);
         }
         std::wstring ds = std::to_wstring(day);
-        br->SetColor(isToday ? ColorF(1, 1, 1, 1) : inMonth ? kText : ColorF(1, 1, 1, 0.26f));
+        br->SetColor(isToday ? theme::P().onAccent : inMonth ? kText : theme::P().faint);
         dc->DrawText(ds.c_str(), static_cast<UINT32>(ds.size()), isToday ? fDayB.get() : fDay.get(),
                      D2D1::RectF(cx - cw / 2, cyy - kCalRow / 2, cx + cw / 2, cyy + kCalRow / 2), br);
     }
