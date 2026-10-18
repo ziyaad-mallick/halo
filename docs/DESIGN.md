@@ -162,6 +162,8 @@ dock, Start panel and Control Center. All colours now come from `src/theme.h`:
 frosted white glass (blur 40, tint #F8F8FB at 84%), dark ink (#1C1C1F), a 1px
 black-7% hairline outside the rim, and a soft shadow (black 18%, blur 28, y 8).
 Sizes are unchanged. `HALO_THEME=dark` restores the glass described above.
+Same day, later: the theme follows the Windows app mode instead (his system is dark, and the white
+panel read as wrong), and the Control Center and Start took the dock's hover lift and bounce.
 Halo is now the logon shell (HKCU Run → `%LOCALAPPDATA%\Halo\app\guardian.exe`;
 ship builds with `tools/install.ps1`), and Quiet Dock's Windhawk mods are disabled.
 
@@ -189,7 +191,7 @@ ship builds with `tools/install.ps1`), and Quiet Dock's Windhawk mods are disabl
 - Other CONTROL-CENTER.md defaults stand: keep Windows' notification banners, Do Not Disturb via
   IQuietHoursSettings with a Settings fallback.
 - **Shortcuts:** Win+Alt+T toggles Halo and the Windows taskbar (guardian); the Windows key alone
-  opens PowerToys Command Palette and reveals the dock.
+  opens Halo's Start panel (its own search; Command Palette is no longer used) and reveals the dock.
 
 ## Risks and open questions
 

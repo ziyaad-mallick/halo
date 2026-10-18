@@ -11,11 +11,11 @@ Status: **daily driver on one machine** (the author's login shell since 2026-10-
 - Frosted pill (host backdrop blur), 256px icons for pinned apps, click to launch
 - Magnification and a pill that grows with it, driven by compositor expressions
 - Auto-hide with a spring reveal
-- Light frosted theme by default (`HALO_THEME=dark` for the dark glass); all colours in `src/theme.h`
+- Follows the Windows light/dark app mode (`HALO_THEME=light|dark` overrides); all colours in `src/theme.h`
 - Halo's own pin list (`%LOCALAPPDATA%\Halo\pins.txt`, seeded once from the taskbar pins) and a right-click menu: open windows, Keep in Dock / Remove from Dock, Show in Explorer, Quit
 - Left status cluster (time, Wi-Fi, battery, Start), hover labels, live window previews, click-to-minimize, bounce on launch
-- Start panel (Win key): recent apps and files, power menu, stacked with the PowerToys Command Palette
-- Control Center (Win+A or the top-right corner): Wi-Fi/Bluetooth, toggles, brightness and volume, notifications and a calendar
+- Start panel (Win key): search bar (Start-menu apps + recent files), one row of recent apps, 12 recent files, avatar / Settings / Power
+- Control Center (Win+A, or resting on the right fifth of the top edge / top fifth of the right edge; auto-hides when the pointer leaves): Wi-Fi/Bluetooth, toggles, brightness and volume, notifications and a calendar
 - `guardian.exe` hides the Windows taskbar, runs the dock, and always gives the
   taskbar back: on exit, on a crash loop (3 crashes in 2 minutes), and after
   an explorer restart it hides the new taskbar again
@@ -50,8 +50,8 @@ build/guardian.exe --restore   # get the taskbar back if anything goes wrong
 - `guardian.exe --autostart on|off` adds/removes the `Halo` value under
   `HKCU\...\CurrentVersion\Run`.
 
-While Halo runs, tapping the Windows key alone opens PowerToys Command Palette
-(sends Win+Alt+Space) and reveals the dock instead of opening Start. Win+<key> combos are
+While Halo runs, tapping the Windows key alone opens Halo's Start panel
+and reveals the dock instead of opening Start. Win+<key> combos are
 untouched; Ctrl+Esc still opens Start. Set `HALO_TEST_WINKEY=1` to let injected Win presses
 count (for tests).
 
