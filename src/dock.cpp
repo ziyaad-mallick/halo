@@ -1,3 +1,4 @@
+#include "theme.h"
 #include "dock.h"
 #include "cluster.h"
 
@@ -87,7 +88,7 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
         const float ch = m_m.pillHeight * 0.6f;
         m_clusterDivider = m_compositor.CreateSpriteVisual();
         m_clusterDivider.Size({cw, ch});
-        m_clusterDivider.Brush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x33, 0xFF, 0xFF, 0xFF)));
+        m_clusterDivider.Brush(m_compositor.CreateColorBrush(halo::theme::C(halo::theme::P().divider)));
         m_clusterDivider.Offset({0, m_m.bottom - (m_m.pillHeight + ch) / 2, 0});
         m_root.Children().InsertAtTop(m_clusterDivider);
         if (m_cluster->Visual()) {
@@ -103,7 +104,7 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
     const float h = m_m.pillHeight * 0.6f;
     m_divider = m_compositor.CreateSpriteVisual();
     m_divider.Size({w, h});
-    m_divider.Brush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x33, 0xFF, 0xFF, 0xFF)));
+    m_divider.Brush(m_compositor.CreateColorBrush(halo::theme::C(halo::theme::P().divider)));
     m_divider.Offset({0, m_m.bottom - (m_m.pillHeight + h) / 2, 0});
     m_divider.Opacity(0.0f);
     m_divider.Properties().InsertScalar(L"Slot", 0.0f);
@@ -175,7 +176,7 @@ Dock::Entry Dock::MakeEntry(Item const& item, bool instant) {
     geometry.Radius({dot / 2, dot / 2});
     auto shape = m_compositor.CreateSpriteShape(geometry);
     shape.Offset({dot / 2, dot / 2});
-    shape.FillBrush(m_compositor.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0xFF, 0xFF, 0xFF, 0xFF)));
+    shape.FillBrush(m_compositor.CreateColorBrush(halo::theme::C(halo::theme::P().dot)));
     auto sv = m_compositor.CreateShapeVisual();
     sv.Size({dot, dot});
     sv.Shapes().Append(shape);

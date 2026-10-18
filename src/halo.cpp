@@ -31,6 +31,7 @@
 #include "cluster.h"
 #include "control_center.h"
 #include "notifications.h"
+#include "theme.h"
 #include "dock.h"
 #include "effects.h"
 #include "icons.h"
@@ -143,6 +144,7 @@ private:
     void InitComposition();
     void InitGraphics();
     wuc::ContainerVisual BuildPill(int noiseHeight = 0);
+    wuc::SpriteVisual BuildPillShadow(wuc::ContainerVisual const& pill);
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
     void RefreshDock();
@@ -460,7 +462,7 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight) {
     glass.RelativeSizeAdjustment({1, 1});
     Step(L"blur effect brush", [&] {
         auto backdrop = m_comp.CreateHostBackdropBrush();
-        auto blur = winrt::make<halo::GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), 40.0f);
+        auto blur = winrt::make<halo::GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), halo::theme::P().blur);
         auto factory = m_comp.CreateEffectFactory(blur.as<winrt::Windows::Graphics::Effects::IGraphicsEffect>());
         auto brush = factory.CreateBrush();
         brush.SetSourceParameter(L"backdrop", backdrop);
@@ -470,13 +472,13 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight) {
 
     auto tint = m_comp.CreateSpriteVisual();
     tint.RelativeSizeAdjustment({1, 1});
-    tint.Brush(m_comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0x80, 0x16, 0x16, 0x1A)));
+    tint.Brush(m_comp.CreateColorBrush(halo::theme::C(halo::theme::P().tint)));
     pill.Children().InsertAtTop(tint);
 
     Step(L"noise", [&] {
         auto noise = m_comp.CreateSpriteVisual();
         noise.RelativeSizeAdjustment({1, 1});
-        noise.Opacity(0.025f);
+        noise.Opacity(halo::theme::P().noise);
         noise.Brush(MakeNoiseBrush(m_monitor.right - m_monitor.left, noiseHeight ? noiseHeight : static_cast<int>(std::ceil(m_metrics.pillHeight))));
         pill.Children().InsertAtTop(noise);
     });
@@ -485,21 +487,26 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight) {
     const float t = m_scale.f(1);
     const float r = m_metrics.cornerRadius - t / 2;
     auto rimShape = m_comp.CreateRoundedRectangleGeometry();
-    rimShape.Offset({t / 2, t / 2});
-    rimShape.CornerRadius({r, r});
+    const bool hasEdge = halo::theme::P().edge.a != 0;
+    const float ri = hasEdge ? t : 0.0f;  // the white rim sits just inside the outer hairline
+    rimShape.Offset({t / 2 + ri, t / 2 + ri});
+    rimShape.CornerRadius({r - ri, r - ri});
     auto rimSize = m_comp.CreateExpressionAnimation(
-        L"Vector2(pill.Size.X - " + std::to_wstring(t) + L", pill.Size.Y - " + std::to_wstring(t) + L")");
+        L"Vector2(pill.Size.X - " + std::to_wstring(t + 2 * ri) + L", pill.Size.Y - " + std::to_wstring(t + 2 * ri) + L")");
     rimSize.SetReferenceParameter(L"pill", pill);
     rimShape.StartAnimation(L"Size", rimSize);
+    auto edgeSize = m_comp.CreateExpressionAnimation(
+        L"Vector2(pill.Size.X - " + std::to_wstring(t) + L", pill.Size.Y - " + std::to_wstring(t) + L")");
+    edgeSize.SetReferenceParameter(L"pill", pill);
     auto gradient = m_comp.CreateLinearGradientBrush();
     gradient.MappingMode(wuc::CompositionMappingMode::Relative);
     gradient.StartPoint({0, 0});
     gradient.EndPoint({0, 1});
-    auto stop = [&](float at, uint8_t a) {
-        gradient.ColorStops().Append(
-            m_comp.CreateColorGradientStop(at, winrt::Windows::UI::ColorHelper::FromArgb(a, 0xFF, 0xFF, 0xFF)));
+    auto const& pal = halo::theme::P();
+    auto stop = [&](float at, halo::theme::Argb c) {
+        gradient.ColorStops().Append(m_comp.CreateColorGradientStop(at, halo::theme::C(c)));
     };
-    stop(0.0f, 0x70); stop(0.35f, 0x18); stop(0.7f, 0x0A); stop(1.0f, 0x26);
+    stop(0.0f, pal.rimTop); stop(0.35f, pal.rimMid); stop(0.7f, pal.rimLow); stop(1.0f, pal.rimBottom);
     auto rimSprite = m_comp.CreateSpriteShape(rimShape);
     rimSprite.StrokeBrush(gradient);
     rimSprite.StrokeThickness(t);
@@ -507,13 +514,81 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight) {
     rim.RelativeSizeAdjustment({1, 1});
     rim.Shapes().Append(rimSprite);
     pill.Children().InsertAtTop(rim);
+
+    // Outer hairline: a second stroke of the same rounded rect, flush with the clip edge,
+    // so glass reads against a light wallpaper.
+    if (pal.edge.a) {
+        auto edgeShape = m_comp.CreateRoundedRectangleGeometry();
+        edgeShape.Offset({t / 2, t / 2});
+        edgeShape.CornerRadius({r, r});
+        edgeShape.StartAnimation(L"Size", edgeSize);
+        auto edgeSprite = m_comp.CreateSpriteShape(edgeShape);
+        edgeSprite.StrokeBrush(m_comp.CreateColorBrush(halo::theme::C(pal.edge)));
+        edgeSprite.StrokeThickness(t);
+        auto edge = m_comp.CreateShapeVisual();
+        edge.RelativeSizeAdjustment({1, 1});
+        edge.Shapes().Append(edgeSprite);
+        pill.Children().InsertAtTop(edge);
+    }
     return pill;  // the dock places it in the tree
+}
+
+// A soft drop shadow for the dock pill: a brushless sprite that follows the pill's size and
+// offset, its shadow shaped by a nine-grid rounded-rect mask. A sibling of the (clipped) pill.
+wuc::SpriteVisual Halo::BuildPillShadow(wuc::ContainerVisual const& pill) {
+    auto const& pal = halo::theme::P();
+    if (!pal.shadow.a) return nullptr;
+    const int ri = std::max(2, static_cast<int>(std::ceil(m_metrics.cornerRadius)));
+    const int side = 2 * ri + 2;
+    auto surface = MakeSurface({static_cast<float>(side), static_cast<float>(side)});
+    auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
+    winrt::com_ptr<ID2D1DeviceContext> dc;
+    POINT offset{};
+    winrt::check_hresult(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset));
+    try {
+        dc->Clear(D2D1::ColorF(0, 0.0f));
+        winrt::com_ptr<ID2D1SolidColorBrush> white;
+        winrt::check_hresult(dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), white.put()));
+        D2D1_ROUNDED_RECT rr{D2D1::RectF(static_cast<float>(offset.x), static_cast<float>(offset.y),
+                                         static_cast<float>(offset.x + side), static_cast<float>(offset.y + side)),
+                             static_cast<float>(ri), static_cast<float>(ri)};
+        dc->FillRoundedRectangle(rr, white.get());
+    } catch (...) {
+        interop->EndDraw();
+        throw;
+    }
+    winrt::check_hresult(interop->EndDraw());
+    auto src = m_comp.CreateSurfaceBrush(surface);
+    src.Stretch(wuc::CompositionStretch::Fill);
+    auto grid = m_comp.CreateNineGridBrush();
+    grid.Source(src);
+    grid.SetInsets(static_cast<float>(ri));
+
+    auto shadow = m_comp.CreateDropShadow();
+    shadow.Mask(grid);
+    shadow.Color(halo::theme::C({0xFF, pal.shadow.r, pal.shadow.g, pal.shadow.b}));
+    shadow.Opacity(pal.shadow.a / 255.0f);
+    shadow.BlurRadius(m_scale.f(pal.shadowBlur));
+    shadow.Offset({0, m_scale.f(pal.shadowY), 0});
+    auto sprite = m_comp.CreateSpriteVisual();
+    sprite.Shadow(shadow);
+    auto size = m_comp.CreateExpressionAnimation(L"pill.Size");
+    size.SetReferenceParameter(L"pill", pill);
+    sprite.StartAnimation(L"Size", size);
+    auto off = m_comp.CreateExpressionAnimation(L"pill.Offset");
+    off.SetReferenceParameter(L"pill", pill);
+    sprite.StartAnimation(L"Offset", off);
+    return sprite;
 }
 
 void Halo::BuildDock() {
     auto pill = BuildPill();
     m_cluster = std::make_unique<DockCluster>(m_comp, m_gdev, m_hwnd, m_metrics.pillHeight, m_scale.v);
     m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics, m_cluster.get());
+    Step(L"pill shadow", [&] {
+        auto shadow = BuildPillShadow(pill);
+        if (shadow && pill.Parent()) pill.Parent().Children().InsertBelow(shadow, pill);
+    });
     m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
     RefreshDock();
 }

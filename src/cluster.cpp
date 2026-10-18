@@ -1,3 +1,4 @@
+#include "theme.h"
 #include "cluster.h"
 
 #include <algorithm>
@@ -228,8 +229,8 @@ void DockCluster::Render() {
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
         winrt::com_ptr<ID2D1SolidColorBrush> white, dim;
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), white.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.40f), dim.put());
+        dc->CreateSolidColorBrush(halo::theme::P().text, white.put());
+        dc->CreateSolidColorBrush(halo::theme::A(halo::theme::P().dim, 0.7f), dim.put());
 
         // Time, in the user's 12/24-hour setting, centered in its slot.
         SYSTEMTIME st;
