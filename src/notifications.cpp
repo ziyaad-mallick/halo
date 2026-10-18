@@ -868,7 +868,7 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
 
     auto tint = comp.CreateSpriteVisual();
     tint.RelativeSizeAdjustment({1, 1});
-    tint.Brush(comp.CreateColorBrush(theme::Dark() ? theme::C(theme::P().tint) : winrt::Windows::UI::ColorHelper::FromArgb(0xA0, 0xFF, 0xFF, 0xFF)));
+    tint.Brush(comp.CreateColorBrush(theme::Dark() ? theme::C(theme::P().tint) : winrt::Windows::UI::ColorHelper::FromArgb(0xD8, 0xFA, 0xFA, 0xFC)));
     c.vis.Children().InsertAtTop(tint);
 
     if (noise) {
