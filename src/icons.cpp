@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -503,6 +504,38 @@ std::vector<PinnedApp> LoadPinnedApps() {
     return apps;
 }
 
+// True if all opaque pixels sit inside the top-left quarter: the jumbo image
+// list hands back a 32px icon in a 256px frame when the shell's icon cache has
+// no large version yet (seen at logon for Electron .lnk pins).
+bool SmallInFrame(const IconImage& img) {
+    if (img.width < 128 || img.height < 128) return false;
+    int maxX = -1, maxY = -1;
+    for (int y = 0; y < img.height; ++y)
+        for (int x = 0; x < img.width; ++x)
+            if (img.bgra[(static_cast<std::size_t>(y) * img.width + x) * 4 + 3] > 8) {
+                maxX = std::max(maxX, x);
+                maxY = std::max(maxY, y);
+            }
+    return maxX >= 0 && maxX < img.width / 4 && maxY < img.height / 4;
+}
+
+// 256px icon of a file via IShellItemImageFactory, which extracts the large
+// icon itself instead of trusting the image-list cache.
+bool LoadFactoryIcon(const std::wstring& path, IconImage& out) {
+    out = {};
+    ComRef<IShellItemImageFactory> factory;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_IShellItemImageFactory,
+                                           reinterpret_cast<void**>(factory.put())))) {
+        return false;
+    }
+    HBITMAP hbmp = nullptr;
+    if (FAILED(factory->GetImage(SIZE{256, 256}, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &hbmp)) || !hbmp) {
+        return false;
+    }
+    Owned<HBITMAP, &DeleteObject> bmp(hbmp);
+    return HBitmapToBgra(hbmp, out) && !SmallInFrame(out);
+}
+
 bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
     out = {};
     if (path.starts_with(kAppsFolder)) return LoadAppsFolderIcon(path, out, taskbarLogo);
@@ -524,7 +557,12 @@ bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
             continue;
         }
         Owned<HICON, &DestroyIcon> icon(hicon);
-        if (HIconToBgra(hicon, out)) return true;
+        if (HIconToBgra(hicon, out)) {
+            if (!SmallInFrame(out)) return true;
+            IconImage large;
+            if (LoadFactoryIcon(path, large)) out = std::move(large);
+            return true;  // the small one is still better than nothing
+        }
     }
     return false;
 }
