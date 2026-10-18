@@ -397,6 +397,14 @@ private:
         brush.Stretch(wuc::CompositionStretch::None);
         m_visual.Brush(brush);
         m_visual.Size({pillW, pillH});
+        if (halo::theme::P().shadow.a) {  // small soft shadow, shaped by the pill itself (light theme only)
+            if (!m_shadow) m_shadow = m_comp.CreateDropShadow();
+            m_shadow.BlurRadius(8.0f * m_scale);
+            m_shadow.Color(winrt::Windows::UI::ColorHelper::FromArgb(0x20, 0, 0, 0));
+            m_shadow.Offset({0.0f, 2.0f * m_scale, 0.0f});
+            m_shadow.Mask(brush);
+            m_visual.Shadow(m_shadow);
+        }
     }
 
     void AnimateOpacity(float target, int ms) {
@@ -418,6 +426,7 @@ private:
     wuc::CompositionGraphicsDevice m_gdev{nullptr};
     wuc::SpriteVisual m_visual{nullptr};
     wuc::CubicBezierEasingFunction m_easeOut{nullptr};
+    wuc::DropShadow m_shadow{nullptr};
 
     winrt::com_ptr<IDWriteFactory> m_dwrite;
     winrt::com_ptr<IDWriteTextFormat> m_format;
