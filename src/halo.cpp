@@ -1135,7 +1135,8 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case kMsgEdge:
             Log(w == halo::edge::kBottom ? L"edge: bottom right" : w == halo::edge::kTop ? L"edge: top" : L"edge: right");
-            OpenPanel(true, w != halo::edge::kBottom);  // the bottom-right corner: Quick Settings alone
+            if (w == halo::edge::kBottom && m_intellihide && m_intellihide->IsFullscreen()) return 0;  // a video's controls, not us
+            OpenPanel(w == halo::edge::kBottom, w != halo::edge::kBottom);  // the corner: Quick Settings alone; touch: both, no auto-hide
             return 0;
         case WM_TIMER:
             if (w == kHideTimer) {

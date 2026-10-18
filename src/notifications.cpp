@@ -1373,9 +1373,9 @@ void NotificationCenter::Impl::Open() {
         st = St::Open;
         winH = 0;
         Update(true);
+        motion::In(comp, panelVis, rest, Travel());  // before the show: no frame at rest first
         ShowWindow(hwnd, attached ? SW_SHOWNOACTIVATE : SW_SHOW);  // attached: the Control Center keeps the focus
         if (!attached) Focus();
-        motion::In(comp, panelVis, rest, Travel());
         SetEvent(evReq);
         svc::Log(std::wstring(L"notifications: open") + (attached ? L" (attached)" : L"") + L" availH=" + std::to_wstring(static_cast<int>(availH)) +
                  L" totalH=" + std::to_wstring(static_cast<int>(totalH)));

@@ -46,6 +46,7 @@ inline void Settle(wuc::Visual const& v) {
 inline void In(detail::wuc::Compositor const& c, detail::wuc::Visual const& v, detail::float3 rest, detail::float2 travel) {
     using namespace std::chrono;
     detail::Settle(v);
+    v.Offset({rest.x + travel.x, rest.y + travel.y, rest.z});  // out of sight until the spring's first tick
     auto slide = c.CreateSpringVector3Animation();
     slide.InitialValue(detail::Ref3({rest.x + travel.x, rest.y + travel.y, rest.z}));
     slide.FinalValue(detail::Ref3(rest));
@@ -61,7 +62,7 @@ inline void Out(detail::wuc::Compositor const& c, detail::wuc::Visual const& v, 
     auto down = c.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.9f, 0.5f});  // the dock's hide ease-in
     const float nudge = std::min(0.04f, 8.0f / std::max(1.0f, std::hypot(travel.x, travel.y)));  // at most 8 px back
     auto slide = c.CreateVector3KeyFrameAnimation();
-    slide.InsertKeyFrame(0.0f, rest);
+    // No key at 0: a close during the opening spring carries on from wherever the panel is.
     slide.InsertKeyFrame(0.25f, {rest.x - travel.x * nudge, rest.y - travel.y * nudge, rest.z}, up);
     slide.InsertKeyFrame(1.0f, {rest.x + travel.x, rest.y + travel.y, rest.z}, down);
     slide.Duration(milliseconds(kOutMs));

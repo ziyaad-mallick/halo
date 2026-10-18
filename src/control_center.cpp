@@ -474,11 +474,10 @@ void ControlCenter::Impl::Open(bool pointer) {
         else SizeVisuals();
         st = St::Open;
         Render();
-        pill.Opacity(0);
+        motion::In(comp, pill, {pad * 1.0f, pad * 1.0f, 0}, Travel());  // before the show: no frame at rest first
         // From the edge the panel only shows (the app under the pointer keeps the keyboard, and nothing
         // waits on a foreground change); a click in it activates it like any window.
         ShowWindow(hwnd, pointer ? SW_SHOWNOACTIVATE : SW_SHOW);
-        motion::In(comp, pill, {pad * 1.0f, pad * 1.0f, 0}, Travel());
         settling = true;
         SetTimer(hwnd, kTimerSettle, kSettleMs, nullptr);
         {
@@ -1136,7 +1135,16 @@ void ControlCenter::Impl::ApplySize() {
     const int pad = static_cast<int>(std::lround(motion::kPad * s));
     SetWindowPos(hwnd, nullptr, rect.left - pad, rect.top - pad, wp.cx, wp.cy, SWP_NOZORDER | SWP_NOACTIVATE);
     SizeVisuals();
-    if (st == St::Open && api->onResized) api->onResized();
+    if (st == St::Open) {
+        POINT p;  // the panel moved under a still pointer: hover what is there now
+        if (GetCursorPos(&p) && pressed.id == Id::None && drag == Id::None) {
+            auto* it = HitAt((p.x - rect.left) / s, (p.y - rect.top) / s);
+            hover = it ? *it : Item{};
+            SetHover(it);
+            HoverChip(ChipOf(it));
+        }
+        if (api->onResized) api->onResized();
+    }
 }
 
 // Every visual and the surface follow `height` (and the scale).
@@ -1173,7 +1181,7 @@ void ControlCenter::Impl::Render() {
         Paint(dc.get(), static_cast<float>(off.x), static_cast<float>(off.y), nullptr, nullptr);
     } catch (...) {}
     interop->EndDraw();
-    SyncChips();
+    if (drag == Id::None) SyncChips();  // a slider drag changes no chip: don't redraw 17 of them per move
 }
 
 // Draws every item (or just `only`, minus `skip`) with the panel origin at (tx, ty) device px.

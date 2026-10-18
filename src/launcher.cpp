@@ -387,6 +387,10 @@ void Launcher::LoadFiles() {
             FAILED(link->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH)) || !target[0])
             continue;
         if (target[0] == L'\\' && target[1] == L'\\') continue;  // network: stat could hang
+        if (target[1] == L':') {  // so could a mapped, removable or optical drive
+            const wchar_t root[4] = {target[0], L':', L'\\', 0};
+            if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+        }
         DWORD attrs = GetFileAttributesW(target);
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::wstring path = target;
@@ -1033,11 +1037,10 @@ void Launcher::Show(LauncherAnchor const& anchor) {
 
     // Rises out of the gap above the dock with the dock's reveal spring (clipped by the window's bottom edge).
     const float home = kTop * m_s;
-    m_panel.Offset({0, home, 0});
-    Place();
     const float2 rise{0, m_h + m_shadowB};  // up out of the window's bottom edge, just above the dock
     motion::In(m_comp, m_panel, {0, home, 0}, rise);
     if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), rise);
+    Place();  // shows the window: after the slide is set up, so no frame shows the panel at rest first
     SetTimer(m_hwnd, kRefreshTimer, 420, nullptr);  // once, after the rise has settled
 
     m_open = true;
@@ -1198,6 +1201,7 @@ void Launcher::RunSearch() {
         return a.r.app && !b.r.app;
     });
     for (size_t i = 0; i < hits.size() && i < kMaxResults; i++) m_results.push_back(std::move(hits[i].r));
+    m_sel = std::clamp(m_sel, 0, std::max(0, static_cast<int>(m_results.size()) - 1));  // Refresh() re-runs this
 }
 
 void Launcher::QueryChanged() {
