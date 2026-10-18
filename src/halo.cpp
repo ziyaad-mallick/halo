@@ -363,6 +363,10 @@ bool Halo::Create(HINSTANCE inst) {
             Log(L"panel: closed");
         };
         m_cc->onResized = [this] { if (m_notif && m_notif->IsOpen()) m_notif->SetAnchor(m_cc->PanelRectScreen()); };
+        m_cc->onClock = [this] {  // the calendar and notifications rise out of the panel, or go
+            if (m_notif->IsOpen()) m_notif->Close();
+            else OpenPanel(false, true);
+        };
     }
     if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
     else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));

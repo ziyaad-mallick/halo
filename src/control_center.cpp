@@ -51,9 +51,9 @@ namespace {
 // Grid, in logical px (all drawing is scaled by the monitor DPI): 14 outer inset, 10 between modules,
 // 24 panel radius, 18 module radius. The window is the panel plus motion::kPad of empty margin on every
 // side, so the spring's overshoot never clips; everything below is in panel ("pill") coordinates.
-// On an 8 px grid, with concentric corners: tile radius = panel radius - inset.
-constexpr float kW = 344, kInset = 12, kGap = 8, kRadius = 28, kTileR = 16;
-constexpr float kPillH = 56, kRowH = 64, kSliderH = 56, kMediaH = 88, kHeadH = 72, kActH = 56, kPowH = 48;
+// Concentric corners (tile radius = panel radius - inset) and room to breathe between modules.
+constexpr float kW = 356, kInset = 14, kGap = 10, kRadius = 32, kTileR = 18;
+constexpr float kPillH = 60, kRowH = 66, kSliderH = 60, kMediaH = 92, kHeadH = 76, kActH = 62, kPowH = 48;
 constexpr float kMaxH = 900, kMargin = 8;
 constexpr int kMaxOutputs = 6;
 
@@ -73,7 +73,7 @@ constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloCont
 enum class Id {
     None, WifiPill, BtPill, WifiText, BtText, Wifi, Bluetooth, RowTile, Airplane, Hotspot, Night, Dark, Dnd,
     DisplayTile, Bright, SoundTile, Vol, OutRow, OutDev, ListTile, WifiNet, BtDev, MediaTile, Prev, PlayPause, Next,
-    Snip, Cast, Settings, Battery, Header, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut
+    Snip, Cast, Settings, Battery, Header, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut, Clock
 };
 bool Passive(Id id) {
     return id == Id::WifiPill || id == Id::BtPill || id == Id::RowTile || id == Id::DisplayTile || id == Id::SoundTile ||
@@ -223,6 +223,9 @@ struct ControlCenter::Impl {
     void Open(bool pointer);
     void Close();
     void Teardown();
+    void Park();
+    void SizeVisuals();
+    float builtScale = 0;  // the DPI scale the window and visuals were built for
     void CheckPointer();
     // Up out of the bottom edge, like the Windows taskbar's Quick Settings flyout.
     wfn::float2 Travel() const { return {0, std::ceil(height * s) + std::lround(motion::kPad * s)}; }
@@ -401,7 +404,7 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_TIMER:
-            if (w == kTimerClose) Teardown();
+            if (w == kTimerClose) Park();
             else if (w == kTimerLeave) CheckPointer();
             else if (w == kTimerSettle) Settle();
             else if (w == kTimerClock && st == St::Open) {
@@ -428,7 +431,7 @@ void ControlCenter::Impl::Open(bool pointer) {
     byPointer = pointer;
     entered = false;
     outSince = 0;
-    if (st == St::Closing) Teardown();
+    if (st == St::Closing) Park();
     LARGE_INTEGER q0, qf;
     QueryPerformanceCounter(&q0);
     QueryPerformanceFrequency(&qf);
@@ -443,11 +446,17 @@ void ControlCenter::Impl::Open(bool pointer) {
 
     try {
         BuildFonts();  // first open only
-        hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPanelClass,
-                               L"Halo Control Center", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, this);
-        if (!hwnd) return;
-        BOOL on = TRUE;
-        DwmSetWindowAttribute(hwnd, 17 /* DWMWA_USE_HOSTBACKDROPBRUSH */, &on, sizeof(on));
+        // The window and its visual tree are built once and kept hidden between opens (Park): a new
+        // backdrop window per open cost DWM the first frames of the slide. Rebuilt only for a new DPI.
+        if (hwnd && builtScale != s) Teardown();
+        if (!hwnd) {
+            hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPanelClass,
+                                   L"Halo Control Center", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, this);
+            if (!hwnd) return;
+            BOOL on = TRUE;
+            DwmSetWindowAttribute(hwnd, 17 /* DWMWA_USE_HOSTBACKDROPBRUSH */, &on, sizeof(on));
+            builtScale = s;
+        }
         // The reads (audio endpoints above all) cost ~20 ms: after the first open the panel shows with
         // what it read last time and syncs once the motion has settled.
         needSync = synced;
@@ -461,7 +470,8 @@ void ControlCenter::Impl::Open(bool pointer) {
         rect.bottom = rect.top + hPx;
         SIZE wp = WindowPx();
         SetWindowPos(hwnd, HWND_TOPMOST, rect.left - pad, rect.top - pad, wp.cx, wp.cy, SWP_NOACTIVATE);
-        BuildVisuals();
+        if (!pill) BuildVisuals();
+        else SizeVisuals();
         st = St::Open;
         Render();
         pill.Opacity(0);
@@ -520,6 +530,40 @@ void ControlCenter::Impl::Close() {
     motion::Out(comp, pill, {pad, pad, 0}, Travel());
     SetTimer(hwnd, kTimerClose, motion::kOutMs + 10, nullptr);
     if (api->onHidden) api->onHidden();
+}
+
+// Closed but kept: the window hides, the visuals and surfaces stay for the next open.
+void ControlCenter::Impl::Park() {
+    bool wasOpen = st == St::Open;
+    speaker.Unbind();
+    mic.Unbind();
+    radios.Stop();
+    svc::WifiStop();
+    svc::BtStop();
+    drag = Id::None;
+    outsOpen = false;
+    powerOpen = false;
+    expand = Expand::None;
+    btAsked = false;
+    hover = pressed = {};
+    tracking = false;
+    if (hv) { hv.StopAnimation(L"Opacity"); hv.Opacity(0); }
+    hvShown = false;
+    for (auto& c : chips) {  // back to rest, so the next open does not start with a lifted chip
+        c.v.StopAnimation(L"Scale");
+        c.v.StopAnimation(L"Offset");
+        c.v.Scale({1, 1, 1});
+        c.v.Offset(c.rest);
+    }
+    hotChip = -1;
+    if (ptr) ptr.InsertVector2(L"P", {-1000, -1000});
+    if (hwnd) {
+        KillTimer(hwnd, kTimerClose);
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    st = St::Closed;
+    rect = {};
+    if (wasOpen && api->onHidden) api->onHidden();
 }
 
 // Releases the window and every composition object (the DirectWrite objects and grain stay cached).
@@ -853,6 +897,9 @@ void ControlCenter::Impl::RunPowerAfterClose(int item) {
 void ControlCenter::Impl::Click(Item const& it) {
     if (svc::DryRun()) svc::Log(L"click id=" + std::to_wstring(static_cast<int>(it.id)) + L" arg=" + std::to_wstring(it.arg));
     switch (it.id) {
+        case Id::Clock:
+            if (api->onClock) api->onClock();
+            break;
         case Id::Battery:
             if (mode == svc::PowerMode::Unknown) return;
             mode = svc::NextPowerMode(mode);
@@ -994,6 +1041,7 @@ void ControlCenter::Impl::Layout() {
     // Header module: the time and date, and the power mode + battery (click cycles the mode).
     add(Id::Header, {x0, y, x1, y + kHeadH}, 0, kTileR);
     add(Id::Battery, {x1 - 14 - 124, y + (kHeadH - 44) / 2, x1 - 14, y + (kHeadH - 44) / 2 + 44}, 0, 16);
+    add(Id::Clock, {x0 + 6, y + 6, x1 - 14 - 124 - 8, y + kHeadH - 6}, 0, 14);  // the time and date: opens the calendar
     y += kHeadH + kGap;
 
     // Row 1: two half-width pills. The icon toggles the radio, the text (and chevron) opens its list.
@@ -1035,14 +1083,14 @@ void ControlCenter::Impl::Layout() {
     // Slim Display and Sound sliders.
     if (bright >= 0) {
         add(Id::DisplayTile, {x0, y, x1, y + kSliderH}, 0, kTileR);
-        add(Id::Bright, {x0 + 14, y + 27, x1 - 14, y + 47});
+        add(Id::Bright, {x0 + 14, y + 31, x1 - 14, y + 51});
         y += kSliderH + kGap;
     }
     if (speaker.Available()) {
         float extra = outsOpen ? outs.size() * 32.0f + 6 : 0;
         add(Id::SoundTile, {x0, y, x1, y + kSliderH + extra}, 0, kTileR);
-        add(Id::OutRow, {x0 + 100, y + 4, x1 - 8, y + 26}, 0, 10);
-        add(Id::Vol, {x0 + 14, y + 27, x1 - 14, y + 47});
+        add(Id::OutRow, {x0 + 100, y + 7, x1 - 8, y + 29}, 0, 10);
+        add(Id::Vol, {x0 + 14, y + 31, x1 - 14, y + 51});
         if (outsOpen)
             for (size_t i = 0; i < outs.size(); i++)
                 add(Id::OutDev, {x0 + 8, y + kSliderH - 2 + i * 32, x1 - 8, y + kSliderH + 30 + i * 32}, static_cast<int>(i), 12);
@@ -1081,12 +1129,19 @@ void ControlCenter::Impl::Layout() {
 
 // Window, visuals and surface all follow `height`.
 void ControlCenter::Impl::ApplySize() {
-    int wPx = static_cast<int>(std::ceil(kW * s)), hPx = static_cast<int>(std::ceil(height * s));
+    int hPx = static_cast<int>(std::ceil(height * s));
     if (rect.bottom - rect.top == hPx) return;
     rect.top = rect.bottom - hPx;  // anchored at the bottom: it grows upward
     SIZE wp = WindowPx();
     const int pad = static_cast<int>(std::lround(motion::kPad * s));
     SetWindowPos(hwnd, nullptr, rect.left - pad, rect.top - pad, wp.cx, wp.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+    SizeVisuals();
+    if (st == St::Open && api->onResized) api->onResized();
+}
+
+// Every visual and the surface follow `height` (and the scale).
+void ControlCenter::Impl::SizeVisuals() {
+    int wPx = static_cast<int>(std::ceil(kW * s)), hPx = static_cast<int>(std::ceil(height * s));
     pill.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     inner.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
     if (shadowV) shadowV.Size({static_cast<float>(wPx), static_cast<float>(hPx)});
@@ -1095,7 +1150,6 @@ void ControlCenter::Impl::ApplySize() {
     rim.Size({wPx - s, hPx - s});
     if (specGeo) specGeo.Size({wPx - 3 * s, hPx - 3 * s});
     surf.as<ICompositionDrawingSurfaceInterop>()->Resize({wPx, hPx});
-    if (st == St::Open && api->onResized) api->onResized();
 }
 
 void ControlCenter::Impl::Settle() {
@@ -1230,8 +1284,8 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     txt(tb, fTime.get(), {r.left + 16, r.top + 6, r.left + 170, r.top + 52}, kText);
                     txt(db, fDate.get(), {r.left + 17, r.top + 50, r.left + 176, r.top + 70}, kDim);
                 }
-                if (it.id == Id::DisplayTile) txt(L"Display", fTitle.get(), {r.left + 16, r.top + 4, r.right - 16, r.top + 25}, kText);
-                if (it.id == Id::SoundTile) txt(L"Sound", fTitle.get(), {r.left + 16, r.top + 4, r.left + 96, r.top + 25}, kText);
+                if (it.id == Id::DisplayTile) txt(L"Display", fTitle.get(), {r.left + 16, r.top + 7, r.right - 16, r.top + 28}, kText);
+                if (it.id == Id::SoundTile) txt(L"Sound", fTitle.get(), {r.left + 16, r.top + 7, r.left + 96, r.top + 28}, kText);
                 if (it.id == Id::ListTile)
                     txt(expand == Expand::Wifi ? L"Known Wi-Fi networks" : L"Paired Bluetooth devices", fTitle.get(),
                         {r.left + 16, r.top + 10, r.right - 16, r.top + 32}, kText);
@@ -1384,10 +1438,10 @@ void ControlCenter::Impl::BuildFonts() {
     const auto L = DWRITE_TEXT_ALIGNMENT_LEADING, C = DWRITE_TEXT_ALIGNMENT_CENTER, T = DWRITE_TEXT_ALIGNMENT_TRAILING;
     const auto N = DWRITE_PARAGRAPH_ALIGNMENT_NEAR, M = DWRITE_PARAGRAPH_ALIGNMENT_CENTER;
     const auto SB = DWRITE_FONT_WEIGHT_SEMI_BOLD, R = DWRITE_FONT_WEIGHT_NORMAL;
-    mk(fTitle, L"Segoe UI Variable Text", SB, 14, L, M);
+    mk(fTitle, L"Segoe UI Variable Display", SB, 14, L, M);
     mk(fSub, L"Segoe UI Variable Text", R, 12, L, M);
     mk(fSubR, L"Segoe UI Variable Text", R, 12, T, M);
-    mk(fBatt, L"Segoe UI Variable Text", SB, 14, L, M);
+    mk(fBatt, L"Segoe UI Variable Display", SB, 14, L, M);
     mk(fIcon, L"Segoe Fluent Icons", R, 18, C, M);
     mk(fIconS, L"Segoe Fluent Icons", R, 14, C, M);
     mk(fCap, L"Segoe UI Variable Text", R, 12, C, N);

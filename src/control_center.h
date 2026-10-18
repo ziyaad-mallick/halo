@@ -28,6 +28,8 @@ public:
     // UI thread. onShown: the panel just opened. onHidden: it started closing (fading out).
     // onResized: it opened or changed height while open; read PanelRectScreen() again.
     std::function<void()> onShown, onHidden, onResized;
+    // The time/date in the header was clicked: show or hide the calendar and notifications above the panel.
+    std::function<void()> onClock;
     // Focus moving to this window must not close the panel (the attached notification column).
     std::function<HWND()> siblingHwnd;
 
