@@ -21,8 +21,8 @@ Status: **daily driver on one machine** (the author's login shell since 2026-10-
   an explorer restart it hides the new taskbar again
 
 Measured on a Core Ultra 7 258V, live login copy with the full feature set
-(2026-10-18, process counters over 30 s idle): **16 ms CPU, 29.9 MB private
-memory, 62 MB working set, 15 threads**; guardian 1.4 MB private.
+(2026-10-18, process counters over 30 s idle, two runs): **0–16 ms CPU, 29.9–35.2 MB private
+memory (35.2 MB with the pin store and right-click menu), 62–65 MB working set**; guardian 1.4 MB private.
 Earlier M0 spike (2026-10-17, `tools/smoke.ps1`): 17.5 MB
 private memory, 0 ms CPU over 10 s idle in 3 of 4 runs (250 ms in the first
 run after an explorer restart, unexplained).
