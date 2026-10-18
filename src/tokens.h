@@ -22,12 +22,12 @@ constexpr float kIcon = 16, kIconSmall = 14;  // glyph sizes
 
 // Radius.
 constexpr float kRadiusSmall = 12, kRadiusLarge = 20;
-constexpr float kPanelInset = kS3, kPanelRadius = kRadiusLarge + kPanelInset;
+constexpr float kPanelInset = kS4, kPanelRadius = kRadiusLarge + kPanelInset;
 
 // Control sizes (multiples of 4).
-constexpr float kRound = 32;      // a round toggle inside a row or tile
-constexpr float kRoundAction = 40;  // the free-standing action buttons
-constexpr float kRowH = 44;       // a list or connectivity row
+constexpr float kRound = 36;      // a round toggle inside a pill or tile
+constexpr float kRoundAction = 44;  // the free-standing action buttons
+constexpr float kPillH = 64;      // a connectivity pill (round toggle + two lines)
 constexpr float kSliderH = 28;    // the thick slider track
 
 // Motion.
