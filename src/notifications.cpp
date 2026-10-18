@@ -348,8 +348,7 @@ struct NotificationCenter::Impl {
     void Place();
     void ApplyGeometry();
     void Dismissed() { if (api->onDismiss) api->onDismiss(); else Close(); }
-    float2 Anchor() const { return attached ? float2{std::ceil(kW * s), 0} : float2{(kW + motion::kPad) * s, (totalH / 2 + motion::kPad) * s}; }
-    float2 Travel() const { return attached ? float2{0, -28.0f * s} : float2{48.0f * s, 0}; }  // attached: the Control Center's motion
+    float2 Travel() const { return {(kW + 2 * motion::kPad) * s, 0}; }  // in from the right screen edge
     void AnimateIn(Card& c, int order);
     void AnimateOut(Card& c);
     int CardAt(float x, float y, int* part);
@@ -858,12 +857,9 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
 
     auto glass = comp.CreateSpriteVisual();
     glass.RelativeSizeAdjustment({1, 1});
-    try {
-        auto blur = winrt::make<GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), 40.0f);
-        auto brush = comp.CreateEffectFactory(blur.as<winrt::Windows::Graphics::Effects::IGraphicsEffect>()).CreateBrush();
-        brush.SetSourceParameter(L"backdrop", comp.CreateHostBackdropBrush());
-        glass.Brush(brush);
-    } catch (...) { svc::Log(L"notifications: blur brush failed"); }
+    // The host backdrop already comes blurred by DWM; another Gaussian pass on top cost dropped frames
+    // whenever the panel moved (measured with tools/framegaps.cpp) for a barely softer look.
+    glass.Brush(comp.CreateHostBackdropBrush());
     c.vis.Children().InsertAtTop(glass);
 
     auto tint = comp.CreateSpriteVisual();
@@ -1383,7 +1379,7 @@ void NotificationCenter::Impl::Open() {
         Update(true);
         ShowWindow(hwnd, attached ? SW_SHOWNOACTIVATE : SW_SHOW);  // attached: the Control Center keeps the focus
         if (!attached) Focus();
-        motion::In(comp, panelVis, rest, Anchor(), Travel());
+        motion::In(comp, panelVis, rest, Travel());
         SetEvent(evReq);
         svc::Log(std::wstring(L"notifications: open") + (attached ? L" (attached)" : L"") + L" availH=" + std::to_wstring(static_cast<int>(availH)) +
                  L" totalH=" + std::to_wstring(static_cast<int>(totalH)));
@@ -1397,7 +1393,7 @@ void NotificationCenter::Impl::Close() {
     visible = false;
     if (st != St::Open) return;
     st = St::Closing;
-    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Anchor(), Travel());
+    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Travel());
     SetTimer(hwnd, kTimerClose, motion::kOutMs + 10, nullptr);
 }
 

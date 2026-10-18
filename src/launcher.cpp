@@ -89,7 +89,6 @@ constexpr float kMenuW = 168;
 constexpr float kMenuRowH = 32;
 constexpr float kMenuPad = 8;
 constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 24;
-constexpr float kRise = 24;       // how far below its place the panel starts
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
 constexpr int kMaxApps = 6, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
 constexpr UINT_PTR kRefreshTimer = 1;
@@ -1032,13 +1031,13 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     LARGE_INTEGER built;
     QueryPerformanceCounter(&built);
 
-    // Rises out of the gap above the dock with the dock's reveal spring (clipped by the window's bottom edge),
-    // growing from its bottom centre.
+    // Rises out of the gap above the dock with the dock's reveal spring (clipped by the window's bottom edge).
     const float home = kTop * m_s;
     m_panel.Offset({0, home, 0});
     Place();
-    motion::In(m_comp, m_panel, {0, home, 0}, {m_w / 2, m_h}, {0, kRise * m_s});
-    if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), {m_w / 2, m_h}, {0, kRise * m_s});
+    const float2 rise{0, m_h + m_shadowB};  // up out of the window's bottom edge, just above the dock
+    motion::In(m_comp, m_panel, {0, home, 0}, rise);
+    if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), rise);
     SetTimer(m_hwnd, kRefreshTimer, 420, nullptr);  // once, after the rise has settled
 
     m_open = true;
@@ -1067,8 +1066,9 @@ void Launcher::Hide() {
     m_open = false;
     unsigned gen = ++m_gen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    motion::Out(m_comp, m_panel, {0, kTop * m_s, 0}, {m_w / 2, m_h}, {0, kRise * m_s});
-    if (m_shadowHold) motion::Out(m_comp, m_shadowHold, PanelHome(), {m_w / 2, m_h}, {0, kRise * m_s});
+    const float2 rise{0, m_h + m_shadowB};
+    motion::Out(m_comp, m_panel, {0, kTop * m_s, 0}, rise);
+    if (m_shadowHold) motion::Out(m_comp, m_shadowHold, PanelHome(), rise);
     batch.End();
     batch.Completed([this, gen](auto&&, auto&&) {
         if (gen == m_gen && !m_open) Close();

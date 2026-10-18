@@ -487,14 +487,7 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius) {
 
     auto glass = m_comp.CreateSpriteVisual();
     glass.RelativeSizeAdjustment({1, 1});
-    Step(L"blur effect brush", [&] {
-        auto backdrop = m_comp.CreateHostBackdropBrush();
-        auto blur = winrt::make<halo::GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), halo::theme::P().blur);
-        auto factory = m_comp.CreateEffectFactory(blur.as<winrt::Windows::Graphics::Effects::IGraphicsEffect>());
-        auto brush = factory.CreateBrush();
-        brush.SetSourceParameter(L"backdrop", backdrop);
-        glass.Brush(brush);
-    });
+    glass.Brush(m_comp.CreateHostBackdropBrush());  // already blurred by DWM (see control_center.cpp)
     pill.Children().InsertAtTop(glass);
 
     auto tint = m_comp.CreateSpriteVisual();

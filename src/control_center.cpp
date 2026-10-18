@@ -57,11 +57,14 @@ constexpr float kMaxH = 900, kMargin = 8;
 constexpr int kMaxOutputs = 6;
 
 constexpr UINT kMsgAudio = WM_APP + 1, kMsgMic = WM_APP + 2, kMsgRadios = WM_APP + 3, kMsgBright = WM_APP + 4,
-               kMsgMedia = WM_APP + 5, kMsgWifi = WM_APP + 6, kMsgBt = WM_APP + 7, kMsgLate = WM_APP + 8, kMsgSync = WM_APP + 9;
-constexpr UINT_PTR kTimerClose = 1, kTimerChord = 2, kTimerClock = 3, kTimerLeave = 4;
+               kMsgMedia = WM_APP + 5, kMsgWifi = WM_APP + 6, kMsgBt = WM_APP + 7, kMsgLate = WM_APP + 8;
+constexpr UINT_PTR kTimerClose = 1, kTimerChord = 2, kTimerClock = 3, kTimerLeave = 4, kTimerSettle = 5;
+// While the opening spring runs nothing redraws: updates that arrive (the deferred reads, radios, media,
+// brightness) are held and drawn once, kSettleMs after the show. A redraw mid-motion cost a frame.
+constexpr UINT kSettleMs = 330;
 // Auto-hide: while open, where the pointer is gets checked every kLeaveTickMs; kLeaveMs outside the panel
-// (plus kLeaveSlack px around it) closes it. Then the lift (a hovered control grows by about kLiftPx
-// logical px) and the magnetic lean toward the pointer.
+// (plus kLeaveSlack px around it) closes it. Then the chips: a hovered control grows by about kLiftPx
+// logical px and leans toward the pointer by kLean of the distance, at most kLeanMax.
 constexpr UINT kLeaveTickMs = 50, kLeaveMs = 280;
 constexpr float kLeaveSlack = 18, kLiftPx = 4, kPressScale = 0.96f, kLean = 0.07f, kLeanMax = 3.5f;
 constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloControlCenterTimers";
@@ -75,8 +78,8 @@ bool Passive(Id id) {
     return id == Id::WifiPill || id == Id::BtPill || id == Id::RowTile || id == Id::DisplayTile || id == Id::SoundTile ||
            id == Id::ListTile || id == Id::MediaTile || id == Id::Header || id == Id::PowerTile;
 }
-// Controls that lift and grow under the pointer and squash under the finger (their drawing is lifted
-// onto its own little surface).
+// Controls that grow under the pointer and squash under the finger (each is drawn on its own little
+// surface, a chip).
 bool Scalable(Id id) {
     return id == Id::Wifi || id == Id::Bluetooth || id == Id::Airplane || id == Id::Hotspot || id == Id::Night ||
            id == Id::Dark || id == Id::Dnd || id == Id::Snip || id == Id::Cast || id == Id::Settings ||
@@ -161,11 +164,21 @@ struct ControlCenter::Impl {
     wuc::Desktop::DesktopWindowTarget target{nullptr};
     wuc::ContainerVisual root{nullptr}, pill{nullptr}, inner{nullptr}, fx{nullptr};
     wuc::SpriteVisual shadowV{nullptr};
-    wuc::SpriteVisual content{nullptr}, pv{nullptr};
+    wuc::SpriteVisual content{nullptr};
     wuc::ShapeVisual hv{nullptr};
-    wuc::CompositionDrawingSurface surf{nullptr}, pvSurf{nullptr};
-    wfn::float3 pvRest{};  // where the lifted control sits when it isn't leaning
-    float liftScale = 1;
+    wuc::CompositionDrawingSurface surf{nullptr};
+    struct Chip {
+        Item it;
+        wuc::SpriteVisual v{nullptr};
+        wuc::CompositionDrawingSurface surf{nullptr};
+        wfn::float3 rest{};  // offset in the pill, px
+        wfn::float2 size{};
+        float lift = 1;      // hover scale
+    };
+    std::vector<Chip> chips;
+    wuc::ContainerVisual chipLayer{nullptr};
+    wuc::CompositionPropertySet ptr{nullptr};  // "P": the pointer in pill px, read by the hovered chip's lean
+    int hotChip = -1;
     wuc::CompositionRoundedRectangleGeometry clip{nullptr}, rim{nullptr}, hvGeo{nullptr};
     bool hvShown = false;
 
@@ -190,8 +203,8 @@ struct ControlCenter::Impl {
     svc::PowerMode mode = svc::PowerMode::Unknown;
     std::wstring ssid;
     std::vector<Item> items;
-    Item hover, pressed, lifted;
-    bool tracking = false, synced = false;
+    Item hover, pressed;
+    bool tracking = false, synced = false, settling = false, held = false, needSync = false;
     bool byPointer = false, entered = false;  // opened from the screen edge; the pointer has been over the panel
     ULONGLONG outSince = 0;
     bool powerOpen = false;
@@ -210,6 +223,7 @@ struct ControlCenter::Impl {
     void Close();
     void Teardown();
     void CheckPointer();
+    void Settle();
     void Focus();
     void BuildFonts();
     void SyncAll();
@@ -225,9 +239,9 @@ struct ControlCenter::Impl {
     wuc::CompositionBrush NoiseBrush(int w, int h);
     void Pulse(Item const& it);
     void SetHover(Item const* it);
-    void Lift(Item const* it);
-    void PaintLift();
-    void Lean(float x, float y);
+    void SyncChips();
+    int ChipOf(Item const* it) const;
+    void HoverChip(int i);
     void Squash(bool down);
     void Click(Item const& it);
     void LaunchAfterClose(wchar_t const* uri);
@@ -308,6 +322,7 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_LBUTTONDOWN:
             if (st != St::Open) return 0;
+            Settle();  // a click shows its result at once
             if (x < 0 || y < 0 || x >= kW || y >= height) { Close(); return 0; }  // the transparent margin is "outside"
             if (auto* it = HitAt(x, y)) {
                 if (it->id == Id::Bright || it->id == Id::Vol) {
@@ -316,7 +331,7 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     DragTo(x);
                 } else {
                     pressed = *it;
-                    if (Scalable(it->id)) { Lift(it); Squash(true); }
+                    if (Scalable(it->id)) { HoverChip(ChipOf(it)); Squash(true); }
                 }
             }
             return 0;
@@ -327,20 +342,20 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
                 tracking = TrackMouseEvent(&tme);
             }
+            if (ptr) ptr.InsertVector2(L"P", {x * s, y * s});
             auto* it = HitAt(x, y);
             Item now = it ? *it : Item{};
             if (!Same(now, hover)) {
                 hover = now;
                 SetHover(it);
-                if (pressed.id == Id::None) Lift(it && Scalable(it->id) ? it : nullptr);
+                if (pressed.id == Id::None) HoverChip(ChipOf(it));
             }
-            Lean(x, y);
             return 0;
         }
         case WM_MOUSELEAVE:
             tracking = false;
             if (hover.id != Id::None) { hover = {}; SetHover(nullptr); }
-            if (pressed.id == Id::None) Lift(nullptr);
+            if (pressed.id == Id::None) HoverChip(-1);
             return 0;
         case WM_LBUTTONUP:
         case WM_CAPTURECHANGED:
@@ -356,10 +371,9 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     Item c = *it;  // Click re-lays-out and invalidates `it`
                     Click(c);
                 }
-                if (st == St::Open && !Same(hover, lifted)) Lift(hover.id != Id::None && Scalable(hover.id) ? &hover : nullptr);
+                if (st == St::Open) HoverChip(ChipOf(hover.id != Id::None ? &hover : nullptr));
             }
             return 0;
-        case kMsgSync: if (st == St::Open) { SyncAll(); Render(); } return 0;
         case kMsgAudio: SyncSpeaker(); Render(); return 0;
         case kMsgMic: SyncMic(); Render(); return 0;
         case kMsgRadios:
@@ -386,6 +400,7 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == kTimerClose) Teardown();
             else if (w == kTimerLeave) CheckPointer();
+            else if (w == kTimerSettle) Settle();
             else if (w == kTimerClock && st == St::Open) {
                 SYSTEMTIME t;
                 GetLocalTime(&t);
@@ -431,9 +446,9 @@ void ControlCenter::Impl::Open(bool pointer) {
         BOOL on = TRUE;
         DwmSetWindowAttribute(hwnd, 17 /* DWMWA_USE_HOSTBACKDROPBRUSH */, &on, sizeof(on));
         // The reads (audio endpoints above all) cost ~20 ms: after the first open the panel shows with
-        // what it read last time and syncs right after its first frame.
+        // what it read last time and syncs once the motion has settled.
+        needSync = synced;
         if (!synced) SyncAll();
-        else PostMessageW(hwnd, kMsgSync, 0, 0);
         synced = true;
         Layout();
         const int pad = static_cast<int>(std::lround(motion::kPad * s)), mg = static_cast<int>(std::lround(kMargin * s));
@@ -450,7 +465,9 @@ void ControlCenter::Impl::Open(bool pointer) {
         // From the edge the panel only shows (the app under the pointer keeps the keyboard, and nothing
         // waits on a foreground change); a click in it activates it like any window.
         ShowWindow(hwnd, pointer ? SW_SHOWNOACTIVATE : SW_SHOW);
-        motion::In(comp, pill, {pad * 1.0f, pad * 1.0f, 0}, {static_cast<float>(wPx), 0}, {0, -28.0f * s});
+        motion::In(comp, pill, {pad * 1.0f, pad * 1.0f, 0}, {0, -static_cast<float>(hPx + pad)});  // down out of the top edge
+        settling = true;
+        SetTimer(hwnd, kTimerSettle, kSettleMs, nullptr);
         {
             LARGE_INTEGER q1;
             QueryPerformanceCounter(&q1);
@@ -484,9 +501,10 @@ void ControlCenter::Impl::Focus() {
 
 void ControlCenter::Impl::Close() {
     if (st != St::Open) return;
-    Lift(nullptr);  // while the base surface still renders: the control goes back into it
+    settling = held = needSync = false;
     st = St::Closing;
     KillTimer(hwnd, kTimerLeave);
+    KillTimer(hwnd, kTimerSettle);
     // Nothing listens while the panel is hidden.
     speaker.Unbind();
     mic.Unbind();
@@ -498,7 +516,7 @@ void ControlCenter::Impl::Close() {
     hover = pressed = {};
     drag = Id::None;
     const float pad = motion::kPad * s;
-    motion::Out(comp, pill, {pad, pad, 0}, {std::ceil(kW * s), 0}, {0, -28.0f * s});
+    motion::Out(comp, pill, {pad, pad, 0}, {0, -(std::ceil(height * s) + pad)});
     SetTimer(hwnd, kTimerClose, motion::kOutMs + 10, nullptr);
     if (api->onHidden) api->onHidden();
 }
@@ -517,14 +535,16 @@ void ControlCenter::Impl::Teardown() {
     powerOpen = false;
     expand = Expand::None;
     btAsked = false;
-    hover = pressed = lifted = {};
+    hover = pressed = {};
     tracking = false;
     hvShown = false;
     if (hwnd) { KillTimer(hwnd, kTimerClose); DestroyWindow(hwnd); }
     hwnd = nullptr;
     if (surf) surf.Close();
-    if (pvSurf) pvSurf.Close();
-    surf = nullptr; pvSurf = nullptr; content = nullptr; pv = nullptr; hv = nullptr; hvGeo = nullptr;
+    for (auto& c : chips) if (c.surf) c.surf.Close();
+    chips.clear();
+    hotChip = -1;
+    surf = nullptr; content = nullptr; chipLayer = nullptr; ptr = nullptr; hv = nullptr; hvGeo = nullptr;
     pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr;
     items.clear();
     st = St::Closed;
@@ -564,7 +584,7 @@ void ControlCenter::Impl::Pulse(Item const& it) {
 // One composition highlight that glides between controls (the surface itself is not redrawn on hover).
 void ControlCenter::Impl::SetHover(Item const* it) {
     if (!hv || !hvGeo) return;
-    bool show = it && it->id != Id::Bright && it->id != Id::Vol && !Scalable(it->id);  // a lifted control is its own highlight
+    bool show = it && it->id != Id::Bright && it->id != Id::Vol && !Scalable(it->id);  // a chip is its own highlight
     if (!show) {
         if (hvShown) {
             hvShown = false;
@@ -600,113 +620,112 @@ void ControlCenter::Impl::SetHover(Item const* it) {
     hv.StartAnimation(L"Opacity", a);
 }
 
-// Hover and press feedback, the dock's way: the control's own drawing is lifted onto a small surface
-// that springs up by ~kLiftPx under the pointer and leans a little toward it (magnetic), squashes to
-// kPressScale under the finger, and bounces back when released. The base surface skips the lifted
-// control, so nothing is drawn twice: one re-render per hover change.
-void ControlCenter::Impl::Lift(Item const* it) {
-    if (!pill || (it && Same(*it, lifted)) || (!it && lifted.id == Id::None && !pv)) return;
-    if (pv) {  // the old one settles and fades over the base surface, which draws it again
-        auto old = std::exchange(pv, nullptr);
-        auto oldSurf = std::exchange(pvSurf, nullptr);
-        auto batch = comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-        auto home = comp.CreateSpringVector3Animation();
-        home.FinalValue(Ref3(1.0f));
-        home.DampingRatio(0.6f);
-        home.Period(45ms);
-        old.StartAnimation(L"Scale", home);
+// Hover and press feedback, the dock's way: every Scalable control is drawn onto its own little surface
+// (a chip, like a dock icon), so hovering never redraws anything. The hovered chip springs up by about
+// kLiftPx and leans toward the pointer through an expression the compositor evaluates from `ptr`
+// (no animation restarts on mouse moves); it squashes to kPressScale under the finger and bounces back.
+void ControlCenter::Impl::SyncChips() {
+    if (!chipLayer) return;
+    std::vector<Chip> next;
+    for (auto const& it : items) {
+        if (!Scalable(it.id)) continue;
+        const int l = static_cast<int>(std::floor(it.r.left * s)), t = static_cast<int>(std::floor(it.r.top * s));
+        const int w = static_cast<int>(std::ceil(it.r.right * s)) - l, h = static_cast<int>(std::ceil(it.r.bottom * s)) - t;
+        Chip c;
+        for (auto& old : chips)  // the same control in the same place keeps its visual (and its animation)
+            if (old.v && Same(old.it, it) && old.rest.x == l && old.rest.y == t && old.size.x == w && old.size.y == h) {
+                c = std::move(old);
+                old.v = nullptr;
+                break;
+            }
+        if (!c.v) {
+            c.surf = gdev.CreateDrawingSurface({static_cast<float>(w), static_cast<float>(h)},
+                                               winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                               winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+            c.v = comp.CreateSpriteVisual();
+            c.v.Size({static_cast<float>(w), static_cast<float>(h)});
+            c.rest = {static_cast<float>(l), static_cast<float>(t), 0};
+            c.size = {static_cast<float>(w), static_cast<float>(h)};
+            c.v.Offset(c.rest);
+            c.v.CenterPoint({w / 2.0f, h / 2.0f, 0});
+            auto sb = comp.CreateSurfaceBrush(c.surf);
+            sb.Stretch(wuc::CompositionStretch::None);
+            c.v.Brush(sb);
+            chipLayer.Children().InsertAtTop(c.v);
+        }
+        c.it = it;
+        c.lift = std::clamp(1 + kLiftPx / std::min(it.r.right - it.r.left, it.r.bottom - it.r.top), 1.03f, 1.09f);
+        auto interop = c.surf.as<ICompositionDrawingSurfaceInterop>();
+        winrt::com_ptr<ID2D1DeviceContext> dc;
+        POINT off{};
+        if (SUCCEEDED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) {
+            try {
+                Paint(dc.get(), off.x - c.rest.x, off.y - c.rest.y, &it, nullptr);
+            } catch (...) {}
+            interop->EndDraw();
+        }
+        next.push_back(std::move(c));
+    }
+    for (auto& old : chips)
+        if (old.v) {
+            chipLayer.Children().Remove(old.v);
+            if (old.surf) old.surf.Close();
+        }
+    const Item was = hotChip >= 0 && hotChip < static_cast<int>(chips.size()) ? chips[hotChip].it : Item{};
+    chips = std::move(next);
+    hotChip = -1;
+    for (size_t i = 0; i < chips.size(); i++)
+        if (was.id != Id::None && Same(chips[i].it, was)) hotChip = static_cast<int>(i);
+}
+
+int ControlCenter::Impl::ChipOf(Item const* it) const {
+    if (!it || !Scalable(it->id)) return -1;
+    for (size_t i = 0; i < chips.size(); i++)
+        if (Same(chips[i].it, *it)) return static_cast<int>(i);
+    return -1;
+}
+
+void ControlCenter::Impl::HoverChip(int i) {
+    if (i == hotChip) return;
+    if (hotChip >= 0 && hotChip < static_cast<int>(chips.size())) {  // the old one settles back
+        auto& c = chips[hotChip];
+        auto scale = comp.CreateSpringVector3Animation();
+        scale.FinalValue(Ref3(1.0f));
+        scale.DampingRatio(0.6f);
+        scale.Period(45ms);
+        c.v.StartAnimation(L"Scale", scale);
         auto back = comp.CreateSpringVector3Animation();
-        back.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(pvRest));
+        back.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(c.rest));
         back.DampingRatio(0.6f);
         back.Period(45ms);
-        old.StartAnimation(L"Offset", back);
-        auto fade = comp.CreateScalarKeyFrameAnimation();
-        fade.InsertKeyFrame(0.4f, 1.0f);
-        fade.InsertKeyFrame(1.0f, 0.0f);
-        fade.Duration(180ms);
-        old.StartAnimation(L"Opacity", fade);
-        batch.End();
-        batch.Completed([parent = pill, old, oldSurf](auto&&, auto&&) {
-            parent.Children().Remove(old);
-            if (oldSurf) oldSurf.Close();
-        });
+        c.v.StartAnimation(L"Offset", back);
     }
-    if (!it || st != St::Open) {
-        lifted = {};
-        Render();
-        return;
-    }
-    lifted = *it;
-    int l = static_cast<int>(std::floor(it->r.left * s)), t = static_cast<int>(std::floor(it->r.top * s));
-    int w = static_cast<int>(std::ceil(it->r.right * s)) - l, h = static_cast<int>(std::ceil(it->r.bottom * s)) - t;
-    pvSurf = gdev.CreateDrawingSurface({static_cast<float>(w), static_cast<float>(h)},
-                                       winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                                       winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-    pv = comp.CreateSpriteVisual();
-    pv.Size({static_cast<float>(w), static_cast<float>(h)});
-    pvRest = {static_cast<float>(l), static_cast<float>(t), 0};
-    pv.Offset(pvRest);
-    pv.CenterPoint({w / 2.0f, h / 2.0f, 0});
-    auto sb = comp.CreateSurfaceBrush(pvSurf);
-    sb.Stretch(wuc::CompositionStretch::None);
-    pv.Brush(sb);
-    pill.Children().InsertAtTop(pv);
-    Render();  // the base surface leaves the control out, and PaintLift draws it on pv
-    liftScale = std::clamp(1 + kLiftPx / std::min(it->r.right - it->r.left, it->r.bottom - it->r.top), 1.03f, 1.09f);
+    hotChip = i;
+    if (i < 0) return;
+    auto& c = chips[i];
     auto grow = comp.CreateSpringVector3Animation();
-    grow.InitialValue(Ref3(1.0f));
-    grow.FinalValue(Ref3(liftScale));
+    grow.FinalValue(Ref3(c.lift));
     grow.DampingRatio(0.55f);
     grow.Period(45ms);
-    pv.StartAnimation(L"Scale", grow);
-}
-
-// Draws the lifted control onto its own surface, after every Render so a toggle that changed shows.
-void ControlCenter::Impl::PaintLift() {
-    if (!pvSurf || lifted.id == Id::None) return;
-    Item const* cur = nullptr;
-    for (auto const& i : items)
-        if (Same(i, lifted)) { cur = &i; break; }
-    if (!cur || std::floor(cur->r.left * s) != pvRest.x || std::floor(cur->r.top * s) != pvRest.y) {  // it moved or went
-        Lift(nullptr);
-        return;
-    }
-    lifted = *cur;
-    auto interop = pvSurf.as<ICompositionDrawingSurfaceInterop>();
-    winrt::com_ptr<ID2D1DeviceContext> dc;
-    POINT off{};
-    if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) return;
-    try {
-        Paint(dc.get(), off.x - pvRest.x, off.y - pvRest.y, cur, nullptr);
-    } catch (...) {}
-    interop->EndDraw();
-}
-
-// The lifted control leans a few px toward the pointer, as if pulled by it.
-void ControlCenter::Impl::Lean(float x, float y) {
-    if (!pv || pressed.id != Id::None) return;
-    auto pull = [](float d) { return std::clamp(d * kLean, -kLeanMax, kLeanMax); };
-    const float dx = pull(x - (lifted.r.left + lifted.r.right) / 2), dy = pull(y - (lifted.r.top + lifted.r.bottom) / 2);
-    auto a = comp.CreateSpringVector3Animation();
-    a.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(wfn::float3{pvRest.x + dx * s, pvRest.y + dy * s, 0}));
-    a.DampingRatio(0.7f);
-    a.Period(40ms);
-    pv.StartAnimation(L"Offset", a);
+    c.v.StartAnimation(L"Scale", grow);
+    auto lean = comp.CreateExpressionAnimation(
+        L"Vector3(rest.X + Clamp((ptr.P.X - mid.X) * k, -m, m), rest.Y + Clamp((ptr.P.Y - mid.Y) * k, -m, m), 0)");
+    lean.SetReferenceParameter(L"ptr", ptr);
+    lean.SetVector3Parameter(L"rest", c.rest);
+    lean.SetVector2Parameter(L"mid", {c.rest.x + c.size.x / 2, c.rest.y + c.size.y / 2});
+    lean.SetScalarParameter(L"k", kLean);
+    lean.SetScalarParameter(L"m", kLeanMax * s);
+    c.v.StartAnimation(L"Offset", lean);
 }
 
 void ControlCenter::Impl::Squash(bool down) {
-    if (!pv) return;
-    if (down) {  // a press lets go of the lean
-        auto back = comp.CreateSpringVector3Animation();
-        back.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(pvRest));
-        back.Period(30ms);
-        pv.StartAnimation(L"Offset", back);
-    }
+    if (hotChip < 0 || hotChip >= static_cast<int>(chips.size())) return;
+    auto& c = chips[hotChip];
     auto spring = comp.CreateSpringVector3Animation();
-    spring.FinalValue(Ref3(down ? kPressScale : liftScale));
+    spring.FinalValue(Ref3(down ? kPressScale : c.lift));
     spring.DampingRatio(down ? 0.55f : 0.42f);  // the release overshoots: the bounce
     spring.Period(down ? 35ms : 50ms);
-    pv.StartAnimation(L"Scale", spring);
+    c.v.StartAnimation(L"Scale", spring);
 }
 
 // Auto-hide. Inside: the panel (and kLeaveSlack around it), the notification column, and, until the
@@ -1077,8 +1096,17 @@ void ControlCenter::Impl::ApplySize() {
     if (st == St::Open && api->onResized) api->onResized();
 }
 
+void ControlCenter::Impl::Settle() {
+    if (!settling) return;
+    settling = false;
+    if (hwnd) KillTimer(hwnd, kTimerSettle);
+    if (std::exchange(needSync, false)) { SyncAll(); held = true; }
+    if (std::exchange(held, false)) Render();
+}
+
 void ControlCenter::Impl::Render() {
     if (!surf || st != St::Open) return;
+    if (settling) { held = true; return; }
     Layout();
     ApplySize();
     auto interop = surf.as<ICompositionDrawingSurfaceInterop>();
@@ -1086,10 +1114,10 @@ void ControlCenter::Impl::Render() {
     POINT off{};
     if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) return;
     try {
-        Paint(dc.get(), static_cast<float>(off.x), static_cast<float>(off.y), nullptr, lifted.id != Id::None ? &lifted : nullptr);
+        Paint(dc.get(), static_cast<float>(off.x), static_cast<float>(off.y), nullptr, nullptr);
     } catch (...) {}
     interop->EndDraw();
-    PaintLift();
+    SyncChips();
 }
 
 // Draws every item (or just `only`, minus `skip`) with the panel origin at (tx, ty) device px.
@@ -1175,6 +1203,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
     for (auto const& it : items) {
         if (only && !Same(it, *only)) continue;
         if (skip && Same(it, *skip)) continue;
+        if (!only && chipLayer && Scalable(it.id)) continue;  // drawn on its chip
         auto const& r = it.r;
         const float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
         switch (it.id) {
@@ -1410,12 +1439,9 @@ void ControlCenter::Impl::BuildVisuals() {
 
     auto glass = comp.CreateSpriteVisual();
     glass.RelativeSizeAdjustment({1, 1});
-    try {
-        auto blur = winrt::make<GaussianBlurEffect>(wuc::CompositionEffectSourceParameter(L"backdrop"), 40.0f);
-        auto brush = comp.CreateEffectFactory(blur.as<winrt::Windows::Graphics::Effects::IGraphicsEffect>()).CreateBrush();
-        brush.SetSourceParameter(L"backdrop", comp.CreateHostBackdropBrush());
-        glass.Brush(brush);
-    } catch (...) { svc::Log(L"blur brush failed"); }
+    // The host backdrop already comes blurred by DWM; another Gaussian pass on top cost dropped frames
+    // whenever the panel moved (measured with tools/framegaps.cpp) for a barely softer look.
+    glass.Brush(comp.CreateHostBackdropBrush());
     inner.Children().InsertAtTop(glass);
 
     auto tint = comp.CreateSpriteVisual();
@@ -1483,6 +1509,12 @@ void ControlCenter::Impl::BuildVisuals() {
         rimVisual.Shapes().Append(edge);
     }
     inner.Children().InsertAtTop(rimVisual);
+
+    chipLayer = comp.CreateContainerVisual();
+    chipLayer.RelativeSizeAdjustment({1, 1});
+    pill.Children().InsertAtTop(chipLayer);
+    ptr = comp.CreatePropertySet();
+    ptr.InsertVector2(L"P", {-1000, -1000});
 
     clip = comp.CreateRoundedRectangleGeometry();
     clip.CornerRadius({kRadius * s, kRadius * s});
