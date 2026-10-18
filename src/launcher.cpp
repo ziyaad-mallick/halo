@@ -43,6 +43,37 @@ __CRT_UUID_DECL(ICompositionDrawingSurfaceInterop, 0xFD04E6E3, 0xFE0C, 0x4C3C, 0
 namespace halo {
 namespace {
 
+// Soft drop shadow for a rounded rect. The sprite has no brush of its own (only the shadow draws), so a
+// translucent glass above it never shows the white mask.
+wuc::SpriteVisual MakeShadow(wuc::Compositor const& comp, wuc::CompositionGraphicsDevice const& gdev, float wPx, float hPx,
+                             float radPx, float blur, float dy, theme::Argb col) {
+    if (col.a == 0 || blur <= 0) return nullptr;
+    try {
+        auto surface = gdev.CreateDrawingSurface({wPx, hPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                                 winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+        auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
+        winrt::com_ptr<ID2D1DeviceContext> dc;
+        POINT off{};
+        if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) return nullptr;
+        dc->Clear(D2D1::ColorF(0, 0.0f));
+        winrt::com_ptr<ID2D1SolidColorBrush> b;
+        dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), b.put());
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(off.x + 0.0f, off.y + 0.0f, off.x + wPx, off.y + hPx), radPx, radPx), b.get());
+        interop->EndDraw();
+        auto mask = comp.CreateSurfaceBrush(surface);
+        mask.Stretch(wuc::CompositionStretch::Fill);
+        auto sh = comp.CreateDropShadow();
+        sh.BlurRadius(blur);
+        sh.Color(theme::C(col));
+        sh.Offset({0, dy, 0});
+        sh.Mask(mask);
+        auto v = comp.CreateSpriteVisual();
+        v.Size({wPx, hPx});
+        v.Shadow(sh);
+        return v;
+    } catch (...) { return nullptr; }
+}
+
 // Layout, logical px.
 constexpr float kPad = 24;
 constexpr float kLabelH = 16;
@@ -358,6 +389,8 @@ void Launcher::LoadFiles() {
 
 // ---- Drawing --------------------------------------------------------------------------------
 
+winrt::Windows::Foundation::Numerics::float3 Launcher::PanelHome() const { return {m_shadowM, kTop * m_s, 0}; }
+
 wuc::CompositionDrawingSurface Launcher::MakeSurface(float w, float h) {
     return m_gdev.CreateDrawingSurface({std::ceil(w), std::ceil(h)},
                                        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -528,6 +561,35 @@ void Launcher::Build() {
 
     // Visual tree: [glass] [content: hover plate, text surface, app icons] [menu].
     m_root.Children().RemoveAll();
+    {   // transparent margin around the panel that the drop shadow lives in (left, right, bottom)
+        auto const& pal = theme::P();
+        m_shadowM = pal.shadow.a ? std::ceil(pal.shadowBlur * s) : 0.0f;
+        m_shadowB = pal.shadow.a ? std::ceil((pal.shadowBlur + pal.shadowY) * s) : 0.0f;
+    }
+    m_shadowHold = nullptr;
+    if (m_shadowM > 0) {
+        const float ext = m_stackW > 0 ? 40 * s : 0;  // under the palette the panel is square-topped and taller
+        if (auto sh = MakeShadow(m_comp, m_gdev, std::ceil(m_w), std::ceil(m_h + ext), kPanelRadius * s,
+                                 theme::P().shadowBlur * s, theme::P().shadowY * s, theme::P().shadow)) {
+            sh.Size({m_w, m_h + ext});
+            sh.Offset({0, -ext, 0});
+            m_shadowHold = m_comp.CreateContainerVisual();
+            m_shadowHold.Size({m_w, m_h});
+            m_shadowHold.Offset(PanelHome());
+            m_shadowHold.Children().InsertAtTop(sh);
+            m_root.Children().InsertAtTop(m_shadowHold);
+        }
+    }
+    // The stage clips the panel to the old window rect, so the rise/exit still happens behind the window bottom edge.
+    auto stage = m_comp.CreateContainerVisual();
+    stage.Offset({m_shadowM, 0, 0});
+    stage.Size({m_w, kTop * s + m_h});
+    {
+        auto sc = m_comp.CreateRectangleClip();
+        sc.Left(0); sc.Top(0); sc.Right(m_w); sc.Bottom(kTop * s + m_h);
+        stage.Clip(sc);
+    }
+    m_root.Children().InsertAtTop(stage);
     m_panel = m_comp.CreateContainerVisual();
     m_panel.Size({m_w, m_h});
     m_panel.Offset({0, kTop * s, 0});
@@ -539,7 +601,7 @@ void Launcher::Build() {
         clip.Size({m_w, m_h + 40 * s});
     }
     m_panel.Clip(m_comp.CreateGeometricClip(clip));
-    m_root.Children().InsertAtTop(m_panel);
+    stage.Children().InsertAtTop(m_panel);
 
     if (m_host.glass) {
         auto glass = m_host.glass(static_cast<int>(std::ceil(m_h)));
@@ -803,6 +865,7 @@ void Launcher::Show(LauncherAnchor const& anchor, bool standalone) {
     m_panel.Offset({0, home, 0});
     Place();
     motion::In(m_comp, m_panel, {0, home, 0}, {m_w / 2, m_h}, {0, kRise * m_s});
+    if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), {m_w / 2, m_h}, {0, kRise * m_s});
     ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     SetTimer(m_hwnd, kRefreshTimer, 420, nullptr);  // once, after the rise has settled
 
@@ -828,6 +891,7 @@ void Launcher::Hide() {
     unsigned gen = ++m_gen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     motion::Out(m_comp, m_panel, {0, kTop * m_s, 0}, {m_w / 2, m_h}, {0, kRise * m_s});
+    if (m_shadowHold) motion::Out(m_comp, m_shadowHold, PanelHome(), {m_w / 2, m_h}, {0, kRise * m_s});
     batch.End();
     batch.Completed([this, gen](auto&&, auto&&) {
         if (gen == m_gen && !m_open) Close();
@@ -921,14 +985,16 @@ void Launcher::Place() {
     int x = std::clamp(m_anchor.centerX - static_cast<int>(m_w) / 2, static_cast<int>(m_anchor.monitor.left),
                        static_cast<int>(m_anchor.monitor.right - m_w));
     int margin = static_cast<int>(kTop * m_s);
+    int mx = static_cast<int>(m_shadowM), mb = static_cast<int>(m_shadowB);
     int top = (m_glueTop > 0 ? m_glueTop : m_anchor.bottom - static_cast<int>(m_h)) - margin;
-    SetWindowPos(m_hwnd, HWND_TOPMOST, x, top, static_cast<int>(m_w), static_cast<int>(m_h) + margin,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    int winW = static_cast<int>(m_w) + 2 * mx, winH = static_cast<int>(m_h) + margin + mb;
+    SetWindowPos(m_hwnd, HWND_TOPMOST, x - mx, top, winW, winH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     // Under the palette the transparent margin would sit on top of its bottom edge: leave it out of the window.
-    SetWindowRgn(m_hwnd, m_stackW > 0 ? CreateRectRgn(0, margin, static_cast<int>(m_w), static_cast<int>(m_h) + margin) : nullptr, TRUE);
+    // The side and bottom shadow margins stay in the region so the shadow draws; WM_NCHITTEST lets clicks through them.
+    SetWindowRgn(m_hwnd, m_stackW > 0 ? CreateRectRgn(0, margin, winW, winH) : nullptr, TRUE);
     if (EnvIs(L"HALO_TEST")) {
         auto mid = [&](D2D1_RECT_F const& r) {
-            return std::to_wstring(static_cast<int>((r.left + r.right) / 2)) + L"," +
+            return std::to_wstring(static_cast<int>((r.left + r.right) / 2 + m_shadowM)) + L"," +
                    std::to_wstring(static_cast<int>((r.top + r.bottom) / 2 + kTop * m_s));
         };
         Log(L"test points: power=" + mid(m_powerRect) + L" settings=" + mid(m_settingsRect) + L" app0=" + mid(m_hits[0].r) +
@@ -1164,6 +1230,12 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        case WM_NCHITTEST: {  // the shadow margins (sides, bottom) are not part of the panel: clicks go to what is beneath
+            POINT pt{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
+            ScreenToClient(m_hwnd, &pt);
+            if (pt.x < m_shadowM || pt.x >= m_shadowM + m_w || pt.y >= kTop * m_s + m_h) return HTTRANSPARENT;
+            return HTCLIENT;
+        }
         case WM_TIMER:
             if (w == kStackTimer) {
                 KillTimer(m_hwnd, kStackTimer);
@@ -1187,7 +1259,7 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, m_hwnd, 0};
                 m_tracking = TrackMouseEvent(&tme);
             }
-            if (m_open) OnHover(mx, my);
+            if (m_open) OnHover(mx - m_shadowM, my);
             return 0;
         case WM_MOUSELEAVE:
             m_tracking = false;
@@ -1195,13 +1267,13 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_LBUTTONDOWN:
             if (m_open) {
-                auto const* hit = HitAt(mx, my - kTop * m_s);
+                auto const* hit = HitAt(mx - m_shadowM, my - kTop * m_s);
                 m_pressedIndex = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
             }
             return 0;
         case WM_LBUTTONUP:
             if (m_open) {
-                auto const* hit = HitAt(mx, my - kTop * m_s);
+                auto const* hit = HitAt(mx - m_shadowM, my - kTop * m_s);
                 int key = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
                 if (hit && key == m_pressedIndex) {
                     Hit copy = *hit;

@@ -122,6 +122,9 @@ private:
     wuc::Desktop::DesktopWindowTarget m_target{nullptr};
     wuc::ContainerVisual m_root{nullptr};
     wuc::ContainerVisual m_panel{nullptr};
+    wuc::ContainerVisual m_shadowHold{nullptr};  // carries the drop shadow, animated with m_panel
+    float m_shadowM = 0, m_shadowB = 0;          // shadow margin (px) at the sides / bottom of the window
+    winrt::Windows::Foundation::Numerics::float3 PanelHome() const;
     wuc::ContainerVisual m_content{nullptr};  // the panel's contents; dims behind the menu
     wuc::ShapeVisual m_hover{nullptr};
     wuc::CompositionRoundedRectangleGeometry m_hoverShape{nullptr};
