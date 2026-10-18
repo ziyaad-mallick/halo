@@ -9,8 +9,11 @@
 namespace halo::edge {
 namespace {
 
-constexpr UINT kCornerDwellMs = 120;   // resting in the hot zone this long opens the Control Center
-constexpr float kZone = 0.2f;          // the hot zone: this fraction of the bottom edge, from the right
+// The hot zone and its dwell come from settings.ini ([controlcenter] hot_corner, corner_width, corner_delay);
+// the hook thread reads these atomics, Configure() writes them.
+std::atomic<bool> g_hot{true};
+std::atomic<UINT> g_dwellMs{120};      // resting in the hot zone this long opens the Control Center
+std::atomic<float> g_zone{0.2f};       // the hot zone: this fraction of the bottom edge, from the right
 constexpr DWORD kCooldownMs = 700;    // after a gesture fires
 constexpr float kNearBand = 160;      // logical px from an edge where the strips turn click-through
 constexpr float kStrip = 4;           // touch strip thickness, logical px
@@ -41,7 +44,7 @@ struct Mouse {
 } g_m;
 
 // The right fifth of the bottom edge, where the Windows taskbar keeps Quick Settings.
-bool InCorner(POINT p) { return p.y >= g_bottom - 1 && p.x >= g_rightX - static_cast<long>((g_rightX - g_left) * kZone); }
+bool InCorner(POINT p) { return g_hot && p.y >= g_bottom - 1 && p.x >= g_rightX - static_cast<long>((g_rightX - g_left) * g_zone.load()); }
 
 void CALLBACK CornerTimer(HWND, UINT, UINT_PTR id, DWORD) {
     KillTimer(nullptr, id);
@@ -68,7 +71,7 @@ void OnMove(POINT p, DWORD t) {
     if (InCorner(p)) {
         if (!g_m.inCorner && !cooling) {
             g_m.inCorner = true;
-            g_m.cornerTimer = SetTimer(nullptr, 0, kCornerDwellMs, &CornerTimer);
+            g_m.cornerTimer = SetTimer(nullptr, 0, std::max<UINT>(g_dwellMs, USER_TIMER_MINIMUM), &CornerTimer);
         }
     } else if (g_m.inCorner) {
         CancelCorner();
@@ -196,5 +199,11 @@ void Stop() {
 }
 
 void OnDisplayChange() { Place(); }
+
+void Configure(bool hotCorner, int widthPct, int delayMs) {
+    g_hot = hotCorner;
+    g_zone = widthPct / 100.0f;
+    g_dwellMs = static_cast<UINT>(std::max(0, delayMs));
+}
 
 }  // namespace halo::edge

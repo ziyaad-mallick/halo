@@ -29,6 +29,8 @@ constexpr float kPressDarkness = 0.3f;
 constexpr int kBounceMs = 350;     // one bounce, up and back down
 constexpr int kBounces = 3;
 constexpr float kDotOpacity = 0.7f;
+// [taskbar] running_dots off: the dots are never shown.
+float DotOpacity() { return halo::settings::Get().taskbar.runningDots ? kDotOpacity : 0.0f; }
 
 // Starts an animation, naming the property and expression if it is rejected.
 void Start(CompositionObject const& target, wchar_t const* property, CompositionAnimation const& anim,
@@ -181,7 +183,7 @@ Dock::Entry Dock::MakeEntry(Item const& item, bool instant) {
     sv.Size({dot, dot});
     sv.Shapes().Append(shape);
     sv.Offset({0, m_m.bottom - (m_m.pillHeight - m_m.restSize) / 2 + dot, 0});
-    sv.Opacity(instant && item.running ? kDotOpacity : 0.0f);
+    sv.Opacity(instant && item.running ? DotOpacity() : 0.0f);
     m_root.Children().InsertAtTop(sv);
     e.dot = sv;
     return e;
@@ -200,7 +202,7 @@ void Dock::SetItems(std::vector<Item> const& items) {
         if (j == m_entries.size()) {
             merged.push_back(MakeEntry(item, first));
             if (!first) AnimateTo(merged.back().icon.Properties(), L"P", 1.0f, kPresenceMs);
-            if (!first && item.running) AnimateTo(merged.back().dot, L"Opacity", kDotOpacity, kFadeMs);
+            if (!first && item.running) AnimateTo(merged.back().dot, L"Opacity", DotOpacity(), kFadeMs);
             continue;
         }
         kept[j] = true;
@@ -209,11 +211,11 @@ void Dock::SetItems(std::vector<Item> const& items) {
         if (e.leaving) {  // came back before it finished shrinking
             e.leaving = false;
             AnimateTo(e.icon.Properties(), L"P", 1.0f, kPresenceMs);
-            if (item.running) AnimateTo(e.dot, L"Opacity", kDotOpacity, kFadeMs);
+            if (item.running) AnimateTo(e.dot, L"Opacity", DotOpacity(), kFadeMs);
         }
         if (e.running != item.running) {
             e.running = item.running;
-            AnimateTo(e.dot, L"Opacity", item.running ? kDotOpacity : 0.0f, kFadeMs);
+            AnimateTo(e.dot, L"Opacity", item.running ? DotOpacity() : 0.0f, kFadeMs);
             if (item.running) Settle(e);  // the app we were bouncing for has opened
         }
         merged.push_back(e);
@@ -592,6 +594,11 @@ void Dock::OnClockTimer() {
 
 void Dock::OnTimeChange() {
     if (m_cluster) m_cluster->OnTimeChange();
+}
+
+// Takes the dock's visuals out of its parent, before a rebuild (no destructor: it can outlive the compositor).
+void Dock::Detach() {
+    if (m_root && m_root.Parent()) m_root.Parent().Children().Remove(m_root);
 }
 
 void Dock::OnSettingChange() {

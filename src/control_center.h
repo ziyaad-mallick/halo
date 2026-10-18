@@ -20,6 +20,8 @@ public:
     void Open(bool byPointer = false);
     void Close();
     bool IsOpen() const;
+    // settings.ini changed (glass, accent, layout toggles): a closed panel is rebuilt on its next open, an open one is closed first.
+    void OnSettingsChanged();
 
     // Where the panel is on screen (physical px); empty while it is closed. For things that stack
     // below it (notifications). Height changes when sections expand: see onResized.

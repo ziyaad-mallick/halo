@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "icons.h"
+#include "settings.h"
 
 namespace halo {
 
@@ -36,8 +37,8 @@ namespace wuc = winrt::Windows::UI::Composition;
 
 // What the panel needs from the dock that owns it.
 struct LauncherHost {
-    // The dock's glass (blur, tint, grain, rim), sized by its parent. The argument is the grain's height in px.
-    std::function<wuc::ContainerVisual(int)> glass;
+    // The dock's glass (blur, tint, grain, rim), sized by its parent. The arguments are the grain's height in px and the surface's settings (opacity, tint).
+    std::function<wuc::ContainerVisual(int, settings::Surface const&)> glass;
     // The dock's icon brush for a launch target (a .lnk, shell:AppsFolder\<AUMID> or exe), null if it has none.
     std::function<wuc::CompositionBrush(std::wstring const&)> appIcon;
     // Brings the app to the front if it is running, else starts it.
@@ -135,6 +136,7 @@ private:
     void ToggleMenu(bool open);
     void RunPower(int item);
     void Close();  // after the fade
+    void ShowDim(bool on);
 
     wuc::Compositor m_comp;
     wuc::CompositionGraphicsDevice m_gdev;
@@ -189,6 +191,8 @@ private:
     bool m_dryRun = false;
     float m_iconPx = 44;           // app icon size, logical px
 
+    HWND m_dim{};                 // [start] dim_desktop: the click-through sheet under the panel
+    bool m_showApps = true, m_showFiles = true;  // [start] recent_apps / recent_files are not 0
     bool m_open = false;
     bool m_activated = false;     // the panel has had activation since Show, so losing it means a click elsewhere
     bool m_menuOpen = false;

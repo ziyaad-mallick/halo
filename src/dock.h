@@ -52,6 +52,9 @@ public:
     // shows everything at once.
     void SetItems(std::vector<Item> const& items);
 
+    // Removes the dock's visuals from the parent (to replace it with a rebuilt one).
+    void Detach();
+
     // Pointer in the parent's coordinates. Move starts magnifying if needed.
     void OnPointerMove(float x);
     void OnPointerLeave();

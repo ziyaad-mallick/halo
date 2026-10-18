@@ -104,11 +104,10 @@ winrt::Windows::Foundation::IReference<wfn::float3> Ref3(float v) {
 }
 bool In(D2D1_RECT_F const& r, float x, float y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
 
-// Ink and fills come from the shared palette (light by default, HALO_THEME=dark for the old look).
-const D2D1_COLOR_F kText = theme::P().text, kDim = theme::P().dim, kOff = theme::P().off, kAccent = theme::P().accent,
-                   kOnAccent = theme::P().onAccent,
-                   kFill = theme::Dark() ? ColorF(1, 1, 1, 0.94f) : ColorF(1, 1, 1, 1.0f),
-                   kOnFill = theme::Dark() ? ColorF(0x1C1C1E) : ColorF(0.11f, 0.11f, 0.12f, 0.62f);
+// Ink and fills come from the shared palette (light by default, HALO_THEME=dark for the old look). These
+// refer into the live palette, so a theme or accent change from settings.ini shows at the next paint.
+const D2D1_COLOR_F &kText = theme::detail::Cur().text, &kDim = theme::detail::Cur().dim, &kOff = theme::detail::Cur().off,
+                   &kAccent = theme::detail::Cur().accent, &kOnAccent = theme::detail::Cur().onAccent;
 
 // A soft drop shadow that follows a rounded-rect mask. Lives under the clipped glass, so it
 // must be a sibling of the clipped container, not a child.
@@ -233,10 +232,13 @@ struct ControlCenter::Impl {
     void Teardown();
     void Park();
     float builtScale = 0;  // the DPI scale the window and visuals were built for
+    bool stale = false;    // settings changed the glass: rebuild the window and visuals on the next open
+    settings::ControlCenter const& cfg() const { return settings::Get().cc; }
     void CheckPointer();
     void Snapshot();
     // It rises a little as it fades in, from the bottom edge it lives on (and sinks back out).
     wfn::float2 Travel() const { return {0, ui::kEnterTravel * s}; }
+    wfn::float2 Corner() const { return {1, 1}; }  // the swoop grows from the bottom right, where it opens
     void Settle();
     void Focus();
     void BuildFonts();
@@ -466,7 +468,8 @@ void ControlCenter::Impl::Open(bool pointer) {
         BuildFonts();  // first open only
         // The window and its visual tree are built once and kept hidden between opens (Park): a new
         // backdrop window per open cost DWM the first frames of the slide. Rebuilt only for a new DPI.
-        if (hwnd && builtScale != s) Teardown();
+        if (hwnd && (builtScale != s || stale)) Teardown();
+        stale = false;
         if (!hwnd) {
             hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPanelClass,
                                    L"Halo Control Center", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, this);
@@ -493,7 +496,7 @@ void ControlCenter::Impl::Open(bool pointer) {
         Resize(static_cast<float>(hPx), false);
         st = St::Open;
         Render();
-        motion::In(comp, pill, {pad * 1.0f, TopPx(), 0}, Travel());  // before the show: no frame at rest first
+        motion::In(comp, pill, {pad * 1.0f, TopPx(), 0}, Travel(), cfg(), Corner());  // before the show: no frame at rest first
         // From the edge the panel only shows (the app under the pointer keeps the keyboard, and nothing
         // waits on a foreground change); a click in it activates it like any window.
         ShowWindow(hwnd, pointer ? SW_SHOWNOACTIVATE : SW_SHOW);
@@ -541,8 +544,8 @@ void ControlCenter::Impl::Close() {
     hover = pressed = {};
     drag = Id::None;
     const float pad = motion::kPad * s;
-    motion::Out(comp, pill, {pad, TopPx(), 0}, Travel());
-    SetTimer(hwnd, kTimerClose, motion::kOutMs + 10, nullptr);
+    motion::Out(comp, pill, {pad, TopPx(), 0}, Travel(), cfg(), Corner());
+    SetTimer(hwnd, kTimerClose, motion::OutMs(cfg()) + 10, nullptr);
     if (api->onHidden) api->onHidden();
 }
 
@@ -793,7 +796,7 @@ void ControlCenter::Impl::Squash(bool down) {
 // Auto-hide. Inside: the panel (and kLeaveSlack around it), the notification column, and, until the
 // pointer has first come over the panel, the screen-edge hot zone it came from. A slider drag holds it.
 void ControlCenter::Impl::CheckPointer() {
-    if (st != St::Open || drag != Id::None || (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
+    if (st != St::Open || !cfg().closeOnLeave || drag != Id::None || (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
     POINT p;
     if (!GetCursorPos(&p)) return;
     if (PtInRect(&rect, p)) entered = true;
@@ -810,7 +813,7 @@ void ControlCenter::Impl::CheckPointer() {
     }
     if (!in && !entered) {
         const long w = mon.right - mon.left;
-        in = p.y >= mon.bottom - 1 - slack && p.x >= mon.right - w / 5;
+        in = p.y >= mon.bottom - 1 - slack && p.x >= mon.right - w * cfg().cornerWidth / 100;
     }
     if (in) { outSince = 0; return; }
     const ULONGLONG now = GetTickCount64();
@@ -1099,7 +1102,7 @@ void ControlCenter::Impl::Layout() {
 
     // One module for both sliders: Display, then Sound (whose output list opens under it). The Sound row
     // is always laid out (greyed when there is no output), so the height never depends on the audio read.
-    {
+    if (cfg().showSliders) {
         const bool disp = bright >= 0;
         const float extra = outsOpen ? outs.size() * kListRowH + kS1 : 0;
         const float blk = kTitleLine + kS2 + kSliderH;  // a label over a track
@@ -1121,7 +1124,7 @@ void ControlCenter::Impl::Layout() {
     }
 
     // Now Playing: always there, so the panel never changes height when a session turns up.
-    {
+    if (cfg().showMedia) {
         add(Id::MediaTile, {x0, y, x1, y + kMediaH}, 0, kRadiusLarge);
         const float cy = y + kMediaH / 2, b = kRound;
         float r = x1 - kS3;
@@ -1282,6 +1285,8 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
     winrt::com_ptr<ID2D1SolidColorBrush> br;
     dc->CreateSolidColorBrush(kText, br.put());
     const bool darkTheme = theme::Dark();
+    const D2D1_COLOR_F kFill = darkTheme ? ColorF(1, 1, 1, 0.94f) : ColorF(1, 1, 1, 1.0f),
+                       kOnFill = darkTheme ? ColorF(0x1C1C1E) : ColorF(0.11f, 0.11f, 0.12f, 0.62f);
 
     auto box = [&](D2D1_RECT_F r, float rad, D2D1_COLOR_F c) {
         br->SetColor(c);
@@ -1522,7 +1527,7 @@ void ControlCenter::Impl::Snapshot() {
     auto dc = rt.try_as<ID2D1DeviceContext>();
     if (!dc) return;
     // The stand-in glass: the tint over a mid-dark backdrop, inside the panel's rounded shape.
-    const auto t = theme::P().tint;
+    const auto t = theme::Glass(cfg()).tint;
     const float k = t.a / 255.0f, back = theme::Dark() ? 0.22f : 0.75f;
     auto mix = [&](uint8_t c) { return c / 255.0f * k + back * (1 - k); };
     auto layer = std::exchange(chipLayer, nullptr);  // so Paint draws the chips too
@@ -1654,7 +1659,8 @@ void ControlCenter::Impl::BuildVisuals() {
 
     auto tint = comp.CreateSpriteVisual();
     tint.RelativeSizeAdjustment({1, 1});
-    tint.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(theme::P().tint.a, theme::P().tint.r, theme::P().tint.g, theme::P().tint.b)));
+    const auto glassTint = theme::Glass(cfg()).tint;
+    tint.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(glassTint.a, glassTint.r, glassTint.g, glassTint.b)));
     inner.Children().InsertAtTop(tint);
 
     try {
@@ -1776,6 +1782,12 @@ ControlCenter::~ControlCenter() {
     if (m->hot) DestroyWindow(m->hot);
 }
 
+// The glass or the layout toggles changed: a closed panel is torn down now, an open one closes and rebuilds on its next open.
+void ControlCenter::OnSettingsChanged() {
+    m->stale = true;
+    if (m->st == Impl::St::Open) m->Close();
+    else if (m->st == Impl::St::Closed && m->hwnd) m->Teardown();
+}
 void ControlCenter::Toggle() { IsOpen() ? Close() : Open(); }
 void ControlCenter::Open(bool byPointer) { m->Open(byPointer); }
 void ControlCenter::Close() { m->Close(); }

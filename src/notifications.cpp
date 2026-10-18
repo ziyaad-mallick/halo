@@ -75,7 +75,8 @@ constexpr UINT kMsgData = WM_APP + 1;
 constexpr UINT_PTR kTimerGone = 1, kTimerClose = 2;
 constexpr wchar_t kClass[] = L"HaloNotifications", kMsgClass[] = L"HaloNotificationsMsg";
 
-const D2D1_COLOR_F kText = theme::P().text, kDim = theme::P().dim;
+// Refers into the live palette: a theme or accent change shows at the next paint.
+const D2D1_COLOR_F &kText = theme::detail::Cur().text, &kDim = theme::detail::Cur().dim;
 // A subtle wash over glass: white-alpha in dark, a fainter ink wash in light.
 D2D1_COLOR_F Wash(float darkAlpha) { return theme::Dark() ? ColorF(1, 1, 1, darkAlpha) : ColorF(0, 0, 0, darkAlpha * 0.5f); }
 
@@ -320,7 +321,7 @@ struct NotificationCenter::Impl {
     // calendar
     SYSTEMTIME today{};
     int calYear = 0, calMonth = 0;
-    D2D1_COLOR_F accent = theme::P().accent;
+    const D2D1_COLOR_F& accent = theme::detail::Cur().accent;  // live, see kText
 
     winrt::com_ptr<IDWriteFactory> dw;
     winrt::com_ptr<IDWriteTextFormat> fApp, fTime, fTitle, fBody, fPill, fCount, fHead, fClear, fBig, fCalDow, fNav, fDay, fDayB, fDow;
@@ -865,7 +866,8 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
 
     auto tint = comp.CreateSpriteVisual();
     tint.RelativeSizeAdjustment({1, 1});
-    tint.Brush(comp.CreateColorBrush(theme::Dark() ? theme::C(theme::P().tint) : winrt::Windows::UI::ColorHelper::FromArgb(0xF0, 0xFA, 0xFA, 0xFC)));
+    const auto& gcc = settings::Get().cc;  // the notification column follows the Control Center's glass
+    tint.Brush(comp.CreateColorBrush(theme::Dark() || gcc.hasTint ? theme::C(theme::Glass(gcc).tint) : winrt::Windows::UI::ColorHelper::FromArgb(0xF0, 0xFA, 0xFA, 0xFC)));
     c.vis.Children().InsertAtTop(tint);
 
     if (noise) {
@@ -1374,7 +1376,7 @@ void NotificationCenter::Impl::Open() {
         st = St::Open;
         winH = 0;
         Update(true);
-        motion::In(comp, panelVis, rest, Travel());  // before the show: no frame at rest first
+        motion::In(comp, panelVis, rest, Travel(), settings::Get().cc);  // before the show: no frame at rest first
         ShowWindow(hwnd, attached ? SW_SHOWNOACTIVATE : SW_SHOW);  // attached: the Control Center keeps the focus
         if (!attached) Focus();
         SetEvent(evReq);
@@ -1390,8 +1392,8 @@ void NotificationCenter::Impl::Close() {
     visible = false;
     if (st != St::Open) return;
     st = St::Closing;
-    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Travel());
-    SetTimer(hwnd, kTimerClose, motion::kOutMs + 10, nullptr);
+    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Travel(), settings::Get().cc);
+    SetTimer(hwnd, kTimerClose, motion::OutMs(settings::Get().cc) + 10, nullptr);
 }
 
 void NotificationCenter::Impl::Teardown() {

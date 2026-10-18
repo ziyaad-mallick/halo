@@ -283,7 +283,30 @@ Launcher::Launcher(HINSTANCE inst, wuc::Compositor const& comp, wuc::Composition
 }
 
 Launcher::~Launcher() {
+    if (m_dim) DestroyWindow(m_dim);
     if (m_hwnd) DestroyWindow(m_hwnd);
+}
+
+// [start] dim_desktop: a click-through black sheet over the monitor, under the panel (which Place() raises above it).
+void Launcher::ShowDim(bool on) {
+    if (!on) {
+        if (m_dim) ShowWindow(m_dim, SW_HIDE);
+        return;
+    }
+    if (!m_dim) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"HaloLauncherDim";
+        wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+        RegisterClassExW(&wc);
+        m_dim = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                                wc.lpszClassName, L"Halo Launcher Dim", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!m_dim) return;
+        SetLayeredWindowAttributes(m_dim, 0, theme::Dark() ? 64 : 40, LWA_ALPHA);
+    }
+    const RECT& r = m_anchor.monitor;
+    SetWindowPos(m_dim, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 void Launcher::CreateHwnd(HINSTANCE inst) {
@@ -551,10 +574,17 @@ void Launcher::Build() {
     wl = std::clamp(wl, std::min(kMinWidth, wl), kMaxWidth);
     m_w = std::round(wl * s);
 
+    // [start] recent_apps / recent_files: 0 hides the section; up to six files is one row.
+    auto const& cfg = settings::Get().start;
+    const size_t maxApps = std::min(cfg.recentApps, kMaxApps), maxFiles = std::min(cfg.recentFiles, kMaxFiles);
+    m_showApps = maxApps > 0;
+    m_showFiles = maxFiles > 0;
+    m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min(m_allFiles.size(), maxFiles));
+
     // Recent apps: those that still have an icon.
     m_apps.clear();
     for (auto const& t : m_mru) {
-        if (m_apps.size() >= kMaxApps) break;
+        if (m_apps.size() >= maxApps) break;
         if (t.find(L"LockApp") != std::wstring::npos) continue;  // the lock screen is not an app to relaunch
         if (m_host.appIcon && m_host.appIcon(t)) m_apps.push_back(t);
     }
@@ -564,8 +594,10 @@ void Launcher::Build() {
     const float innerW = wl - 2 * kPad, colW = innerW / kFileCols;
     const float searchBot = kSearchTop + kSearchH;
     const float appsLabelY = searchBot + 16, appsTop = appsLabelY + kLabelH + 6;
-    const float filesLabelY = appsTop + kAppRowH + 14, filesTop = filesLabelY + kLabelH + 6;
-    const float dividerY = filesTop + kFileRowPitch + kFileCellH + 12;
+    const float filesLabelY = m_showApps ? appsTop + kAppRowH + 14 : searchBot + 16, filesTop = filesLabelY + kLabelH + 6;
+    const float fileRows = maxFiles > kFileCols ? 2.0f : 1.0f;
+    const float dividerY = m_showFiles ? filesTop + (fileRows - 1) * kFileRowPitch + kFileCellH + 12
+                                       : m_showApps ? appsTop + kAppRowH + 2 : searchBot + 12;
     const float bottomY = dividerY + 1;
     m_iconPx = kIconSize;
     m_h = std::round((bottomY + kBottomH) * s);
@@ -654,7 +686,7 @@ void Launcher::Build() {
     stage.Children().InsertAtTop(m_panel);
 
     if (m_host.glass) {
-        auto glass = m_host.glass(static_cast<int>(std::ceil(m_h)));
+        auto glass = m_host.glass(static_cast<int>(std::ceil(m_h)), settings::Get().start);
         glass.Size({m_w, m_h});
         m_panel.Children().InsertAtTop(glass);
     }
@@ -732,16 +764,16 @@ void Launcher::Build() {
     menuClip.Size({m_menuW, m_menuH});
     m_menu.Clip(m_comp.CreateGeometricClip(menuClip));
     if (m_host.glass) {
-        auto glass = m_host.glass(static_cast<int>(std::ceil(m_menuH)));
+        auto glass = m_host.glass(static_cast<int>(std::ceil(m_menuH)), settings::Get().start);
         glass.Size({m_menuW, m_menuH});
         m_menu.Children().InsertAtTop(glass);
         // Over the panel's own text the dock's 50% tint is not enough; the backdrop is the desktop, not the panel.
         auto veil = m_comp.CreateSpriteVisual();
         veil.Size({m_menuW, m_menuH});
         // theme::P().veil is the full-screen dim; this one frosts the menu, so it follows the glass tint.
-        auto const& tp = theme::P();
+        const auto tint = theme::Glass(settings::Get().start).tint;
         veil.Brush(m_comp.CreateColorBrush(theme::Dark() ? theme::C({0xB0, 0x16, 0x16, 0x1A})
-                                                          : theme::C({0xD8, tp.tint.r, tp.tint.g, tp.tint.b})));
+                                                          : theme::C({0xD8, tint.r, tint.g, tint.b})));
         m_menu.Children().InsertAtTop(veil);
     }
     m_menuHover = plate(m_menuHoverShape);
@@ -976,12 +1008,12 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
         return;
     }
 
-    txt.Draw(dc, L"RECENT APPS", fLabel.get(), at(m_appsLabel), dim.get());
-    if (m_apps.empty())
+    if (m_showApps) txt.Draw(dc, L"RECENT APPS", fLabel.get(), at(m_appsLabel), dim.get());
+    if (m_showApps && m_apps.empty())
         txt.Draw(dc, L"Apps you open show up here", fRow.get(),
                  at(R(m_appsLabel.left, m_appsLabel.bottom + 6 * s, m_appsLabel.right, m_appsLabel.bottom + 46 * s)), dim.get());
-    txt.Draw(dc, L"RECENT FILES", fLabel.get(), at(m_filesLabel), dim.get());
-    if (m_files.empty())
+    if (m_showFiles) txt.Draw(dc, L"RECENT FILES", fLabel.get(), at(m_filesLabel), dim.get());
+    if (m_showFiles && m_files.empty())
         txt.Draw(dc, L"No recent files", fRow.get(),
                  at(R(m_filesLabel.left, m_filesLabel.bottom + 6 * s, m_filesLabel.right, m_filesLabel.bottom + 34 * s)), dim.get());
     // File names under their icons: one line, ellipsized.
@@ -1039,8 +1071,11 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     // Rises out of the gap above the dock with the dock's reveal spring (clipped by the window's bottom edge).
     const float home = kTop * m_s;
     const float2 rise{0, ui::kEnterTravel * m_s};  // a short rise as it fades in, just above the dock
-    motion::In(m_comp, m_panel, {0, home, 0}, rise);
-    if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), rise);
+    auto const& st = settings::Get().start;
+    const float2 corner{0.5f, 1.0f};  // the swoop grows from the bottom centre, just above the dock
+    motion::In(m_comp, m_panel, {0, home, 0}, rise, st, corner);
+    if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), rise, st, corner);
+    ShowDim(st.dimDesktop);
     Place();  // shows the window: after the slide is set up, so no frame shows the panel at rest first
     SetTimer(m_hwnd, kRefreshTimer, 420, nullptr);  // once, after the rise has settled
 
@@ -1071,8 +1106,10 @@ void Launcher::Hide() {
     unsigned gen = ++m_gen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     const float2 rise{0, ui::kEnterTravel * m_s};
-    motion::Out(m_comp, m_panel, {0, kTop * m_s, 0}, rise);
-    if (m_shadowHold) motion::Out(m_comp, m_shadowHold, PanelHome(), rise);
+    auto const& st = settings::Get().start;
+    const float2 corner{0.5f, 1.0f};
+    motion::Out(m_comp, m_panel, {0, kTop * m_s, 0}, rise, st, corner);
+    if (m_shadowHold) motion::Out(m_comp, m_shadowHold, PanelHome(), rise, st, corner);
     batch.End();
     batch.Completed([this, gen](auto&&, auto&&) {
         if (gen == m_gen && !m_open) Close();
@@ -1081,6 +1118,7 @@ void Launcher::Hide() {
 }
 
 void Launcher::Close() {
+    ShowDim(false);
     ShowWindow(m_hwnd, SW_HIDE);
     m_caret.StopAnimation(L"Opacity");  // nothing animates while hidden
     m_tracking = false;

@@ -18,6 +18,7 @@
 #include <winrt/Windows.UI.Composition.Desktop.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <algorithm>
+#include <tuple>
 #include <chrono>
 #include <cstdio>
 #include <cmath>
@@ -67,14 +68,16 @@ extern "C" HRESULT WINAPI D2D1CreateDevice(IDXGIDevice*, D2D1_CREATION_PROPERTIE
 
 namespace wuc = winrt::Windows::UI::Composition;
 using winrt::Windows::Foundation::Size;
+using winrt::Windows::Foundation::Numerics::float2;
 
 namespace {
 
-// Settings
-constexpr UINT kHideDelayMs = 500;        // cursor must stay away this long before hiding
+// Motion defaults; [taskbar] speed / motion / effect / hide_delay in settings.ini scale or replace them.
 constexpr float kSpringDamping = 0.72f;   // < 1 overshoots slightly
 constexpr int kSpringPeriodMs = 55;       // lower = snappier
 constexpr int kHideDurationMs = 200;
+constexpr int kDockFadeMs = 180;          // the fade of the non-rise reveal effects
+constexpr float kDockTravel = 24;         // logical px a swipe / swoop reveal moves
 constexpr float kLabelRoom = 34;  // logical px above a magnified icon: a 6 px gap and the name label
 constexpr int kStripPx = 2;               // hit strip left on the screen edge while hidden
 
@@ -87,6 +90,7 @@ constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 // Test hook (HALO_TEST=1): wParam 0 = open the launcher panel, 1 = close it, else Launcher::TestCommand.
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
+constexpr UINT kMsgSettings = WM_APP + 50;  // halo::settings::Watch: settings.ini changed
 constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Control Center) / kRight (notifications)
 constexpr UINT kMsgTestNotifCenter = WM_APP + 21;  // HALO_TEST=1: toggle the Notification Center
 constexpr UINT kMsgTestMenu = WM_APP + 31;    // HALO_TEST=1: wParam = dock item; lParam 0 = open its menu, 1 = close, 100+r = hover row r, 200+r = choose row r
@@ -147,7 +151,10 @@ private:
     LRESULT OnMessage(UINT, WPARAM, LPARAM);
     void InitComposition();
     void InitGraphics();
-    wuc::ContainerVisual BuildPill(int noiseHeight = 0, float radius = 0.0f);
+    wuc::ContainerVisual BuildPill(int noiseHeight = 0, float radius = 0.0f, halo::settings::Surface const* glass = nullptr);
+    void ComputeMetrics();
+    void ApplySettings(bool themeFlipped = false);
+    void RebuildDock();
     wuc::SpriteVisual BuildPillShadow(wuc::ContainerVisual const& pill);
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
@@ -211,6 +218,7 @@ private:
     int m_pressed = -1;  // the icon the mouse button went down on
     bool m_pressedStart = false;  // the button went down on the Start logo
     bool m_autoHide = true;  // off under HALO_TEST
+    halo::settings::Settings m_cfg;  // what the dock was last built / applied with
     UINT m_genieMsg = RegisterWindowMessageW(L"Halo.DockIconForWindow");
 
     enum class State { Hidden, Shown, Hiding };
@@ -240,7 +248,9 @@ Halo::~Halo() {
 
 bool Halo::Create(HINSTANCE inst) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    m_autoHide = !_wgetenv(L"HALO_TEST");
+    halo::theme::Refresh();
+    m_cfg = halo::settings::Get();
+    m_autoHide = !_wgetenv(L"HALO_TEST") && m_cfg.taskbar.autohide;
 
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = WndProc;
@@ -261,24 +271,11 @@ bool Halo::Create(HINSTANCE inst) {
 
     // Metrics in physical px. The window is as wide as the monitor and tall
     // enough for a fully magnified, bouncing icon above the pill; only the
-    // dock's part of it takes input (UpdateRegion), so it never has to resize.
-    m_metrics.restSize = m_scale.f(28);
-    m_metrics.gap = m_scale.f(10);
-    m_metrics.maxScale = 1.57f;
-    m_metrics.radius = m_scale.f(100);
-    m_metrics.padding = m_scale.f(10);
-    m_metrics.pillHeight = m_scale.f(50);
-    m_metrics.cornerRadius = m_scale.f(20);
-    // The window reaches the monitor's bottom edge so a hiding dock slides
-    // fully off-screen; the dock itself sits a margin above it.
-    int margin = m_scale.px(6);
-    float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
-    // Above the peak: room for the hover name label (kLabelRoom).
-    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_scale.f(kLabelRoom))) + margin;
-    m_metrics.bottom = static_cast<float>(m_height - margin);
+    // dock's part of it takes input (UpdateRegion), so it never has to resize
+    // (unless the icon size or magnification setting changes).
     m_monitor = mi.rcMonitor;
     m_width = m_monitor.right - m_monitor.left;
-    m_metrics.centerX = m_width / 2.0f;
+    ComputeMetrics();
     int x = m_monitor.left, y = m_monitor.bottom - m_height;
     m_full = {x, y, x + m_width, y + m_height};
     if (m_autoHide) m_state = State::Hidden;
@@ -317,7 +314,7 @@ bool Halo::Create(HINSTANCE inst) {
             });
             Step(L"launcher", [&] {
                 halo::LauncherHost host;
-                host.glass = [this](int noiseHeight) { return BuildPill(noiseHeight); };
+                host.glass = [this](int noiseHeight, halo::settings::Surface const& g) { return BuildPill(noiseHeight, 0.0f, &g); };
                 host.appIcon = [this](std::wstring const& target) { return IconBrushFor(target); };
                 host.launch = [this](std::wstring const& target) { LaunchRecent(target); };
                 host.closed = [this] { if (!m_trackingMouse) PointerLeave(); };  // the dock may auto-hide again
@@ -370,6 +367,8 @@ bool Halo::Create(HINSTANCE inst) {
     }
     if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
     else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
+    halo::edge::Configure(m_cfg.cc.hotCorner, m_cfg.cc.cornerWidth, m_cfg.cc.cornerDelay);
+    halo::settings::Watch(m_hwnd, kMsgSettings);  // edits to settings.ini apply live (ApplySettings)
     if (!_wgetenv(L"HALO_TEST_NOHOOK") && !halo::edge::Start(inst, m_hwnd, kMsgEdge))
         Log(L"edge mouse hook failed " + std::to_wstring(GetLastError()));
 
@@ -486,7 +485,7 @@ wuc::CompositionBrush Halo::MakeNoiseBrush(int w, int h) {
 // grain and a 1px rim whose vertical gradient is bright on top and faintly
 // bright again at the bottom. Layers size relative to the container, which
 // the dock resizes and clips.
-wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius) {
+wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius, halo::settings::Surface const* glassCfg) {
     auto pill = m_comp.CreateContainerVisual();
 
     auto glass = m_comp.CreateSpriteVisual();
@@ -496,7 +495,7 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius) {
 
     auto tint = m_comp.CreateSpriteVisual();
     tint.RelativeSizeAdjustment({1, 1});
-    tint.Brush(m_comp.CreateColorBrush(halo::theme::C(halo::theme::P().tint)));
+    tint.Brush(m_comp.CreateColorBrush(halo::theme::C(halo::theme::Glass(glassCfg ? *glassCfg : halo::settings::Get().taskbar).tint)));
     pill.Children().InsertAtTop(tint);
 
     Step(L"noise", [&] {
@@ -557,6 +556,70 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius) {
     return pill;  // the dock places it in the tree
 }
 
+// settings.ini changed (halo::settings::Reload() found a difference): apply it without a restart. Motion
+// settings are read where they are used; glass, size and layout changes close the panel they touch, which
+// rebuilds on its next open, and the dock rebuilds its pill and icons in place.
+void Halo::ApplySettings(bool themeFlipped) {
+    using halo::settings::Surface;
+    const auto prev = m_cfg;
+    halo::theme::Refresh();
+    m_cfg = halo::settings::Get();
+    auto const& c = m_cfg;
+    auto glass = [](Surface const& g) { return std::make_tuple(g.opacity, g.blur, g.hasTint, g.tint); };
+    const bool look = themeFlipped || prev.theme != c.theme || prev.accent != c.accent;
+    const bool dockChanged = look || glass(prev.taskbar) != glass(c.taskbar) || prev.reduceMotion != c.reduceMotion ||
+                             prev.taskbar.iconSize != c.taskbar.iconSize || prev.taskbar.magnification != c.taskbar.magnification ||
+                             prev.taskbar.runningDots != c.taskbar.runningDots;
+    const bool ccChanged = look || glass(prev.cc) != glass(c.cc) || prev.cc.showMedia != c.cc.showMedia ||
+                           prev.cc.showSliders != c.cc.showSliders;
+    const bool startChanged = look || glass(prev.start) != glass(c.start) || prev.start.recentApps != c.start.recentApps ||
+                              prev.start.recentFiles != c.start.recentFiles || prev.start.dimDesktop != c.start.dimDesktop;
+    Log(L"settings: changed, applying (dock " + std::to_wstring(dockChanged) + L", control center " +
+        std::to_wstring(ccChanged) + L", start " + std::to_wstring(startChanged) + L"; accent #" + [&] {
+            wchar_t hex[8];
+            swprintf(hex, 8, L"%06X", c.accent);
+            return std::wstring(hex);
+        }() + L")");
+
+    halo::edge::Configure(c.cc.hotCorner, c.cc.cornerWidth, c.cc.cornerDelay);
+    m_autoHide = !_wgetenv(L"HALO_TEST") && c.taskbar.autohide;
+    if (!c.taskbar.autohide) Reveal();
+    else if (!prev.taskbar.autohide && !m_trackingMouse) PointerLeave();
+    if (startChanged && m_launcher && m_launcher->IsOpen()) m_launcher->Hide();  // it is built per open
+    if (ccChanged && m_cc) {
+        if (m_notif && m_notif->IsOpen()) ClosePanel();
+        m_cc->OnSettingsChanged();
+    }
+    if (dockChanged) RebuildDock();
+}
+
+// The pill, icons, cluster and label are rebuilt with the current settings; the window resizes if the icon
+// size or magnification moved its height.
+void Halo::RebuildDock() {
+    if (!m_dock) return;
+    HidePreviews(true);
+    if (m_menu && m_menu->IsOpen()) m_menu->Close();
+    KillTimer(m_hwnd, kPreviewTimer);
+    KillTimer(m_hwnd, kPreviewGrace);
+    m_hoverItem = -1;
+    m_pressed = -1;
+    m_label.reset();
+    m_dock->Detach();
+    m_dock.reset();
+    m_cluster.reset();
+    m_brushes.clear();  // icon surfaces are sized for the old icon size
+    ComputeMetrics();
+    const int x = m_monitor.left, y = m_monitor.bottom - m_height;
+    m_full = {x, y, x + m_width, y + m_height};
+    SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, m_width, m_height, SWP_NOACTIVATE);
+    if (m_state == State::Hidden) m_slide.Offset({0, static_cast<float>(m_height), 0});
+    BuildDock();
+    m_label = std::make_unique<halo::AppLabel>(m_comp, m_slide, m_gdev, m_scale.v);
+    UpdateRegion();
+    Log(L"dock rebuilt, icon " + std::to_wstring(static_cast<int>(m_metrics.restSize)) + L" px, window height " +
+        std::to_wstring(m_height));
+}
+
 // A soft drop shadow for the dock pill: a brushless sprite that follows the pill's size and
 // offset, its shadow shaped by a nine-grid rounded-rect mask. A sibling of the (clipped) pill.
 wuc::SpriteVisual Halo::BuildPillShadow(wuc::ContainerVisual const& pill) {
@@ -613,7 +676,7 @@ void Halo::BuildDock() {
         auto shadow = BuildPillShadow(pill);
         if (shadow && pill.Parent()) pill.Parent().Children().InsertBelow(shadow, pill);
     });
-    m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
+    if (!m_tracker) m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
     RefreshDock();
 }
 
@@ -704,6 +767,27 @@ RECT Halo::GetPillRectScreen() const {
     return RECT{pillLeft, pillTop, pillRight, pillBottom};
 }
 
+// The dock's sizes from the DPI scale and [taskbar] icon_size / magnification. icon_size 48 is the shipped
+// 28 logical px icon; magnification 150 is the shipped 1.57x (hover magnification is off under reduce_motion).
+void Halo::ComputeMetrics() {
+    auto const& tb = halo::settings::Get().taskbar;
+    m_metrics.restSize = m_scale.f(28 * tb.iconSize / 48.0f);
+    m_metrics.gap = m_scale.f(10);
+    m_metrics.maxScale = halo::settings::Get().reduceMotion ? 1.0f : 1.0f + (tb.magnification - 100) / 100.0f * 1.14f;
+    m_metrics.radius = m_scale.f(100);
+    m_metrics.padding = m_scale.f(10);
+    m_metrics.pillHeight = m_metrics.restSize + m_scale.f(22);  // 50 at the shipped icon size
+    m_metrics.cornerRadius = m_scale.f(20);
+    // The window reaches the monitor's bottom edge so a hiding dock slides
+    // fully off-screen; the dock itself sits a margin above it.
+    int margin = m_scale.px(6);
+    float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
+    // Above the peak: room for the hover name label (kLabelRoom).
+    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_scale.f(kLabelRoom))) + margin;
+    m_metrics.bottom = static_cast<float>(m_height - margin);
+    m_metrics.centerX = m_width / 2.0f;
+}
+
 void Halo::MigrateToMonitor(HMONITOR mon) {
     if (!mon || mon == m_currentMon) return;
     MONITORINFO mi{sizeof(mi)};
@@ -719,18 +803,7 @@ void Halo::MigrateToMonitor(HMONITOR mon) {
     m_width = m_monitor.right - m_monitor.left;
     m_scale.v = newScale;
 
-    m_metrics.restSize = m_scale.f(28);
-    m_metrics.gap = m_scale.f(10);
-    m_metrics.maxScale = 1.57f;
-    m_metrics.radius = m_scale.f(100);
-    m_metrics.padding = m_scale.f(10);
-    m_metrics.pillHeight = m_scale.f(50);
-    m_metrics.cornerRadius = m_scale.f(20);
-    int margin = m_scale.px(6);
-    float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
-    m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_scale.f(kLabelRoom))) + margin;
-    m_metrics.bottom = static_cast<float>(m_height - margin);
-    m_metrics.centerX = m_width / 2.0f;
+    ComputeMetrics();
 
     int x = m_monitor.left, y = m_monitor.bottom - m_height;
     m_full = {x, y, x + m_width, y + m_height};
@@ -792,7 +865,7 @@ void Halo::Activate(size_t item) {
     } else if (!it.launch.empty()) {
         // Bounce first: ShellExecute can block this thread for a while, the animation runs without it.
         if (m_launcher) m_launcher->Note(it.launch);
-        if (it.key.empty()) m_dock->Bounce(static_cast<int>(item));  // an app that is up (no window yet) doesn't bounce
+        if (it.key.empty() && m_cfg.taskbar.bounceOnLaunch) m_dock->Bounce(static_cast<int>(item));  // an app that is up (no window yet) doesn't bounce
         ShellExecuteW(nullptr, L"open", it.launch.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 }
@@ -930,7 +1003,7 @@ void Halo::PointerLeave() {
     }
     if (m_autoHide && m_state == State::Shown) {
         if (!m_intellihide || m_intellihide->HasOverlap() || m_intellihide->IsFullscreen()) {
-            SetTimer(m_hwnd, kHideTimer, kHideDelayMs, nullptr);
+            SetTimer(m_hwnd, kHideTimer, std::max<UINT>(m_cfg.taskbar.hideDelay, USER_TIMER_MINIMUM), nullptr);
         }
     }
 }
@@ -973,7 +1046,19 @@ void Halo::LaunchRecent(std::wstring const& target) {
     ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-// Takes input over the whole dock at once and springs it up from wherever it is.
+// The dock slides on m_slide (its Offset.Y is m_height while hidden, 0 at rest). [taskbar] effect picks the
+// reveal and hide: rise / bounce slide it as before (bounce on a looser spring), swipe moves it sideways in
+// from the right edge, fade and swoop (a 92 % scale from the bottom centre, with a short rise) bring it to
+// rest and fade it; none cuts. speed divides the durations and the spring period, motion scales the travel
+// and the overshoot. All on the compositor.
+namespace {
+using halo::settings::Effect;
+std::chrono::milliseconds Scaled(float ms, float speed) {
+    return std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(ms / speed))));
+}
+}  // namespace
+
+// Takes input over the whole dock at once and brings it up from wherever it is.
 void Halo::Reveal() {
     KillTimer(m_hwnd, kHideTimer);
     if (m_state == State::Shown) return;
@@ -981,15 +1066,58 @@ void Halo::Reveal() {
     m_state = State::Shown;
     if (wasHidden) UpdateRegion();
     ++m_hideGen;
-    auto spring = m_comp.CreateSpringScalarAnimation();
-    spring.FinalValue(0.0f);
-    spring.DampingRatio(kSpringDamping);
-    spring.Period(std::chrono::milliseconds(kSpringPeriodMs));
-    m_slide.StartAnimation(L"Offset.Y", spring);
+    auto const& tb = halo::settings::Get().taskbar;
+    const float speed = halo::settings::Speed(tb), amt = halo::settings::Amount(tb);
+    const Effect eff = tb.effect;
+    for (auto prop : {L"Offset", L"Offset.Y", L"Offset.X", L"Opacity", L"Scale"}) m_slide.StopAnimation(prop);
+    if (eff == Effect::None) {
+        m_slide.Offset({0, 0, 0});
+        m_slide.Opacity(1);
+        m_slide.Scale({1, 1, 1});
+        return;
+    }
+    const bool slides = eff == Effect::Rise || eff == Effect::Bounce;
+    const float travel = kDockTravel * m_scale.v * amt;
+    float2 start{0, 0};  // where it comes from, relative to rest
+    if (slides) start.y = m_height * std::min(amt, 1.0f);
+    else if (eff == Effect::Swipe) start.x = kDockTravel * 2 * m_scale.v * amt;
+    else if (eff == Effect::Swoop) start.y = travel;
+    const bool fade = !slides || amt < 1.0f;
+    if (wasHidden) {
+        m_slide.Offset({start.x, start.y, 0});
+        m_slide.Opacity(fade ? 0.0f : 1.0f);
+        if (eff == Effect::Swoop) {
+            m_slide.CenterPoint({m_width / 2.0f, static_cast<float>(m_height), 0});
+            m_slide.Scale({0.92f, 0.92f, 1});
+        }
+    }
+    const float damping = eff == Effect::Bounce ? 1.0f - 0.5f * std::min(amt, 1.4f) : kSpringDamping;
+    auto spring = [&](wchar_t const* prop) {
+        auto a = m_comp.CreateSpringScalarAnimation();
+        a.FinalValue(0.0f);
+        a.DampingRatio(damping);
+        a.Period(Scaled(kSpringPeriodMs, speed));
+        m_slide.StartAnimation(prop, a);
+    };
+    if (start.y != 0 || wasHidden) spring(L"Offset.Y");
+    if (eff == Effect::Swipe) spring(L"Offset.X");
+    if (eff == Effect::Swoop) {
+        auto grow = m_comp.CreateVector3KeyFrameAnimation();
+        grow.InsertKeyFrame(1.0f, {1, 1, 1}, m_comp.CreateCubicBezierEasingFunction({0.0f, 0.0f}, {0.2f, 1.0f}));
+        grow.Duration(Scaled(kDockFadeMs, speed));
+        m_slide.StartAnimation(L"Scale", grow);
+    }
+    if (fade) {
+        auto in = m_comp.CreateScalarKeyFrameAnimation();
+        in.InsertKeyFrame(1.0f, 1.0f, m_comp.CreateCubicBezierEasingFunction({0.0f, 0.0f}, {0.2f, 1.0f}));
+        in.Duration(Scaled(kDockFadeMs, speed));
+        m_slide.StartAnimation(L"Opacity", in);
+    }
 }
 
 void Halo::StartHide() {
     if (m_state != State::Shown) return;
+    if (!m_cfg.taskbar.autohide) return;             // [taskbar] autohide off: the dock stays
     if (m_launcher && m_launcher->IsOpen()) return;  // the panel is up; its close brings the hide back
     if (m_menu && m_menu->IsOpen()) return;          // likewise the right-click menu
     m_state = State::Hiding;
@@ -997,18 +1125,45 @@ void Halo::StartHide() {
     if (m_label) m_label->Hide();
     if (m_dock) m_dock->OnPointerLeave();  // magnification relaxes as the dock drops
     unsigned gen = ++m_hideGen;
-    auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    auto slide = m_comp.CreateScalarKeyFrameAnimation();
-    slide.InsertKeyFrame(1.0f, static_cast<float>(m_height),
-                         m_comp.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.9f, 0.5f}));
-    slide.Duration(std::chrono::milliseconds(kHideDurationMs));
-    m_slide.StartAnimation(L"Offset.Y", slide);
-    batch.End();
-    batch.Completed([this, gen](auto&&, auto&&) {
+    auto const& tb = halo::settings::Get().taskbar;
+    const float speed = halo::settings::Speed(tb), amt = halo::settings::Amount(tb);
+    const Effect eff = tb.effect;
+    // Off-screen, and back at the neutral pose the next reveal starts from.
+    auto finish = [this, gen] {
         if (gen != m_hideGen || m_state != State::Hiding) return;  // a reveal took over
         m_state = State::Hidden;
+        m_slide.Offset({0, static_cast<float>(m_height), 0});
+        m_slide.Opacity(1);
+        m_slide.Scale({1, 1, 1});
         UpdateRegion();
-    });
+    };
+    if (eff == Effect::None) { finish(); return; }
+    for (auto prop : {L"Offset", L"Offset.Y", L"Offset.X", L"Opacity", L"Scale"}) m_slide.StopAnimation(prop);
+    auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    auto down = m_comp.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.9f, 0.5f});
+    auto dur = Scaled(kHideDurationMs, speed);
+    auto to = [&](wchar_t const* prop, float v) {
+        auto a = m_comp.CreateScalarKeyFrameAnimation();
+        a.InsertKeyFrame(1.0f, v, down);
+        a.Duration(dur);
+        m_slide.StartAnimation(prop, a);
+    };
+    if (eff == Effect::Rise || eff == Effect::Bounce) {
+        to(L"Offset.Y", static_cast<float>(m_height));
+    } else {
+        to(L"Opacity", 0.0f);
+        if (eff == Effect::Swipe) to(L"Offset.X", kDockTravel * 2 * m_scale.v * amt);
+        if (eff == Effect::Swoop) {
+            to(L"Offset.Y", kDockTravel * m_scale.v * amt);
+            m_slide.CenterPoint({m_width / 2.0f, static_cast<float>(m_height), 0});
+            auto shrink = m_comp.CreateVector3KeyFrameAnimation();
+            shrink.InsertKeyFrame(1.0f, {0.92f, 0.92f, 1}, down);
+            shrink.Duration(dur);
+            m_slide.StartAnimation(L"Scale", shrink);
+        }
+    }
+    batch.End();
+    batch.Completed([finish](auto&&, auto&&) { finish(); });
 }
 
 // Cross-process protocol with the Halo Genie Windhawk mod (mods/halo-genie.wh.cpp),
@@ -1171,7 +1326,15 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_TIMECHANGE:
             if (m_dock) m_dock->OnTimeChange();
             return 0;
+        case kMsgSettings:
+            if (halo::settings::Reload()) ApplySettings();
+            return 0;
         case WM_SETTINGCHANGE:
+            if (l && !wcscmp(reinterpret_cast<LPCWSTR>(l), L"ImmersiveColorSet")) {  // the Windows light / dark switch
+                const bool was = halo::theme::Dark();
+                halo::theme::Refresh();
+                if (halo::theme::Dark() != was) ApplySettings(true);
+            }
             if (m_dock) m_dock->OnSettingChange();
             return 0;
         case WM_POWERBROADCAST:

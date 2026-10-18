@@ -1,0 +1,810 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Halo Settings</title>
+<style>
+/* ===================================================================== TOKENS
+   Everything below :root uses these and nothing else. Spacing is a 4px scale,
+   type is four sizes and two weights, radii are two, durations are two. */
+:root {
+  color-scheme: light dark;
+
+  /* spacing (4px base) */
+  --s1: 4px;  --s2: 8px;  --s3: 12px;  --s4: 16px;  --s5: 20px;  --s6: 24px;  --s8: 32px;  --s10: 40px;
+
+  /* type: base 14, ratio ~1.2 */
+  --fs-xs: 12px;  --fs-sm: 14px;  --fs-md: 17px;  --fs-lg: 22px;
+  --fw-regular: 400;  --fw-strong: 600;
+  --font: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+
+  /* shape */
+  --r-sm: 8px;  --r-lg: 16px;  --r-full: 999px;  /* r-full only for switches, dots and swatches */
+
+  /* motion */
+  --d-fast: 120ms;  --d-slow: 280ms;
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+  --ease-in: cubic-bezier(.4, 0, 1, 1);
+
+  /* palette: raw values, defined once */
+  --ink-900: #0B0D0F;  --paper-0: #FFFFFF;
+  --smoke-tint: #18191E;  --frost-tint: #F8F8FB;   /* Halo's own default glass, from docs/SETTINGS.md */
+  --wall-1: #0E6B73;  --wall-2: #1F3A5F;  --wall-3: #E0A458;  --wall-4: #0A2E36;   /* sample wallpaper for previews */
+
+  /* semantic colour: dark first, light via light-dark() */
+  --accent: #14A394;
+  --on-accent: var(--paper-0);
+  --accent-text: color-mix(in srgb, var(--accent) 78%, light-dark(var(--ink-900), var(--paper-0)));
+  --bg:        light-dark(#E9EEF0, #0D0F11);
+  --surface:   light-dark(rgba(255,255,255,.72), rgba(255,255,255,.045));
+  --surface-2: light-dark(rgba(11,13,15,.045), rgba(255,255,255,.07));
+  --line:      light-dark(rgba(11,13,15,.11), rgba(255,255,255,.09));
+  --text:      light-dark(#14181B, #ECEFF1);
+  --muted:     light-dark(#4E5961, #9CA6AD);
+  --good:      light-dark(#13795B, #3DD9A6);
+  --warn:      light-dark(#9A5B00, #F2B35C);
+  --bad:       light-dark(#B42318, #FF8A80);
+  --shadow:    light-dark(0 1px 2px rgba(11,13,15,.08), 0 1px 2px rgba(0,0,0,.5));
+  --shadow-pop: light-dark(0 16px 48px rgba(11,13,15,.22), 0 16px 48px rgba(0,0,0,.6));
+  --ambient-a: light-dark(rgba(20,163,148,.16), rgba(20,163,148,.14));
+  --ambient-b: light-dark(rgba(59,130,246,.10), rgba(59,130,246,.07));
+}
+:root[data-theme="dark"]  { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-accent-tone="light"] { --on-accent: var(--ink-900); }
+
+/* ===================================================================== BASE */
+* { box-sizing: border-box; }
+* { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font: var(--fw-regular) var(--fs-sm)/1.45 var(--font);
+  color: var(--text);
+  background:
+    radial-gradient(900px 520px at 8% -8%, var(--ambient-a), transparent 70%),
+    radial-gradient(800px 560px at 100% 108%, var(--ambient-b), transparent 70%),
+    var(--bg);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+h1, h2, h3, p { margin: 0; }
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.muted { color: var(--muted); }
+.xs { font-size: var(--fs-xs); }
+.num { font-variant-numeric: tabular-nums; }
+
+/* ===================================================================== LAYOUT */
+.app {
+  display: grid;
+  grid-template-columns: 216px minmax(0, 1fr) 304px;
+  grid-template-areas: "nav main rail";
+  height: 100vh;
+}
+.nav  { grid-area: nav;  padding: var(--s6) var(--s3) var(--s4); display: flex; flex-direction: column; gap: var(--s1); border-right: 1px solid var(--line); }
+.main { grid-area: main; overflow-y: auto; padding: var(--s8) var(--s8) var(--s10); scroll-behavior: smooth; }
+.rail { grid-area: rail; overflow-y: auto; padding: var(--s6) var(--s5); border-left: 1px solid var(--line); background: var(--surface); }
+.page { max-width: 640px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--s6); }
+
+@media (max-width: 960px) {
+  .app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-areas: "nav" "main" "rail"; }
+  .nav { flex-direction: row; align-items: center; padding: var(--s2) var(--s3); border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .nav .brand { padding: 0 var(--s3) 0 var(--s2); }
+  .nav .spacer, .nav .nav-foot-note { display: none; }
+  .main { padding: var(--s6) var(--s4) var(--s8); }
+  .rail { border-left: 0; border-top: 1px solid var(--line); padding: var(--s3) var(--s4); max-height: 38vh; }
+  .rail .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--s3); }
+  .rail .m-help, .rail .rail-intro { display: none; }
+  .rail .metric { border-top: 0; padding: 0; }
+}
+@media (max-width: 560px) { .page-head { flex-wrap: wrap; } }
+
+/* ===================================================================== NAV */
+.brand { display: flex; align-items: center; gap: var(--s3); padding: var(--s1) var(--s3) var(--s5); font-family: var(--font-display); font-weight: var(--fw-strong); font-size: var(--fs-md); white-space: nowrap; }
+.brand svg { flex: none; }
+.nav-btn {
+  display: flex; align-items: center; gap: var(--s3);
+  width: 100%; padding: var(--s2) var(--s3);
+  border: 0; border-radius: var(--r-sm); background: transparent;
+  color: var(--muted); text-align: left; white-space: nowrap;
+  transition: background var(--d-fast), color var(--d-fast);
+}
+.nav-btn svg { width: 20px; height: 20px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.nav-btn:hover { background: var(--surface-2); color: var(--text); }
+.nav-btn:active { background: var(--line); }
+.nav-btn[aria-current="page"] { background: var(--surface-2); color: var(--text); font-weight: var(--fw-strong); }
+.nav-btn[aria-current="page"] svg { color: var(--accent); }
+.spacer { flex: 1; }
+.nav-foot-note { padding: var(--s3); color: var(--muted); font-size: var(--fs-xs); }
+
+/* ===================================================================== BUTTONS */
+.btn {
+  display: inline-flex; align-items: center; gap: var(--s2);
+  min-height: 32px; padding: var(--s1) var(--s3);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface-2); white-space: nowrap;
+  transition: background var(--d-fast), border-color var(--d-fast), transform var(--d-fast);
+}
+.btn svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.btn:hover { background: var(--line); }
+.btn:active { transform: scale(.98); }
+.btn:disabled { opacity: .45; cursor: default; transform: none; }
+.btn.primary { background: var(--accent); border-color: transparent; color: var(--on-accent); font-weight: var(--fw-strong); }
+.btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, var(--text)); }
+.btn.danger { background: var(--bad); border-color: transparent; color: var(--ink-900); font-weight: var(--fw-strong); }
+.btn.danger:hover { background: color-mix(in srgb, var(--bad) 88%, var(--paper-0)); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.btn.ghost:hover { background: var(--surface-2); color: var(--text); }
+
+/* ===================================================================== PAGE HEAD */
+.page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s4); }
+.page-head > div:first-child { flex: 1; min-width: 0; }
+.page-head h1 { font: var(--fw-strong) var(--fs-lg)/1.2 var(--font-display); }
+.page-head .lede { color: var(--muted); margin-top: var(--s1); }
+.head-actions { display: flex; align-items: center; gap: var(--s3); flex: none; }
+.save { display: inline-flex; align-items: center; gap: var(--s1); min-width: 92px; justify-content: flex-end; font-size: var(--fs-xs); color: var(--muted); opacity: 0; transition: opacity var(--d-slow) var(--ease-out); }
+.save.show { opacity: 1; }
+.save svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.save[data-state="saved"] { color: var(--good); }
+.save[data-state="error"] { color: var(--bad); }
+.save button { border: 0; background: none; padding: 0; color: inherit; text-decoration: underline; }
+
+/* ===================================================================== CARDS */
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow); }
+.card-head { padding: var(--s5) var(--s6) 0; }
+.card-head h2 { font: var(--fw-strong) var(--fs-md)/1.3 var(--font-display); }
+.card-head p { color: var(--muted); margin-top: var(--s1); }
+.card-body { padding: var(--s4) var(--s6) var(--s5); display: flex; flex-direction: column; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: var(--s6); padding: var(--s3) 0; border-top: 1px solid var(--line); }
+.card-body > .row:first-child, .card-body > .block:first-child { border-top: 0; padding-top: 0; }
+.txt { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.label { font-weight: var(--fw-strong); }
+.help { color: var(--muted); font-size: var(--fs-xs); max-width: 52ch; }
+.row[data-disabled="true"] { opacity: .45; }
+.row.stack { flex-direction: column; align-items: stretch; gap: var(--s3); }
+.row.stack .top { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s4); }
+.row .readout { font-variant-numeric: tabular-nums; color: var(--accent-text); font-weight: var(--fw-strong); white-space: nowrap; }
+.block { padding: var(--s3) 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: var(--s3); }
+
+/* ===================================================================== SWITCH */
+.sw { appearance: none; -webkit-appearance: none; flex: none; position: relative; width: 40px; height: 24px; margin: 0; border-radius: var(--r-full); background: var(--line); border: 1px solid var(--line); cursor: pointer; transition: background var(--d-fast), border-color var(--d-fast); }
+.sw::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: var(--r-full); background: var(--text); opacity: .8; transition: transform var(--d-fast) var(--ease-out), background var(--d-fast), opacity var(--d-fast); }
+.sw:hover { border-color: var(--muted); }
+.sw:checked { background: var(--accent); border-color: transparent; }
+.sw:checked::after { transform: translateX(16px); background: var(--on-accent); opacity: 1; }
+.sw:active::after { width: 20px; }
+.sw:checked:active::after { transform: translateX(12px); }
+.sw:disabled { cursor: default; }
+
+/* ===================================================================== SLIDER */
+.range { appearance: none; -webkit-appearance: none; width: 100%; height: 24px; margin: 0; background: transparent; cursor: pointer; --fill: 50%; }
+.range::-webkit-slider-runnable-track { height: 6px; border-radius: var(--r-full); background: linear-gradient(to right, var(--accent) var(--fill), var(--line) var(--fill)); }
+.range::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; margin-top: -7px; border-radius: var(--r-full); background: var(--paper-0); border: 1px solid color-mix(in srgb, var(--text) 35%, transparent); box-shadow: var(--shadow-pop); transition: transform var(--d-fast); }
+.range:hover::-webkit-slider-thumb { transform: scale(1.1); }
+.range:active::-webkit-slider-thumb { transform: scale(.95); }
+.range:disabled { cursor: default; }
+.range-ends { display: flex; justify-content: space-between; color: var(--muted); font-size: var(--fs-xs); }
+
+/* ===================================================================== SEGMENTED */
+.seg { display: inline-flex; padding: 2px; gap: 2px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); }
+.seg label { position: relative; }
+.seg input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.seg span { display: block; padding: var(--s1) var(--s4); border-radius: calc(var(--r-sm) - 2px); color: var(--muted); transition: background var(--d-fast), color var(--d-fast); }
+.seg label:hover span { color: var(--text); }
+.seg input:checked + span { background: var(--accent); color: var(--on-accent); font-weight: var(--fw-strong); }
+.seg label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
+
+/* ===================================================================== SWATCHES */
+.swatches { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
+.swatch { position: relative; width: 32px; height: 32px; border-radius: var(--r-full); background: var(--c, transparent); box-shadow: inset 0 0 0 1px var(--line); transition: transform var(--d-fast), box-shadow var(--d-fast); }
+.swatch:hover { transform: scale(1.08); }
+.swatch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.swatch:has(input:checked) { box-shadow: inset 0 0 0 1px var(--line), 0 0 0 2px var(--bg), 0 0 0 4px var(--text); }
+.swatch:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 5px; }
+.swatch.theme-default { background: linear-gradient(135deg, var(--smoke-tint) 50%, var(--frost-tint) 50%); }
+.swatch.custom { background: conic-gradient(var(--wall-3), var(--accent), var(--wall-2), var(--wall-1), var(--wall-3)); }
+.swatch.custom input { padding: 0; border: 0; }
+.swatch-label { color: var(--muted); font-size: var(--fs-xs); margin-left: var(--s1); }
+
+/* ===================================================================== EFFECT PICKER */
+.fx-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s3); }
+@media (max-width: 560px) { .fx-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.fx { position: relative; display: flex; flex-direction: column; gap: var(--s2); padding: var(--s2); border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); cursor: pointer; transition: border-color var(--d-fast), background var(--d-fast), transform var(--d-fast); }
+.fx:hover { border-color: var(--muted); }
+.fx:active { transform: scale(.985); }
+.fx input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.fx:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); box-shadow: 0 0 0 1px var(--accent); }
+.fx:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.fx .name { font-weight: var(--fw-strong); padding: 0 var(--s1); display: flex; justify-content: space-between; align-items: center; }
+.fx .name svg { width: 16px; height: 16px; stroke: var(--accent); fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; opacity: 0; transition: opacity var(--d-fast); }
+.fx:has(input:checked) .name svg { opacity: 1; }
+.fx .desc { color: var(--muted); font-size: var(--fs-xs); padding: 0 var(--s1) var(--s1); min-height: 2.9em; }
+
+.stage { position: relative; height: 84px; border-radius: var(--r-sm); overflow: hidden; background: linear-gradient(160deg, var(--wall-4), var(--wall-2) 55%, var(--wall-1)); }
+.stage::before { content: ""; position: absolute; width: 70px; height: 70px; right: -14px; top: -22px; border-radius: var(--r-full); background: radial-gradient(circle, var(--wall-3), transparent 70%); opacity: .55; }
+.surf { position: absolute; bottom: 8px; display: flex; align-items: center; justify-content: center; gap: var(--s1); padding: var(--s1); border-radius: var(--r-sm); background: color-mix(in srgb, var(--smoke-tint) 70%, transparent); border: 1px solid rgba(255,255,255,.18); backdrop-filter: blur(6px); will-change: transform, opacity; }
+.surf i { display: block; border-radius: var(--r-full); background: rgba(255,255,255,.7); }
+.surf[data-kind="taskbar"] { left: 18%; right: 18%; height: 22px; }
+.surf[data-kind="taskbar"] i { width: 9px; height: 9px; }
+.surf[data-kind="controlcenter"] { right: 8px; width: 46%; height: 52px; flex-wrap: wrap; align-content: center; }
+.surf[data-kind="controlcenter"] i { width: 28%; height: 14px; border-radius: 4px; }
+.surf[data-kind="start"] { left: 8px; width: 52%; height: 60px; flex-wrap: wrap; align-content: center; }
+.surf[data-kind="start"] i { width: 17%; height: 11px; border-radius: 4px; }
+.fx-note { color: var(--muted); font-size: var(--fs-xs); padding-top: var(--s2); }
+
+/* ===================================================================== GLASS PREVIEW */
+.wall { position: relative; height: 164px; border-radius: var(--r-sm); overflow: hidden; background: linear-gradient(120deg, var(--wall-4), var(--wall-2) 45%, var(--wall-1)); box-shadow: inset 0 0 0 1px var(--line); }
+.wall .blob { position: absolute; border-radius: var(--r-full); }
+.wall .b1 { width: 130px; height: 130px; left: 8%; top: -30px; background: radial-gradient(circle at 40% 40%, var(--wall-3), transparent 68%); }
+.wall .b2 { width: 160px; height: 160px; right: 6%; bottom: -60px; background: radial-gradient(circle, var(--accent), transparent 66%); opacity: .8; }
+.wall .b3 { width: 14px; height: 120px; left: 46%; top: 10px; border-radius: var(--r-sm); background: var(--wall-3); transform: rotate(18deg); opacity: .9; }
+.glass { position: absolute; left: 50%; top: 50%; width: 62%; min-width: 220px; transform: translate(-50%, -50%); padding: var(--s4); border-radius: var(--r-lg); border: 1px solid rgba(255,255,255,.2); display: flex; flex-direction: column; gap: var(--s2); background: var(--glass-bg, rgba(24,25,30,.66)); color: var(--glass-ink, #fff); backdrop-filter: blur(var(--glass-blur, 40px)); -webkit-backdrop-filter: blur(var(--glass-blur, 40px)); }
+.glass b { font-weight: var(--fw-strong); }
+.glass .bar { height: 6px; border-radius: var(--r-full); background: currentColor; opacity: .25; }
+.glass .bar.s { width: 60%; }
+.glass .bar.a { background: var(--accent); opacity: 1; width: 40%; }
+.glass-note { color: var(--muted); font-size: var(--fs-xs); }
+
+/* ===================================================================== PERFORMANCE */
+.rail h2 { font: var(--fw-strong) var(--fs-md)/1.3 var(--font-display); }
+.rail-top { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
+.status { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--fs-xs); font-weight: var(--fw-strong); }
+.status .dot { width: 8px; height: 8px; border-radius: var(--r-full); background: var(--muted); }
+.status[data-on="true"] { color: var(--good); }
+.status[data-on="true"] .dot { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 25%, transparent); }
+.status[data-on="false"] { color: var(--warn); }
+.status[data-on="false"] .dot { background: var(--warn); }
+.rail-intro { margin-top: var(--s2); color: var(--muted); font-size: var(--fs-xs); }
+.notice { margin-top: var(--s3); padding: var(--s3); border-radius: var(--r-sm); background: var(--surface-2); border: 1px solid var(--line); font-size: var(--fs-xs); }
+.notice b { display: block; font-size: var(--fs-sm); margin-bottom: var(--s1); }
+.metrics { margin-top: var(--s3); }
+.metric { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3) 0; border-top: 1px solid var(--line); }
+.m-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); }
+.m-name { font-weight: var(--fw-strong); }
+.m-val { font: var(--fw-strong) var(--fs-lg)/1 var(--font-display); font-variant-numeric: tabular-nums; }
+.m-val small { font-size: var(--fs-xs); font-weight: var(--fw-regular); color: var(--muted); margin-left: 2px; }
+.m-val.na { color: var(--muted); font-size: var(--fs-md); }
+.spark { width: 100%; height: 32px; display: block; }
+.spark .area { fill: var(--accent); opacity: .16; }
+.spark .line { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.spark .base { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.spark.shared .area { fill: var(--muted); } .spark.shared .line { stroke: var(--muted); }
+.m-sub:empty { display: none; }
+.m-sub { display: flex; justify-content: space-between; gap: var(--s2); color: var(--muted); font-size: var(--fs-xs); }
+.m-help { color: var(--muted); font-size: var(--fs-xs); }
+.rail-foot { margin-top: var(--s2); color: var(--muted); font-size: var(--fs-xs); }
+.rail[data-running="false"] .spark .area, .rail[data-running="false"] .spark .line { opacity: .25; }
+
+/* ===================================================================== STATES + DIALOG */
+.empty { padding: var(--s10) var(--s6); text-align: center; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: var(--s3); }
+.empty h2 { color: var(--text); font: var(--fw-strong) var(--fs-md)/1.3 var(--font-display); }
+.skel { height: 120px; border-radius: var(--r-lg); background: linear-gradient(100deg, var(--surface) 30%, var(--surface-2) 50%, var(--surface) 70%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
+@keyframes shimmer { to { background-position: -200% 0; } }
+dialog { border: 1px solid var(--line); border-radius: var(--r-lg); background: light-dark(#FFFFFF, #1A1D20); color: var(--text); padding: var(--s6); max-width: 400px; box-shadow: var(--shadow-pop); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog[open] { animation: pop var(--d-slow) var(--ease-out); }
+@keyframes pop { from { opacity: 0; transform: translateY(8px) scale(.98); } }
+dialog h2 { font: var(--fw-strong) var(--fs-md)/1.3 var(--font-display); margin-bottom: var(--s2); }
+dialog p { color: var(--muted); }
+dialog menu { margin: var(--s5) 0 0; padding: 0; display: flex; justify-content: flex-end; gap: var(--s2); }
+.file-path { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: var(--fs-xs); color: var(--muted); word-break: break-all; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.6-5.9"/><path d="M4 4v4.5h4.5"/></symbol>
+  <symbol id="i-taskbar" viewBox="0 0 24 24"><rect x="3" y="13" width="18" height="7" rx="3.5"/><path d="M8 16.5h.01M12 16.5h.01M16 16.5h.01"/><path d="M6 6h12"/></symbol>
+  <symbol id="i-cc" viewBox="0 0 24 24"><path d="M4 8h9M19 8h1M4 16h1M11 16h9"/><circle cx="16" cy="8" r="2.5"/><circle cx="8" cy="16" r="2.5"/></symbol>
+  <symbol id="i-start" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="2"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="2"/></symbol>
+  <symbol id="i-general" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 4v16"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none" opacity=".35"/></symbol>
+</svg>
+
+<div class="app">
+  <nav class="nav" aria-label="Settings categories">
+    <div class="brand">
+      <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true"><circle cx="14" cy="14" r="10" fill="none" stroke="var(--accent)" stroke-width="3"/><circle cx="14" cy="14" r="3.5" fill="var(--accent)"/></svg>
+      <span>Halo Settings</span>
+    </div>
+    <div id="navlist" role="list"></div>
+    <div class="spacer"></div>
+    <button class="btn ghost" id="reset-all" type="button"><svg aria-hidden="true"><use href="#i-reset"/></svg>Reset everything</button>
+    <p class="nav-foot-note">Changes apply to Halo right away. You never need to restart it.</p>
+  </nav>
+
+  <main class="main" id="main" tabindex="-1" aria-live="off"></main>
+
+  <aside class="rail" id="rail" aria-label="Performance" data-running="false">
+    <div class="rail-top">
+      <h2>Performance</h2>
+      <span class="status" id="status" data-on="unknown"><span class="dot"></span><span id="status-text">Checking…</span></span>
+    </div>
+    <p class="rail-intro">Measured once a second over the last minute. Nothing here is estimated.</p>
+    <div id="not-running" class="notice" hidden>
+      <b>Halo isn't running</b>
+      Start Halo to see live numbers. Your changes are saved either way and apply the next time it starts.
+    </div>
+    <div class="metrics">
+      <div class="metric" id="m-cpu">
+        <div class="m-head"><span class="m-name">Processor</span><span class="m-val" data-v>n/a</span></div>
+        <svg class="spark" viewBox="0 0 240 40" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="m-sub" data-sub></div>
+        <p class="m-help">Share of your computer's processing power Halo is using, across all cores.</p>
+      </div>
+      <div class="metric" id="m-ram">
+        <div class="m-head"><span class="m-name">Memory</span><span class="m-val" data-v>n/a</span></div>
+        <svg class="spark" viewBox="0 0 240 40" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="m-sub" data-sub></div>
+        <p class="m-help">Memory Halo itself holds. Windows' own figure is larger because it includes shared libraries.</p>
+      </div>
+      <div class="metric" id="m-gpu">
+        <div class="m-head"><span class="m-name">Graphics</span><span class="m-val" data-v>n/a</span></div>
+        <svg class="spark" viewBox="0 0 240 40" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="m-sub" data-sub></div>
+        <p class="m-help">Graphics-chip time spent by Halo's own processes.</p>
+      </div>
+      <div class="metric" id="m-dwm">
+        <div class="m-head"><span class="m-name">Desktop Window Manager (shared)</span><span class="m-val" data-v>n/a</span></div>
+        <svg class="spark shared" viewBox="0 0 240 40" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="m-sub" data-sub></div>
+        <p class="m-help">Halo's animations are drawn by Windows itself, so most of their graphics cost lands here, shared with every window on your PC.</p>
+      </div>
+    </div>
+    <p class="rail-foot" id="rail-foot"></p>
+  </aside>
+</div>
+
+<dialog id="confirm" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <h2 id="confirm-title">Reset?</h2>
+    <p id="confirm-text"></p>
+    <menu>
+      <button class="btn" value="cancel" autofocus>Cancel</button>
+      <button class="btn danger" value="ok" id="confirm-ok">Reset</button>
+    </menu>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+/* ===================================================================== DATA
+   What each page shows. Ranges and defaults come from the server's schema, not from here. */
+const PAGES = [
+  { id: "taskbar",       title: "Taskbar",        icon: "i-taskbar", lede: "The dock where your apps live.", animates: true,
+    reveal: "the dock appears when your pointer reaches the bottom edge" },
+  { id: "controlcenter", title: "Control Center", icon: "i-cc",      lede: "Quick settings, sliders and what's playing.", animates: true,
+    reveal: "the panel opens and closes" },
+  { id: "start",         title: "Start menu",     icon: "i-start",   lede: "The launcher for apps and files.", animates: true,
+    reveal: "the Start menu opens and closes" },
+  { id: "general",       title: "General",        icon: "i-general", lede: "How Halo looks overall, and how much it moves." },
+];
+const EFFECTS = [
+  ["rise",   "Rise",   "Slides up from the edge and fades in."],
+  ["bounce", "Bounce", "Springs up, overshoots a little, then settles."],
+  ["swipe",  "Swipe",  "Slides in sideways from the right."],
+  ["fade",   "Fade",   "Fades in place. No movement."],
+  ["swoop",  "Swoop",  "Grows from the corner while rising."],
+  ["none",   "None",   "Appears and disappears instantly."],
+];
+const TINTS = ["#18191E", "#0F2A2E", "#1B2433", "#2B2B2B", "#F8F8FB", "#E6F4F1", "#F3EFE6"];
+const ACCENTS = ["#14A394", "#3B82F6", "#22C55E", "#F59E0B", "#EF4444", "#EC4899", "#8B5CF6", "#94A3B8"];
+
+const secs = (n) => n === 0 ? "Instant" : (n / 1000).toFixed(n % 100 ? 2 : 1).replace(/\.?0+$/, "") + " s";
+const BEHAVIOUR = {
+  taskbar: [
+    { k: "icon_size", type: "slider", label: "Icon size", help: "How big app icons are when your pointer isn't over them.", step: 2, ends: ["Smaller", "Larger"], fmt: (v) => v + " px" },
+    { k: "magnification", type: "slider", label: "Zoom on hover", help: "How much icons grow as your pointer passes over them. Slide fully left to turn zoom off.", step: 5, ends: ["Off", "Big"], fmt: (v) => v <= 100 ? "Off" : v + "%" },
+    { k: "autohide", type: "toggle", label: "Hide automatically", help: "Slide the dock out of the way when a window reaches the bottom of the screen." },
+    { k: "hide_delay", type: "slider", label: "Hide delay", help: "How long your pointer must stay away before the dock hides.", step: 50, ends: ["Right away", "Slowly"], fmt: (v) => v === 0 ? "Right away" : secs(v), needs: "autohide" },
+    { k: "bounce_on_launch", type: "toggle", label: "Bounce when opening an app", help: "The icon hops up and down while the app starts." },
+    { k: "running_dots", type: "toggle", label: "Show which apps are open", help: "A small dot under every app that is running." },
+  ],
+  controlcenter: [
+    { k: "hot_corner", type: "toggle", label: "Open from the corner", help: "Open the panel when your pointer rests in the bottom-right corner of the screen." },
+    { k: "corner_width", type: "slider", label: "Corner size", help: "How wide the hot corner is, as a share of your screen's width.", step: 1, ends: ["Narrow", "Wide"], fmt: (v) => v + "% of width", needs: "hot_corner" },
+    { k: "corner_delay", type: "slider", label: "Hover time", help: "How long your pointer must rest in the corner. A longer time avoids opening it by accident.", step: 10, ends: ["Instant", "Patient"], fmt: (v) => v === 0 ? "Instant" : secs(v), needs: "hot_corner" },
+    { k: "close_on_leave", type: "toggle", label: "Close when the pointer leaves", help: "Close the panel once your pointer moves away. Only applies when it was opened from the corner.", needs: "hot_corner" },
+    { k: "show_media", type: "toggle", label: "Show Now Playing", help: "A tile with the music or video that's playing, with play and skip." },
+    { k: "show_sliders", type: "toggle", label: "Show Display and Sound sliders", help: "Brightness and volume sliders at the top of the panel." },
+  ],
+  start: [
+    { k: "recent_apps", type: "slider", label: "Recent apps", help: "How many recently used apps to show in the top row. Choose 0 to hide the row.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " app" : " apps") },
+    { k: "recent_files", type: "slider", label: "Recent files", help: "How many recent files to list, in rows of six. Choose 0 to hide them.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " file" : " files") },
+    { k: "dim_desktop", type: "toggle", label: "Dim the desktop", help: "Darken everything behind the Start menu so it stands out." },
+  ],
+};
+const SPEED_FMT = (v) => v === 100 ? "Normal" : (v < 100 ? "Slower" : "Faster") + " · " + (v / 100).toFixed(2).replace(/0$/, "") + "×";
+const MOTION_FMT = (v) => v === 0 ? "None · fades only" : v === 100 ? "As designed" : (v < 100 ? "Subtle" : "Dramatic") + " · " + v + "%";
+
+/* ===================================================================== STATE */
+let schema = {};      // "section.key" -> {type,min,max,default}
+let defaults = {};
+let values = {};
+let settingsPath = "";
+let page = "taskbar";
+const ctl = {};       // "section.key" -> {set(v), disable(b)}
+const mqDark = matchMedia("(prefers-color-scheme: dark)");
+const mqMotion = matchMedia("(prefers-reduced-motion: reduce)");
+
+/* ===================================================================== TINY DOM HELPERS */
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === false || v == null) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "style") el.style.cssText = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(kid));
+  return el;
+}
+const svgUse = (id) => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg"); s.setAttribute("aria-hidden", "true"); const u = document.createElementNS("http://www.w3.org/2000/svg", "use"); u.setAttribute("href", "#" + id); s.append(u); return s; };
+const $ = (s, r = document) => r.querySelector(s);
+
+/* ===================================================================== API */
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? undefined : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+/* ===================================================================== SAVING */
+let pending = {}, timer = 0, inflight = false, hideSaved = 0;
+const saveEl = () => $("#save");
+function setStatus(state) {
+  const el = saveEl(); if (!el) return;
+  clearTimeout(hideSaved);
+  el.dataset.state = state;
+  el.classList.add("show");
+  el.replaceChildren();
+  if (state === "saving") el.append("Saving…");
+  else if (state === "saved") { el.append(svgUse("i-check"), "Saved"); hideSaved = setTimeout(() => el.classList.remove("show"), 1800); }
+  else { el.append("Couldn't save. ", h("button", { type: "button", onclick: () => flush() }, "Try again")); }
+}
+function change(key, value) {
+  values[key] = value;
+  pending[key] = value;
+  derived(key);
+  setStatus("saving");
+  clearTimeout(timer);
+  timer = setTimeout(flush, 200);
+}
+async function flush() {
+  clearTimeout(timer);
+  if (inflight) { timer = setTimeout(flush, 100); return; }
+  const batch = pending; pending = {};
+  if (!Object.keys(batch).length) return;
+  inflight = true;
+  try {
+    const r = await api("api/settings", batch);
+    if (!r.ok) throw new Error("rejected");
+    // Take the server's normalised values, except for anything the user has changed since.
+    for (const [k, v] of Object.entries(r.values)) if (!(k in pending) && values[k] !== v) { values[k] = v; ctl[k] && ctl[k].set(v); derived(k); }
+    if (!Object.keys(pending).length) setStatus("saved");
+  } catch (e) {
+    for (const k of Object.keys(batch)) if (!(k in pending)) pending[k] = batch[k];
+    setStatus("error");
+  } finally { inflight = false; }
+}
+
+/* ===================================================================== CONTROLS */
+function toggleRow(sec, spec) {
+  const key = sec + "." + spec.k, id = "c-" + sec + "-" + spec.k;
+  const input = h("input", { class: "sw", type: "checkbox", role: "switch", id, onchange: () => change(key, input.checked ? "on" : "off") });
+  const row = h("label", { class: "row", for: id }, h("span", { class: "txt" }, h("span", { class: "label" }, spec.label), h("span", { class: "help" }, spec.help)), input);
+  ctl[key] = { set: (v) => { input.checked = v === "on"; }, disable: (b) => { input.disabled = b; row.dataset.disabled = b; } };
+  ctl[key].set(values[key]);
+  return row;
+}
+function sliderRow(sec, spec, fmt, ends) {
+  const key = sec + "." + spec.k, id = "c-" + sec + "-" + spec.k, meta = schema[key];
+  const readout = h("span", { class: "readout", "aria-hidden": "true" });
+  const input = h("input", { class: "range", type: "range", id, min: meta.min, max: meta.max, step: spec.step || 1, "aria-describedby": id + "-h" });
+  const paint = () => {
+    const v = +input.value;
+    input.style.setProperty("--fill", ((v - meta.min) / (meta.max - meta.min) * 100) + "%");
+    readout.textContent = fmt(v);
+    input.setAttribute("aria-valuetext", fmt(v));
+  };
+  input.addEventListener("input", () => { paint(); change(key, String(+input.value)); });
+  const row = h("div", { class: "row stack" },
+    h("div", { class: "top" }, h("label", { class: "txt", for: id }, h("span", { class: "label" }, spec.label), h("span", { class: "help", id: id + "-h" }, spec.help)), readout),
+    input,
+    ends && h("div", { class: "range-ends", "aria-hidden": "true" }, h("span", {}, ends[0]), h("span", {}, ends[1])));
+  ctl[key] = { set: (v) => { input.value = v; paint(); }, disable: (b) => { input.disabled = b; row.dataset.disabled = b; } };
+  ctl[key].set(values[key]);
+  return row;
+}
+function applyDeps(sec) {
+  for (const spec of BEHAVIOUR[sec] || []) if (spec.needs) { const c = ctl[sec + "." + spec.k]; if (c) c.disable(values[sec + "." + spec.needs] !== "on"); }
+}
+function swatchGroup(key, colours, { themeDefault, name, current }) {
+  const wrap = h("div", { class: "swatches", role: "radiogroup", "aria-label": name });
+  const inputs = [];
+  const mk = (val, label, cls, style) => {
+    const input = h("input", { type: "radio", name: key, value: val, "aria-label": label, onchange: () => { if (input.checked) { change(key, val); sync(); } } });
+    inputs.push(input);
+    return h("label", { class: "swatch " + (cls || ""), style, title: label }, input);
+  };
+  if (themeDefault) wrap.append(mk("", "Theme default", "theme-default"));
+  for (const c of colours) wrap.append(mk(c, c, "", "--c:" + c));
+  const picker = h("input", { type: "color", "aria-label": "Pick your own colour", value: "#14a394" });
+  picker.addEventListener("input", () => { change(key, picker.value.toUpperCase()); sync(); });
+  wrap.append(h("label", { class: "swatch custom", title: "Pick your own colour" }, picker));
+  const caption = h("span", { class: "swatch-label" });
+  wrap.append(caption);
+  function sync() {
+    const v = values[key] || "";
+    let hit = false;
+    for (const i of inputs) { i.checked = i.value.toLowerCase() === v.toLowerCase(); hit = hit || i.checked; }
+    picker.closest(".swatch").style.boxShadow = hit || !v ? "" : "inset 0 0 0 1px var(--line), 0 0 0 2px var(--bg), 0 0 0 4px var(--text)";
+    if (v) picker.value = v.toLowerCase();
+    caption.textContent = v ? (hit ? "" : v) : "Matches your theme";
+  }
+  ctl[key] = { set: sync };
+  sync();
+  return wrap;
+}
+function segmented(key, options, name) {
+  const wrap = h("div", { class: "seg", role: "radiogroup", "aria-label": name });
+  const inputs = options.map(([v, label]) => {
+    const input = h("input", { type: "radio", name: key, value: v, onchange: () => input.checked && change(key, v) });
+    wrap.append(h("label", {}, input, h("span", {}, label)));
+    return input;
+  });
+  ctl[key] = { set: (v) => inputs.forEach((i) => (i.checked = i.value === v)) };
+  ctl[key].set(values[key]);
+  return wrap;
+}
+
+/* ===================================================================== EFFECT PREVIEWS (Web Animations) */
+let previewAnims = [];
+function previewKeyframes(effect, speed, motion, reduced, kind) {
+  if (reduced && effect !== "none") effect = "fade";
+  const m = motion / 100, t = 16 * m;
+  if (m === 0 && effect !== "swoop" && effect !== "none") effect = "fade";
+  const OPEN = 620 / (speed / 100), CLOSE = 420 / (speed / 100), HOLD = 900, REST = 520;
+  const D = OPEN + HOLD + CLOSE + REST;
+  const a = OPEN / D, b = (OPEN + HOLD) / D, c = (OPEN + HOLD + CLOSE) / D;
+  const origin = kind === "controlcenter" ? "right bottom" : kind === "start" ? "left bottom" : "center bottom";
+  let hid = { opacity: 0 }, easeOpen = "cubic-bezier(.16,1,.3,1)", easeClose = "cubic-bezier(.4,0,1,1)", extra = {};
+  switch (effect) {
+    case "rise":   hid.transform = `translateY(${t}px)`; break;
+    case "bounce": hid.transform = `translateY(${t * 2}px)`; easeOpen = `cubic-bezier(.3,${Math.min(2.4, 1 + 0.7 * m).toFixed(2)},.5,1)`; break;
+    case "swipe":  hid.transform = `translateX(${t * 3}px)`; break;
+    case "swoop":  hid.transform = `translateY(${t * 0.5}px) scale(.92)`; extra.transformOrigin = origin; break;
+  }
+  const shown = { opacity: 1, transform: "none" };
+  if (effect === "none") {
+    return { D, frames: [{ offset: 0, opacity: 1, transform: "none", easing: "steps(1,start)" }, { offset: b - 0.001, opacity: 1, transform: "none", easing: "steps(1,start)" }, { offset: b, opacity: 0, transform: "none" }, { offset: 1, opacity: 0, transform: "none" }], extra };
+  }
+  if (!hid.transform) hid.transform = "none";
+  return { D, extra, frames: [
+    { offset: 0, ...hid, easing: easeOpen }, { offset: a, ...shown, easing: "linear" },
+    { offset: b, ...shown, easing: easeClose }, { offset: c, ...hid }, { offset: 1, ...hid } ] };
+}
+function restartPreviews() {
+  previewAnims.forEach((x) => x.cancel()); previewAnims = [];
+  const pg = PAGES.find((p) => p.id === page);
+  if (!pg || !pg.animates) return;
+  const reduced = values["general.reduce_motion"] === "on" || mqMotion.matches;
+  const speed = +values[page + ".speed"], motion = +values[page + ".motion"];
+  document.querySelectorAll(".fx .surf").forEach((surf) => {
+    const { D, frames, extra } = previewKeyframes(surf.dataset.effect, speed, motion, reduced, page);
+    Object.assign(surf.style, extra);
+    previewAnims.push(surf.animate(frames, { duration: D, iterations: Infinity, fill: "both" }));
+  });
+}
+let previewTimer = 0;
+const schedulePreviews = () => { clearTimeout(previewTimer); previewTimer = setTimeout(restartPreviews, 120); };
+
+function surfInner(kind) { return kind === "taskbar" ? [h("i"), h("i"), h("i"), h("i")] : kind === "controlcenter" ? [h("i"), h("i"), h("i"), h("i"), h("i"), h("i")] : [h("i"), h("i"), h("i"), h("i"), h("i"), h("i"), h("i"), h("i")]; }
+
+function effectCard(sec, pg) {
+  const key = sec + ".effect";
+  const grid = h("div", { class: "fx-grid", role: "radiogroup", "aria-label": "Animation style" });
+  const inputs = EFFECTS.map(([id, name, desc]) => {
+    const input = h("input", { type: "radio", name: key, value: id, onchange: () => { if (input.checked) change(key, id); } });
+    grid.append(h("label", { class: "fx" }, input,
+      h("div", { class: "stage", "aria-hidden": "true" }, h("div", { class: "surf", "data-kind": sec, "data-effect": id }, surfInner(sec))),
+      h("div", { class: "name" }, name, svgUse("i-check")),
+      h("div", { class: "desc" }, desc)));
+    return input;
+  });
+  ctl[key] = { set: (v) => inputs.forEach((i) => (i.checked = i.value === v)) };
+  ctl[key].set(values[key]);
+  const speed = sliderRow(sec, { k: "speed", label: "Speed", help: "How quickly the animation plays." }, SPEED_FMT, ["Slower", "Faster"]);
+  const motion = sliderRow(sec, { k: "motion", label: "Amount of movement", help: "How far things travel and how much they overshoot. At the far left, everything just fades." }, MOTION_FMT, ["Subtle", "Dramatic"]);
+  const note = h("p", { class: "fx-note", id: "fx-note" });
+  return card("Animation", "How " + pg.reveal + ". The previews play at your chosen speed.", [h("div", { class: "block", style: "border-top:0;padding-top:0" }, grid, note), speed, motion]);
+}
+
+/* ===================================================================== GLASS PREVIEW */
+function hexToRgb(hex) { const n = parseInt(hex.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+const lum = ([r, g, b]) => { const f = (c) => { c /= 255; return c <= .03928 ? c / 12.92 : Math.pow((c + .055) / 1.055, 2.4); }; return .2126 * f(r) + .7152 * f(g) + .0722 * f(b); };
+function isDark() { const t = values["general.theme"]; return t === "dark" || (t !== "light" && mqDark.matches); }
+function updateGlass() {
+  const g = $(".glass"); if (!g) return;
+  const op = +values[page + ".opacity"], blur = +values[page + ".blur"];
+  const tint = values[page + ".tint"] || (isDark() ? getComputedStyle(document.documentElement).getPropertyValue("--smoke-tint").trim() : getComputedStyle(document.documentElement).getPropertyValue("--frost-tint").trim());
+  const rgb = hexToRgb(tint);
+  g.style.setProperty("--glass-bg", `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${op / 100})`);
+  g.style.setProperty("--glass-blur", blur + "px");
+  g.style.setProperty("--glass-ink", lum(rgb) > 0.4 ? getComputedStyle(document.documentElement).getPropertyValue("--ink-900") : getComputedStyle(document.documentElement).getPropertyValue("--paper-0"));
+}
+function appearanceCard(sec) {
+  const wall = h("div", { class: "wall", "aria-hidden": "true" }, h("div", { class: "blob b1" }), h("div", { class: "blob b2" }), h("div", { class: "blob b3" }),
+    h("div", { class: "glass" }, h("b", {}, "Sample glass"), h("div", { class: "bar" }), h("div", { class: "bar s" }), h("div", { class: "bar a" })));
+  const tintBlock = h("div", { class: "block" },
+    h("div", { class: "txt" }, h("span", { class: "label" }, "Tint colour"), h("span", { class: "help" }, "The colour of the glass. \"Theme default\" switches between smoky dark and frosted light automatically.")),
+    swatchGroup(sec + ".tint", TINTS, { themeDefault: true, name: "Tint colour" }));
+  return card("Appearance", "The frosted-glass look. The preview shows exactly what you're choosing.", [
+    h("div", { class: "block", style: "border-top:0;padding-top:0" }, wall, h("p", { class: "glass-note" }, "Sample wallpaper. On your desktop, the glass blurs whatever is behind it.")),
+    sliderRow(sec, { k: "opacity", label: "Glass strength", help: "How solid the tint is. Lower is clearer, higher is more opaque." }, (v) => v + "%", ["See-through", "Solid"]),
+    tintBlock,
+  ]);
+}
+
+function card(title, desc, rows) {
+  return h("section", { class: "card" }, h("header", { class: "card-head" }, h("h2", {}, title), desc && h("p", {}, desc)), h("div", { class: "card-body" }, rows));
+}
+
+/* ===================================================================== PAGES */
+function renderPage() {
+  const pg = PAGES.find((p) => p.id === page);
+  for (const k of Object.keys(ctl)) delete ctl[k];
+  const body = h("div", { class: "page" });
+  body.append(h("div", { class: "page-head" },
+    h("div", {}, h("h1", { id: "page-title", tabindex: "-1" }, pg.title), h("p", { class: "lede" }, pg.lede)),
+    h("div", { class: "head-actions" }, h("span", { class: "save", id: "save", role: "status", "aria-live": "polite" }),
+      pg.id !== "general" && h("button", { class: "btn", type: "button", onclick: () => ask("Reset " + pg.title + " to defaults?", "Every " + pg.title + " setting goes back to how Halo ships. Other sections aren't touched.", () => reset(pg.id)) }, svgUse("i-reset"), "Reset this section"))));
+  if (pg.animates) {
+    body.append(effectCard(pg.id, pg), appearanceCard(pg.id));
+    body.append(card("Behaviour", "What it does and when.", BEHAVIOUR[pg.id].map((s) => s.type === "toggle" ? toggleRow(pg.id, s) : sliderRow(pg.id, s, s.fmt, s.ends))));
+    applyDeps(pg.id);
+  } else {
+    body.append(card("Look", "How Halo's surfaces and this window look.", [
+      h("div", { class: "row" }, h("span", { class: "txt" }, h("span", { class: "label" }, "Theme"), h("span", { class: "help" }, "Follow Windows, or always use dark or light glass.")), segmented("general.theme", [["system", "System"], ["dark", "Dark"], ["light", "Light"]], "Theme")),
+      h("div", { class: "block" }, h("div", { class: "txt" }, h("span", { class: "label" }, "Accent colour"), h("span", { class: "help" }, "Used for switches, sliders and highlights, in Halo and in this window.")),
+        swatchGroup("general.accent", ACCENTS, { name: "Accent colour" })),
+    ]));
+    body.append(card("Motion", "For people who find movement distracting.", [toggleRow("general", { k: "reduce_motion", label: "Reduce motion", help: "Every animation becomes a simple fade, and icons stop zooming when you hover. Applies to Halo and to the previews here." })]));
+    body.append(card("Your settings file", "Halo Settings is a friendly front end for one plain-text file. You can back it up or share it.", [
+      h("div", { class: "block", style: "border-top:0;padding-top:0" }, h("span", { class: "file-path" }, settingsPath)),
+      h("div", { class: "row" }, h("span", { class: "txt" }, h("span", { class: "label" }, "Start over"), h("span", { class: "help" }, "Put every setting in every section back to how Halo ships. This can't be undone.")),
+        h("button", { class: "btn", type: "button", onclick: () => ask("Reset everything?", "Every setting in every section goes back to how Halo ships. This can't be undone.", () => reset("all")) }, svgUse("i-reset"), "Reset everything"))]));
+  }
+  const main = $("#main"); main.replaceChildren(body); main.scrollTop = 0;
+  document.title = "Halo Settings";
+  updateGlass(); updateNote(); schedulePreviews();
+}
+function updateNote() {
+  const n = $("#fx-note"); if (!n) return;
+  const reduced = values["general.reduce_motion"] === "on" || mqMotion.matches;
+  n.textContent = reduced ? "Reduce motion is on, so every effect except None plays as a simple fade." : (+values[page + ".motion"] === 0 ? "Movement is at zero, so Rise, Bounce and Swipe play as fades." : "");
+}
+
+/* ===================================================================== NAV */
+function renderNav() {
+  const list = $("#navlist"); list.replaceChildren();
+  for (const p of PAGES) list.append(h("button", { class: "nav-btn", type: "button", role: "listitem", "data-page": p.id, onclick: () => go(p.id) }, svgUse(p.icon), p.title));
+  markNav();
+}
+function markNav() { document.querySelectorAll(".nav-btn").forEach((b) => (b.dataset.page === page ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"))); }
+function go(id, focus) { page = id; history.replaceState(null, "", "#" + id); markNav(); renderPage(); if (focus) $("#page-title").focus({ preventScroll: true }); }
+
+/* ===================================================================== RESET + CONFIRM */
+const dlg = $("#confirm");
+let onConfirm = null;
+function ask(title, text, fn) { $("#confirm-title").textContent = title; $("#confirm-text").textContent = text; onConfirm = fn; dlg.showModal(); }
+dlg.addEventListener("close", () => { if (dlg.returnValue === "ok" && onConfirm) onConfirm(); dlg.returnValue = ""; onConfirm = null; });
+$("#reset-all").addEventListener("click", () => ask("Reset everything?", "Every setting in every section goes back to how Halo ships. This can't be undone.", () => reset("all")));
+async function reset(section) {
+  clearTimeout(timer); pending = {};
+  try {
+    const r = await api("api/reset", { section });
+    values = r.values;
+    derived("*"); renderPage(); setStatus("saved");
+  } catch (e) { setStatus("error"); }
+}
+
+/* ===================================================================== DERIVED STATE (theme, accent, previews) */
+function applyTheme() { const t = values["general.theme"]; if (t === "dark" || t === "light") document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; }
+function applyAccent() {
+  const a = values["general.accent"] || "#14A394", r = document.documentElement;
+  r.style.setProperty("--accent", a);
+  r.dataset.accentTone = lum(hexToRgb(a)) > 0.4 ? "light" : "dark";
+}
+function derived(key) {
+  if (key === "*" || key === "general.theme") { applyTheme(); updateGlass(); }
+  if (key === "*" || key === "general.accent") applyAccent();
+  if (key === "*" || key.endsWith(".opacity") || key.endsWith(".blur") || key.endsWith(".tint")) updateGlass();
+  if (key === "*" || key.endsWith(".speed") || key.endsWith(".motion") || key === "general.reduce_motion") { schedulePreviews(); updateNote(); }
+  if (key === "*" || key.endsWith(".hot_corner") || key.endsWith(".autohide")) applyDeps(page);
+}
+mqDark.addEventListener("change", () => updateGlass());
+mqMotion.addEventListener("change", () => { schedulePreviews(); updateNote(); });
+
+/* ===================================================================== PERFORMANCE */
+const HIST = 60;
+const series = { cpu: [], ram: [], gpu: [], dwm: [] };
+const fmtPct = (v) => v < 10 ? v.toFixed(1) : Math.round(v).toString();
+function push(name, v) { const s = series[name]; s.push(v == null ? null : v); while (s.length > HIST) s.shift(); }
+function drawSpark(svg, data, minMax) {
+  const peak = Math.max(minMax, ...data.filter((x) => x != null)) * 1.15;
+  const W = 240, H = 40, step = W / (HIST - 1), off = HIST - data.length;
+  let line = "", area = "", seg = [];
+  const flush = () => { if (seg.length > 1) { const d = seg.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" "); line += d; area += d + `L${seg[seg.length - 1][0].toFixed(1)} ${H}L${seg[0][0].toFixed(1)} ${H}Z`; } seg = []; };
+  data.forEach((v, i) => { if (v == null) flush(); else seg.push([(off + i) * step, H - 2 - (v / peak) * (H - 6)]); });
+  flush();
+  svg.innerHTML = `<line class="base" x1="0" y1="${H - .5}" x2="${W}" y2="${H - .5}"/><path class="area" d="${area}"/><path class="line" d="${line}"/>`;
+  return peak / 1.15;
+}
+function setMetric(id, text, unit, data, minMax, scaleText, peakText) {
+  const root = $("#" + id), v = $("[data-v]", root);
+  v.classList.toggle("na", text === "n/a");
+  v.replaceChildren(text, unit ? h("small", {}, unit) : "");
+  drawSpark($(".spark", root), data, minMax);
+  $("[data-sub]", root).textContent = scaleText;
+  root.title = peakText ? "Highest in the last minute: " + peakText.replace("peak ", "") : "";
+}
+const peakOf = (d, f) => { const x = d.filter((v) => v != null); return x.length ? "peak " + f(Math.max(...x)) : ""; };
+let failures = 0;
+function renderStats(s) {
+  failures = 0;
+  const t = s.total, running = s.running || t.running;
+  const rail = $("#rail"); rail.dataset.running = running;
+  const st = $("#status"); st.dataset.on = running; $("#status-text").textContent = running ? "Halo is running" : "Halo isn't running";
+  $("#not-running").hidden = running;
+  push("cpu", running ? t.cpu : null); push("ram", running ? t.ram_private_mb : null); push("gpu", running ? t.gpu : null); push("dwm", s.dwm.gpu);
+  const na = "n/a";
+  setMetric("m-cpu", running && t.cpu != null ? fmtPct(t.cpu) : na, running && t.cpu != null ? "%" : "", series.cpu, 5, "", peakOf(series.cpu, (v) => fmtPct(v) + "%"));
+  const mb = (v) => v < 100 ? v.toFixed(1) : Math.round(v);
+  setMetric("m-ram", running && t.ram_private_mb != null ? String(mb(t.ram_private_mb)) : na, running && t.ram_private_mb != null ? "MB" : "", series.ram, 1, running && t.ram_ws_mb != null ? "Windows counts " + mb(t.ram_ws_mb) + " MB in use" : "", peakOf(series.ram, (v) => mb(v) + " MB"));
+  setMetric("m-gpu", running && t.gpu != null ? fmtPct(t.gpu) : na, running && t.gpu != null ? "%" : "", series.gpu, 5, "", peakOf(series.gpu, (v) => fmtPct(v) + "%"));
+  setMetric("m-dwm", s.dwm.gpu != null ? fmtPct(s.dwm.gpu) : na, s.dwm.gpu != null ? "%" : "", series.dwm, 5, "", peakOf(series.dwm, (v) => fmtPct(v) + "%"));
+  const procs = [["halo.exe", s.halo], ["guardian.exe", s.guardian]].filter(([, g]) => g.running);
+  $("#rail-foot").textContent = running ? "Adds up " + procs.map(([n, g]) => n + (g.ram_private_mb != null ? " (" + mb(g.ram_private_mb) + " MB)" : "")).join(" and ") + ". Your PC has " + s.cores + " logical cores." : "";
+}
+function statsLost() {
+  if (++failures < 3) return;
+  const st = $("#status"); st.dataset.on = "unknown"; $("#status-text").textContent = "Disconnected";
+  $("#rail-foot").textContent = "Halo Settings lost its connection to itself. Close this window and open Halo Settings again.";
+}
+async function pollStats() { try { renderStats(await api("api/stats")); } catch (e) { statsLost(); } }
+
+/* ===================================================================== BOOT */
+async function boot() {
+  $("#main").replaceChildren(h("div", { class: "page" }, h("div", { class: "skel" }), h("div", { class: "skel" })));
+  try {
+    const r = await api("api/settings");
+    for (const k of r.schema) schema[k.key] = k;
+    defaults = r.defaults; values = r.values; settingsPath = r.path;
+  } catch (e) {
+    $("#main").replaceChildren(h("div", { class: "empty" }, h("h2", {}, "Couldn't load your settings"), h("p", {}, "Halo Settings may have been closed in the background. Close this window and open Halo Settings again."), h("button", { class: "btn primary", type: "button", onclick: () => boot() }, "Try again")));
+    return;
+  }
+  applyTheme(); applyAccent(); renderNav();
+  const want = location.hash.slice(1);
+  page = PAGES.some((p) => p.id === want) ? want : "taskbar";
+  markNav(); renderPage();
+  pollStats(); setInterval(pollStats, 1000);
+}
+addEventListener("hashchange", () => { const want = location.hash.slice(1); if (PAGES.some((p) => p.id === want) && want !== page) go(want); });
+addEventListener("focus", async () => { if (Object.keys(pending).length || inflight) return; try { const r = await api("api/settings"); for (const [k, v] of Object.entries(r.values)) if (values[k] !== v) { values[k] = v; ctl[k] && ctl[k].set(v); derived(k); } } catch (e) {} });
+boot();
+</script>
+</body>
+</html>
