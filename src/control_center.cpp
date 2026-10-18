@@ -205,7 +205,7 @@ struct ControlCenter::Impl {
     std::vector<Item> items;
     Item hover, pressed;
     bool tracking = false, synced = false, settling = false, held = false, needSync = false;
-    bool byPointer = false, entered = false;  // opened from the screen edge; the pointer has been over the panel
+    bool byPointer = false, entered = false, fromRight = false;  // opened from the screen edge; the pointer has been over the panel
     ULONGLONG outSince = 0;
     bool powerOpen = false;
     WORD lastMin = 0xFFFF;
@@ -219,10 +219,15 @@ struct ControlCenter::Impl {
         : api(a), inst(i), owner(o), comp(std::move(c)), gdev(std::move(g)) {}
 
     void RegisterClasses();
-    void Open(bool pointer);
+    void Open(bool pointer, bool right);
     void Close();
     void Teardown();
     void CheckPointer();
+    // Down out of the top edge, or in from the right edge: the way the pointer came.
+    wfn::float2 Travel() const {
+        const float pad = std::lround(motion::kPad * s);
+        return fromRight ? wfn::float2{std::ceil(kW * s) + pad, 0} : wfn::float2{0, -(std::ceil(height * s) + pad)};
+    }
     void Settle();
     void Focus();
     void BuildFonts();
@@ -420,9 +425,10 @@ SIZE ControlCenter::Impl::WindowPx() const {
     return {static_cast<LONG>(std::ceil(kW * s)) + 2 * pad, static_cast<LONG>(std::ceil(height * s)) + 2 * pad};
 }
 
-void ControlCenter::Impl::Open(bool pointer) {
+void ControlCenter::Impl::Open(bool pointer, bool right) {
     if (st == St::Open) return;
     byPointer = pointer;
+    fromRight = right;
     entered = false;
     outSince = 0;
     if (st == St::Closing) Teardown();
@@ -465,7 +471,7 @@ void ControlCenter::Impl::Open(bool pointer) {
         // From the edge the panel only shows (the app under the pointer keeps the keyboard, and nothing
         // waits on a foreground change); a click in it activates it like any window.
         ShowWindow(hwnd, pointer ? SW_SHOWNOACTIVATE : SW_SHOW);
-        motion::In(comp, pill, {pad * 1.0f, pad * 1.0f, 0}, {0, -static_cast<float>(hPx + pad)});  // down out of the top edge
+        motion::In(comp, pill, {pad * 1.0f, pad * 1.0f, 0}, Travel());
         settling = true;
         SetTimer(hwnd, kTimerSettle, kSettleMs, nullptr);
         {
@@ -516,7 +522,7 @@ void ControlCenter::Impl::Close() {
     hover = pressed = {};
     drag = Id::None;
     const float pad = motion::kPad * s;
-    motion::Out(comp, pill, {pad, pad, 0}, {0, -(std::ceil(height * s) + pad)});
+    motion::Out(comp, pill, {pad, pad, 0}, Travel());
     SetTimer(hwnd, kTimerClose, motion::kOutMs + 10, nullptr);
     if (api->onHidden) api->onHidden();
 }
@@ -1048,7 +1054,7 @@ void ControlCenter::Impl::Layout() {
                 add(Id::OutDev, {x0 + 8, y + kSliderH - 2 + i * 32, x1 - 8, y + kSliderH + 30 + i * 32}, static_cast<int>(i), 12);
         y += kSliderH + extra + kGap;
     }
-    if (media.State().has) {
+    {  // always there ("Not Playing" when idle), so the panel never grows when a session turns up
         add(Id::MediaTile, {x0, y, x1, y + kMediaH}, 0, kTileR);
         add(Id::Prev, {x0 + 84, y + 46, x0 + 120, y + 80}, 0, 12);
         add(Id::PlayPause, {x0 + 120, y + 46, x0 + 156, y + 80}, 0, 12);
@@ -1321,7 +1327,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             }
             case Id::Prev: case Id::PlayPause: case Id::Next: {
                 auto const& ms = media.State();
-                bool ok = it.id == Id::Prev ? ms.canPrev : it.id == Id::Next ? ms.canNext : true;
+                bool ok = it.id == Id::Prev ? ms.canPrev : it.id == Id::Next ? ms.canNext : ms.has;
                 wchar_t g = it.id == Id::Prev ? 0xE892 : it.id == Id::Next ? 0xE893 : (ms.playing ? 0xE769 : 0xE768);
                 glyph(g, fIcon.get(), r, theme::A(kText, ok ? 1.0f : 0.3f));
                 break;
@@ -1346,7 +1352,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 box(art, 12, kOff);
                 glyph(0xE8D6, fIcon.get(), art, kDim);  // music note
             }
-            txt(ms.title.empty() ? L"Now Playing" : ms.title, fTitle.get(), {r.left + 88, r.top + 14, r.right - 16, r.top + 32}, kText);
+            txt(!ms.has ? L"Not Playing" : ms.title.empty() ? L"Now Playing" : ms.title, fTitle.get(), {r.left + 88, r.top + 14, r.right - 16, r.top + 32}, kText);
             txt(ms.artist, fSub.get(), {r.left + 88, r.top + 30, r.right - 16, r.top + 48}, kDim);
         }
     }
@@ -1528,6 +1534,9 @@ void ControlCenter::Impl::BuildVisuals() {
 ControlCenter::ControlCenter(HINSTANCE inst, HWND owner, wuc::Compositor comp, wuc::CompositionGraphicsDevice gdev)
     : m(std::make_unique<Impl>(this, inst, owner, std::move(comp), std::move(gdev))) {
     m->RegisterClasses();
+    // Whether the display has a brightness control is learned off-thread; learn it now, not on the first
+    // open, or the Display slider turns up mid-open and the panel grows under the pointer.
+    svc::brightness::Probe(m->hot, 0);
 }
 
 ControlCenter::~ControlCenter() {
@@ -1536,7 +1545,7 @@ ControlCenter::~ControlCenter() {
 }
 
 void ControlCenter::Toggle() { IsOpen() ? Close() : Open(); }
-void ControlCenter::Open(bool byPointer) { m->Open(byPointer); }
+void ControlCenter::Open(bool byPointer, bool fromRight) { m->Open(byPointer, fromRight); }
 void ControlCenter::Close() { m->Close(); }
 bool ControlCenter::IsOpen() const { return m->st == Impl::St::Open; }
 // The panel itself (physical px), not the padded window.

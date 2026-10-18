@@ -167,7 +167,7 @@ private:
     void OpenLauncher();
     // Control Center + notifications + calendar are one column on the primary monitor, opened, toggled and
     // closed together: Win+A, Win+N, the edge gestures and the test messages all come through here.
-    void OpenPanel(bool byPointer = false);
+    void OpenPanel(bool byPointer = false, bool withNotifs = true, bool fromRight = false);
     void ClosePanel();
     void TogglePanel() { if (m_cc && m_cc->IsOpen()) ClosePanel(); else OpenPanel(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
@@ -1046,12 +1046,18 @@ LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return self ? self->OnMessage(m, w, l) : DefWindowProcW(h, m, w, l);
 }
 
-void Halo::OpenPanel(bool byPointer) {
-    if (!m_cc || m_cc->IsOpen()) return;
-    m_cc->Open(byPointer);
-    if (!m_cc->IsOpen()) return;
-    Log(L"panel: opened");
-    if (m_notif) {
+// withNotifs: the notification column comes too (Win+A, the right edge); the top edge brings the Control
+// Center alone, and moving on to the right edge then adds the column.
+void Halo::OpenPanel(bool byPointer, bool withNotifs, bool fromRight) {
+    if (!m_cc) return;
+    if (!m_cc->IsOpen()) {
+        m_cc->Open(byPointer, fromRight);
+        if (!m_cc->IsOpen()) return;
+        Log(L"panel: opened");
+    } else if (!withNotifs || (m_notif && m_notif->IsOpen())) {
+        return;
+    }
+    if (m_notif && withNotifs) {
         m_notif->SetAnchor(m_cc->PanelRectScreen());
         SetTimer(m_hwnd, kPanelStagger, kPanelStaggerMs, nullptr);  // follows ~40 ms later with the same motion
     }
@@ -1125,7 +1131,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case kMsgEdge:
             Log(w == halo::edge::kTop ? L"edge: top" : L"edge: right");
-            OpenPanel(true);  // kTop and kRight alike
+            OpenPanel(true, w == halo::edge::kRight, w == halo::edge::kRight);
             return 0;
         case WM_TIMER:
             if (w == kHideTimer) {

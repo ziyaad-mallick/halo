@@ -45,12 +45,15 @@ struct Mouse {
     int pushEvents = 0, pushDy = 0;
 } g_m;
 
-// The right fifth of the top edge, or the top fifth of the right edge.
-bool InCorner(POINT p) {
+// The right fifth of the top edge (kTop: the Control Center alone), or the top fifth of the right edge
+// (kRight: the Control Center with the notification column). 0: neither.
+WPARAM Zone(POINT p) {
     const long w = g_rightX - g_left, h = g_bottom - g_topY;
-    return (p.y <= g_topY + 1 && p.x >= g_rightX - static_cast<long>(w * kZone)) ||
-           (p.x >= g_rightX - 1 && p.y <= g_topY + static_cast<long>(h * kZone));
+    if (p.y <= g_topY + 1 && p.x >= g_rightX - static_cast<long>(w * kZone)) return kTop;
+    if (p.x >= g_rightX - 1 && p.y <= g_topY + static_cast<long>(h * kZone)) return kRight;
+    return 0;
 }
+bool InCorner(POINT p) { return Zone(p) != 0; }
 
 void CALLBACK CornerTimer(HWND, UINT, UINT_PTR id, DWORD) {
     KillTimer(nullptr, id);
@@ -58,7 +61,7 @@ void CALLBACK CornerTimer(HWND, UINT, UINT_PTR id, DWORD) {
     POINT p;
     if (g_m.inCorner && GetCursorPos(&p) && InCorner(p) && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
         g_m.cooldownUntil = GetTickCount() + kCooldownMs;
-        Fire(kTop);
+        Fire(Zone(p));
     }
 }
 

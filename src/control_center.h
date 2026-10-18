@@ -17,7 +17,8 @@ public:
     void Toggle();
     // byPointer: opened from the screen edge. It shows without taking the keyboard and hides on its own
     // once the pointer leaves it (a keyboard-opened panel hides once the pointer has been over it and left).
-    void Open(bool byPointer = false);
+    // fromRight: it slides in from the right screen edge (with the notification column) instead of down.
+    void Open(bool byPointer = false, bool fromRight = false);
     void Close();
     bool IsOpen() const;
 
