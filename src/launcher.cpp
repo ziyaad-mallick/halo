@@ -2,7 +2,6 @@
 #include "launcher.h"
 #include "motion.h"
 #include "theme.h"
-#include "winkey.h"
 
 #include <windows.ui.composition.interop.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -79,23 +78,26 @@ constexpr float kPad = 24;
 constexpr float kLabelH = 16;
 constexpr float kIconSize = 44;
 constexpr float kIconPad = 8;     // the hover plate around an app icon
-constexpr float kGridPitchX = 76, kGridPitchY = 80;
-constexpr float kRowH = 28;
-constexpr float kFileIcon = 20;
+constexpr float kSearchTop = 20, kSearchH = 40;
+constexpr float kAppRowH = 64;
+constexpr float kFileIcon = 32, kFileCellH = 70, kFileRowPitch = 74;
+constexpr float kResultRowH = 34, kResultIcon = 24;
 constexpr float kBottomH = 56;
 constexpr float kButtonH = 32;
 constexpr float kAvatar = 32;
 constexpr float kMenuW = 168;
 constexpr float kMenuRowH = 32;
 constexpr float kMenuPad = 8;
-constexpr float kMinWidth = 640, kMaxWidth = 760, kWidth = 720, kScreenMargin = 24;
+constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 24;
 constexpr float kRise = 24;       // how far below its place the panel starts
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
-constexpr int kMaxApps = 8, kMaxFiles = 6, kKeepApps = 12;
-constexpr int kGraceMs = 800;     // how long Command Palette has to take the keyboard
+constexpr int kMaxApps = 6, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
 constexpr UINT_PTR kRefreshTimer = 1;
-constexpr UINT_PTR kStackTimer = 2;
 constexpr float kPanelRadius = 24;  // local: theme.h has no panel-radius token
+// Icon motion, matched to the dock: hover swells and lifts on a spring, a press squashes, a click bounces.
+constexpr float kHoverScale = 1.18f, kHoverLift = 3, kPressScale = 0.94f, kBounceRise = 8;
+constexpr float kHoverDamping = 0.6f;
+constexpr int kHoverPeriodMs = 45, kBounceMs = 420;
 
 inline winrt::Windows::UI::Color Col(D2D1_COLOR_F c) {
     auto b = [](float v) { return static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
@@ -103,8 +105,6 @@ inline winrt::Windows::UI::Color Col(D2D1_COLOR_F c) {
 }
 
 constexpr wchar_t kMenuItems[5][10] = {L"Sleep", L"Restart", L"Shut down", L"Lock", L"Sign out"};
-
-Launcher* g_launcher = nullptr;  // WinEvent callbacks carry no context
 
 void Log(std::wstring const& msg) {
     auto line = L"[halo] launcher: " + msg + L"\n";
@@ -151,29 +151,6 @@ std::wstring RecentFile() {
     CreateDirectoryW(d.c_str(), nullptr);
     return d + L"\\recent.txt";
 }
-
-// Command Palette (and PowerToys Run): the windows that own the keyboard while the panel is up.
-std::wstring ExeNameOf(HWND hwnd) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    std::wstring name;
-    if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
-        wchar_t buf[MAX_PATH * 2];
-        DWORD n = ARRAYSIZE(buf);
-        if (QueryFullProcessImageNameW(h, 0, buf, &n)) {
-            name.assign(buf, n);
-            name = name.substr(name.find_last_of(L'\\') + 1);
-        }
-        CloseHandle(h);
-    }
-    return Lower(name);
-}
-
-bool IsPaletteTarget(std::wstring const& lowered) {
-    return lowered.find(L"cmdpal") != std::wstring::npos || lowered.find(L"commandpalette") != std::wstring::npos ||
-           lowered.find(L"powerlauncher") != std::wstring::npos;
-}
-
 // A picture file as premultiplied BGRA, via WIC.
 bool LoadImageFile(std::wstring const& path, std::vector<uint8_t>& bgra, int& px) {
     winrt::com_ptr<IWICImagingFactory> factory;
@@ -253,16 +230,47 @@ bool EnableShutdownPrivilege() {
     return ok;
 }
 
-void CALLBACK ForegroundProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DWORD, DWORD) {
-    if (g_launcher) g_launcher->OnForeground(hwnd);
+using winrt::Windows::Foundation::IReference;
+using winrt::Windows::Foundation::Numerics::float2;
+using winrt::Windows::Foundation::Numerics::float3;
+
+// How a lower-cased name matches a lower-cased query: 0 starts with it, 1 a word in it does, 2 it contains it, -1 no match.
+int MatchRank(std::wstring const& name, std::wstring const& q) {
+    size_t at = name.find(q);
+    if (at == std::wstring::npos) return -1;
+    if (at == 0) return 0;
+    for (; at != std::wstring::npos; at = name.find(q, at + 1))
+        if (!std::iswalnum(name[at - 1])) return 1;
+    return 2;
 }
+
+// Every .lnk under a Start-menu Programs folder, as (name without extension, path).
+void ScanLinks(std::wstring const& dir, std::vector<std::pair<std::wstring, std::wstring>>& out, int depth) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::wstring name = fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (name != L"." && name != L".." && depth < 4 && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                ScanLinks(dir + L"\\" + name, out, depth + 1);
+        } else if (name.size() > 4 && !_wcsicmp(name.c_str() + name.size() - 4, L".lnk")) {
+            out.emplace_back(name.substr(0, name.size() - 4), dir + L"\\" + name);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+IReference<float3> Ref3(float3 v) { return v; }  // spring animations take IReference<float3>
+IReference<float2> Ref2(float2 v) { return v; }
+
 
 }  // namespace
 
 Launcher::Launcher(HINSTANCE inst, wuc::Compositor const& comp, wuc::CompositionGraphicsDevice const& gdev,
                    LauncherHost host)
     : m_comp(comp), m_gdev(gdev), m_host(std::move(host)) {
-    g_launcher = this;
     m_dryRun = EnvIs(L"HALO_TEST_POWER_DRYRUN") || EnvIs(L"HALO_TEST");
     winrt::check_hresult(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                              reinterpret_cast<IUnknown**>(m_dwrite.put())));
@@ -270,13 +278,12 @@ Launcher::Launcher(HINSTANCE inst, wuc::Compositor const& comp, wuc::Composition
     LoadMru();
     CreateHwnd(inst);
     Prefetch();
-    Log(L"ready, " + std::to_wstring(m_mru.size()) + L" recent apps" + (m_dryRun ? L", power actions are DRY RUN" : L""));
+    Log(L"ready, " + std::to_wstring(m_mru.size()) + L" recent apps, " + std::to_wstring(m_index.size()) + L" start-menu apps" +
+        (m_dryRun ? L", power actions are DRY RUN" : L""));
 }
 
 Launcher::~Launcher() {
-    if (m_hook) UnhookWinEvent(m_hook);
     if (m_hwnd) DestroyWindow(m_hwnd);
-    g_launcher = nullptr;
 }
 
 void Launcher::CreateHwnd(HINSTANCE inst) {
@@ -286,8 +293,9 @@ void Launcher::CreateHwnd(HINSTANCE inst) {
     wc.lpszClassName = L"HaloLauncherWindow";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
-    m_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                             wc.lpszClassName, L"Halo Launcher", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr, inst, this);
+    // Activatable: the panel is the search UI and takes the keyboard.
+    m_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, wc.lpszClassName, L"Halo Launcher",
+                             WS_POPUP, 0, 0, 16, 16, nullptr, nullptr, inst, this);
     if (!m_hwnd) throw winrt::hresult_error(HRESULT_FROM_WIN32(GetLastError()));
     BOOL on = TRUE;
     DwmSetWindowAttribute(m_hwnd, 17 /* DWMWA_USE_HOSTBACKDROPBRUSH */, &on, sizeof(on));
@@ -335,7 +343,7 @@ void Launcher::SaveMru() const {
 }
 
 void Launcher::Note(std::wstring const& target) {
-    if (target.empty() || IsPaletteTarget(Lower(target))) return;
+    if (target.empty()) return;
     if (!m_mru.empty() && !_wcsicmp(m_mru.front().c_str(), target.c_str())) return;
     std::erase_if(m_mru, [&](std::wstring const& t) { return !_wcsicmp(t.c_str(), target.c_str()); });
     m_mru.insert(m_mru.begin(), target);
@@ -343,9 +351,11 @@ void Launcher::Note(std::wstring const& target) {
     SaveMru();
 }
 
-// The newest non-folder files in the shell's Recent folder, from their shortcuts.
+// The newest non-folder files in the shell's Recent folder, from their shortcuts: the panel shows the
+// first kMaxFiles, search looks through all kKeepFiles.
 void Launcher::LoadFiles() {
     m_files.clear();
+    m_allFiles.clear();
     wchar_t* dir = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_Recent, 0, nullptr, &dir))) return;
     std::wstring folder = std::wstring(dir) + L"\\";
@@ -372,7 +382,7 @@ void Launcher::LoadFiles() {
     auto file = link.as<IPersistFile>();
     size_t looked = 0;
     for (auto const& l : links) {
-        if (m_files.size() >= kMaxFiles || ++looked > 80) break;
+        if (m_allFiles.size() >= kKeepFiles || ++looked > 160) break;
         wchar_t target[MAX_PATH] = {};
         if (FAILED(file->Load(l.path.c_str(), STGM_READ)) ||
             FAILED(link->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH)) || !target[0])
@@ -381,10 +391,37 @@ void Launcher::LoadFiles() {
         DWORD attrs = GetFileAttributesW(target);
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::wstring path = target;
-        if (std::any_of(m_files.begin(), m_files.end(), [&](FileEntry const& e) { return !_wcsicmp(e.path.c_str(), path.c_str()); }))
+        if (std::any_of(m_allFiles.begin(), m_allFiles.end(), [&](FileEntry const& e) { return !_wcsicmp(e.path.c_str(), path.c_str()); }))
             continue;
-        m_files.push_back({path.substr(path.find_last_of(L'\\') + 1), path});
+        m_allFiles.push_back({path.substr(path.find_last_of(L'\\') + 1), path});
     }
+    m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min<size_t>(m_allFiles.size(), kMaxFiles));
+}
+
+// Every Start-menu shortcut (per user, then all users), once: what search looks through for apps.
+void Launcher::BuildIndex() {
+    LARGE_INTEGER t0, t1, fq;
+    QueryPerformanceCounter(&t0);
+    std::vector<std::pair<std::wstring, std::wstring>> found;
+    for (auto const& id : {FOLDERID_Programs, FOLDERID_CommonPrograms}) {
+        wchar_t* dir = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &dir))) ScanLinks(dir, found, 0);
+        CoTaskMemFree(dir);
+    }
+    m_index.clear();
+    std::vector<std::wstring> seen;
+    for (auto& [name, path] : found) {
+        auto lname = Lower(name);
+        if (lname.find(L"uninstall") != std::wstring::npos) continue;
+        if (std::find(seen.begin(), seen.end(), lname) != seen.end()) continue;  // the user's own entry wins
+        seen.push_back(lname);
+        m_index.push_back({name, lname, path});
+    }
+    m_indexed = true;
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&fq);
+    Log(L"app index: " + std::to_wstring(m_index.size()) + L" start-menu apps in " +
+        std::to_wstring((t1.QuadPart - t0.QuadPart) * 10000 / fq.QuadPart / 10.0) + L" ms");
 }
 
 // ---- Drawing --------------------------------------------------------------------------------
@@ -404,6 +441,59 @@ wuc::SpriteVisual Launcher::MakeSurfaceVisual(wuc::CompositionDrawingSurface con
     v.Size({w, h});
     v.Brush(brush);
     return v;
+}
+
+// Draws a surface with one of the Draw* functions (each clears it first).
+void Launcher::Redraw(wuc::CompositionDrawingSurface const& surface,
+                      void (Launcher::*draw)(ID2D1DeviceContext*, float, float)) {
+    auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
+    winrt::com_ptr<ID2D1DeviceContext> dc;
+    POINT offset{};
+    winrt::check_hresult(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset));
+    try {
+        (this->*draw)(dc.get(), static_cast<float>(offset.x), static_cast<float>(offset.y));
+    } catch (...) {
+        interop->EndDraw();
+        throw;
+    }
+    interop->EndDraw();
+}
+
+// A file's shell icon at `logicalPx`, as a brush for its own sprite (cached by icon type and size).
+wuc::CompositionBrush Launcher::FileBrush(std::wstring const& path, float logicalPx) {
+    const int px = static_cast<int>(std::round(logicalPx * m_s));
+    const auto key = IconKey(path);
+    const auto bk = key + L"|" + std::to_wstring(px);
+    if (auto it = m_fileBrushes.find(bk); it != m_fileBrushes.end()) return it->second;
+    auto img = m_fileIcons.find(key);
+    if (img == m_fileIcons.end()) {  // a search hit outside the head of the list: its icon is loaded now
+        IconImage loaded;
+        if (!LoadJumboIcon(path, loaded) || !loaded.width) loaded = {};
+        img = m_fileIcons.emplace(key, std::move(loaded)).first;
+    }
+    if (!img->second.width) return nullptr;
+    try {
+        auto surface = MakeSurface(static_cast<float>(px), static_cast<float>(px));
+        auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
+        winrt::com_ptr<ID2D1DeviceContext> dc;
+        POINT off{};
+        winrt::check_hresult(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off));
+        dc->Clear(D2D1::ColorF(0, 0.0f));
+        winrt::com_ptr<ID2D1Bitmap> bmp;
+        D2D1_BITMAP_PROPERTIES props =
+            D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(img->second.width, img->second.height), img->second.bgra.data(),
+                                       img->second.width * 4, &props, bmp.put()))) {
+            D2D1_RECT_F dest = R(static_cast<float>(off.x), static_cast<float>(off.y), static_cast<float>(off.x + px),
+                                 static_cast<float>(off.y + px));
+            dc->DrawBitmap(bmp.get(), &dest, 1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
+        }
+        interop->EndDraw();
+        auto brush = m_comp.CreateSurfaceBrush(surface);
+        brush.Stretch(wuc::CompositionStretch::Fill);
+        m_fileBrushes.insert_or_assign(bk, brush);
+        return brush;
+    } catch (...) { return nullptr; }
 }
 
 namespace {
@@ -450,82 +540,51 @@ struct Text {
 // Lays out the panel for the current content and builds its visual tree.
 void Launcher::Build() {
     const float s = m_s;
-    m_iconMiss = false;
     Text txt{m_dwrite};
     auto fButton = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
 
     float wl = std::min(kWidth, (m_anchor.monitor.right - m_anchor.monitor.left) / s - 2 * kScreenMargin);
     wl = std::clamp(wl, std::min(kMinWidth, wl), kMaxWidth);
-    if (m_stackW > 0) wl = m_stackW / s;  // the palette's exact width, when stacked or glued to it
     m_w = std::round(wl * s);
 
     // Recent apps: those that still have an icon.
-    std::vector<wuc::CompositionBrush> brushes;
     m_apps.clear();
     for (auto const& t : m_mru) {
         if (m_apps.size() >= kMaxApps) break;
-        if (auto b = m_host.appIcon ? m_host.appIcon(t) : nullptr) {
-            m_apps.push_back(t);
-            brushes.push_back(b);
-        }
+        if (t.find(L"LockApp") != std::wstring::npos) continue;  // the lock screen is not an app to relaunch
+        if (m_host.appIcon && m_host.appIcon(t)) m_apps.push_back(t);
     }
 
-    // Two columns: the apps grid (4 x 2) and the files, a hairline between, the user row under both.
-    float gridY = 24 + kLabelH + 8, gapDiv = 16;
-    float rowH = kRowH, pitchY = kGridPitchY, bottomH = kBottomH;
-    size_t shown = kMaxFiles;
-    auto heightFor = [&] { return gridY + std::max(2 * pitchY, shown * rowH) + gapDiv + 1 + bottomH; };
-    // Under Command Palette: when its bottom edge is known, tighten the layout step by step to stay below it
-    // (rows, grid, user row, header, then fewer files) instead of overlapping it.
-    if (m_paletteBottom > 0) {
-        float avail = (m_anchor.bottom - kTop * s) - (m_paletteBottom + 4 * s);
-        while (heightFor() * s > avail) {
-            if (rowH > 22 || pitchY > 64) { rowH = std::max(22.0f, rowH - 1); pitchY = std::max(64.0f, pitchY - 2); }
-            else if (gapDiv > 6) gapDiv -= 2;
-            else if (bottomH > 40) bottomH -= 2;
-            else if (gridY > 32) gridY -= 2;
-            else if (pitchY > 42) pitchY -= 2;
-            else if (shown > 3) shown--;
-            else break;
-        }
-        Log(L"fit under the palette: avail " + std::to_wstring(static_cast<int>(avail)) + L" px, need " +
-            std::to_wstring(static_cast<int>(heightFor() * s)) + L", rows " + std::to_wstring(static_cast<int>(rowH)) +
-            L" x " + std::to_wstring(shown) + L", grid pitch " + std::to_wstring(static_cast<int>(pitchY)));
-    }
-    const float labelY = gridY - kLabelH - 6;
-    const float iconSize = std::clamp(pitchY - 12, 30.0f, kIconSize);
-    m_iconPx = iconSize;
-    const float pad = std::min(kIconPad, (pitchY - iconSize) / 2 - 1);
-    const float dividerY = gridY + std::max(2 * pitchY, shown * rowH) + gapDiv;
+    // Top to bottom: search bar, recent apps (one row), recent files (2 x 6), the dock bar under a hairline.
+    // The apps and the files share six columns.
+    const float innerW = wl - 2 * kPad, colW = innerW / kFileCols;
+    const float searchBot = kSearchTop + kSearchH;
+    const float appsLabelY = searchBot + 16, appsTop = appsLabelY + kLabelH + 6;
+    const float filesLabelY = appsTop + kAppRowH + 14, filesTop = filesLabelY + kLabelH + 6;
+    const float dividerY = filesTop + kFileRowPitch + kFileCellH + 12;
     const float bottomY = dividerY + 1;
-    m_h = std::round((bottomY + bottomH) * s);
+    m_iconPx = kIconSize;
+    m_h = std::round((bottomY + kBottomH) * s);
+    m_bodyTop = (searchBot + 8) * s;
+    m_bodyBottom = dividerY * s;
 
-    m_hits.clear();
-    m_appCells.clear();
-    m_fileRows.clear();
-    const float pitchX = std::clamp(wl * 0.44f / 4, kGridPitchX, 96.0f);
-    const float gridW = 4 * pitchX;
-    const float sepX = kPad + gridW + 14;
-    const float rightX = sepX + 18;
-    for (size_t i = 0; i < m_apps.size(); i++) {
-        float x = kPad + (i % 4) * pitchX + (pitchX - iconSize) / 2;
-        float y = gridY + (i / 4) * pitchY + (pitchY - iconSize) / 2;
-        m_appCells.push_back(R(x * s, y * s, (x + iconSize) * s, (y + iconSize) * s));
-        m_hits.push_back({R((x - pad) * s, (y - pad) * s, (x + iconSize + pad) * s,
-                            (y + iconSize + pad) * s), Kind::App, static_cast<int>(i)});
-    }
-    m_appsLabel = R(kPad * s, labelY * s, (kPad + gridW) * s, (labelY + kLabelH) * s);
-    m_filesLabel = R(rightX * s, labelY * s, (wl - kPad) * s, (labelY + kLabelH) * s);
-    for (size_t i = 0; i < std::min(m_files.size(), shown); i++) {
-        auto row = R((rightX - 8) * s, (gridY + i * rowH) * s, (wl - kPad + 8) * s, (gridY + (i + 1) * rowH) * s);
-        m_fileRows.push_back(row);
-        m_hits.push_back({row, Kind::File, static_cast<int>(i)});
-    }
-    m_vsep = R(sepX * s, labelY * s, (sepX + 1) * s, (dividerY - gapDiv) * s);
+    m_searchRect = R(kPad * s, kSearchTop * s, (kPad + innerW) * s, searchBot * s);
+    m_appsLabel = R(kPad * s, appsLabelY * s, (kPad + innerW) * s, (appsLabelY + kLabelH) * s);
+    m_filesLabel = R(kPad * s, filesLabelY * s, (kPad + innerW) * s, (filesLabelY + kLabelH) * s);
     m_divider = R(kPad * s, dividerY * s, (wl - kPad) * s, (dividerY + 1) * s);
+    m_appCells.clear();
+    m_fileCells.clear();
+    for (size_t i = 0; i < m_apps.size(); i++) {
+        float x = kPad + (i + 0.5f) * colW - kIconSize / 2, y = appsTop + (kAppRowH - kIconSize) / 2;
+        m_appCells.push_back(R(x * s, y * s, (x + kIconSize) * s, (y + kIconSize) * s));
+    }
+    for (size_t i = 0; i < m_files.size(); i++) {
+        float x = kPad + (i % kFileCols) * colW + 2, y = filesTop + (i / kFileCols) * kFileRowPitch;
+        m_fileCells.push_back(R(x * s, y * s, (x + colW - 4) * s, (y + kFileCellH) * s));
+    }
 
     // Bottom row: picture, name, and the two buttons from the right.
-    const float rowMid = (bottomY + bottomH / 2);
+    const float rowMid = (bottomY + kBottomH / 2);
     m_avatarRect = R(kPad * s, (rowMid - kAvatar / 2) * s, (kPad + kAvatar) * s, (rowMid + kAvatar / 2) * s);
     float powerW = 12 + 16 + 6 + txt.Width(L"Power", fButton.get()) / s + 6 + 12 + 12;
     float settingsW = 12 + 16 + 6 + txt.Width(L"Settings", fButton.get()) / s + 12;
@@ -534,32 +593,25 @@ void Launcher::Build() {
     m_powerRect = R(powerX * s, (rowMid - kButtonH / 2) * s, (powerX + powerW) * s, (rowMid + kButtonH / 2) * s);
     m_settingsRect = R(settingsX * s, (rowMid - kButtonH / 2) * s, (settingsX + settingsW) * s, (rowMid + kButtonH / 2) * s);
     m_nameRect = R((kPad + kAvatar + 10) * s, (rowMid - 12) * s, (settingsX - 8) * s, (rowMid + 12) * s);
-    m_hits.push_back({m_settingsRect, Kind::Settings, 0});
-    m_hits.push_back({m_powerRect, Kind::Power, 0});
+    m_staticHits.clear();
+    m_staticHits.push_back({m_settingsRect, Kind::Settings, 0});
+    m_staticHits.push_back({m_powerRect, Kind::Power, 0});
 
     // The Power menu opens above the Power button, right-aligned with it.
     m_menuW = std::round(kMenuW * s);
-    float menuRow = kMenuRowH;
-    m_menuH = std::round((5 * menuRow + 2 * kMenuPad) * s);
+    m_menuH = std::round((5 * kMenuRowH + 2 * kMenuPad) * s);
     m_menuX = std::round(m_powerRect.right - m_menuW);
     m_menuY = std::round(m_powerRect.top - 6 * s - m_menuH);
-    if (m_menuY < 6 * s) {
-        // A short panel has no room above the button: the menu stands beside it, tighter, on the panel's floor.
-        menuRow = std::clamp((m_h / s - 16 - 2 * kMenuPad) / 5, 22.0f, kMenuRowH);
-        m_menuH = std::round((5 * menuRow + 2 * kMenuPad) * s);
-        m_menuX = std::round(m_powerRect.left - 8 * s - m_menuW);
-        m_menuY = std::round(m_h - 8 * s - m_menuH);
-    }
     m_menuRows.clear();
     m_menuHits.clear();
     for (int i = 0; i < 5; i++) {
-        float top = (kMenuPad + i * menuRow) * s;
-        m_menuRows.push_back(R(kMenuPad * s, top, m_menuW - kMenuPad * s, top + menuRow * s));
+        float top = (kMenuPad + i * kMenuRowH) * s;
+        m_menuRows.push_back(R(kMenuPad * s, top, m_menuW - kMenuPad * s, top + kMenuRowH * s));
         m_menuHits.push_back({R(m_menuX + kMenuPad * s, m_menuY + top, m_menuX + m_menuW - kMenuPad * s,
-                                m_menuY + top + menuRow * s), Kind::MenuItem, i});
+                                m_menuY + top + kMenuRowH * s), Kind::MenuItem, i});
     }
 
-    // Visual tree: [glass] [content: hover plate, text surface, app icons] [menu].
+    // Visual tree: [glass] [content: hover plate, bottom bar, search bar, body (text + icon sprites)] [menu].
     m_root.Children().RemoveAll();
     {   // transparent margin around the panel that the drop shadow lives in (left, right, bottom)
         auto const& pal = theme::P();
@@ -568,11 +620,9 @@ void Launcher::Build() {
     }
     m_shadowHold = nullptr;
     if (m_shadowM > 0) {
-        const float ext = m_stackW > 0 ? 40 * s : 0;  // under the palette the panel is square-topped and taller
-        if (auto sh = MakeShadow(m_comp, m_gdev, std::ceil(m_w), std::ceil(m_h + ext), kPanelRadius * s,
+        if (auto sh = MakeShadow(m_comp, m_gdev, std::ceil(m_w), std::ceil(m_h), kPanelRadius * s,
                                  theme::P().shadowBlur * s, theme::P().shadowY * s, theme::P().shadow)) {
-            sh.Size({m_w, m_h + ext});
-            sh.Offset({0, -ext, 0});
+            sh.Size({m_w, m_h});
             m_shadowHold = m_comp.CreateContainerVisual();
             m_shadowHold.Size({m_w, m_h});
             m_shadowHold.Offset(PanelHome());
@@ -596,10 +646,6 @@ void Launcher::Build() {
     auto clip = m_comp.CreateRoundedRectangleGeometry();
     clip.CornerRadius({kPanelRadius * s, kPanelRadius * s});
     clip.Size({m_w, m_h});
-    if (m_stackW > 0) {  // under the palette: square at the seam, rounded at the bottom
-        clip.Offset({0, -40 * s});
-        clip.Size({m_w, m_h + 40 * s});
-    }
     m_panel.Clip(m_comp.CreateGeometricClip(clip));
     stage.Children().InsertAtTop(m_panel);
 
@@ -615,9 +661,8 @@ void Launcher::Build() {
     {   // 1 px hairline around the panel (separates light glass from a light wallpaper); inset so the clip keeps all of it
         const float t = std::max(1.0f, std::round(s));
         auto edgeShape = m_comp.CreateRoundedRectangleGeometry();
-        float top = m_stackW > 0 ? -40 * s : 0;
-        edgeShape.Offset({t / 2, top + t / 2});
-        edgeShape.Size({m_w - t, m_h - top - t});
+        edgeShape.Offset({t / 2, t / 2});
+        edgeShape.Size({m_w - t, m_h - t});
         edgeShape.CornerRadius({kPanelRadius * s - t / 2, kPanelRadius * s - t / 2});
         auto edgeSprite = m_comp.CreateSpriteShape(edgeShape);
         edgeSprite.StrokeBrush(m_comp.CreateColorBrush(theme::C(theme::P().edge)));
@@ -643,28 +688,33 @@ void Launcher::Build() {
     m_hoverIndex = -1;
     m_hoverOn = m_menuHoverOn = false;
 
-    auto surface = MakeSurface(m_w, m_h);
-    {
-        auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
-        winrt::com_ptr<ID2D1DeviceContext> dc;
-        POINT offset{};
-        winrt::check_hresult(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset));
-        try {
-            DrawPanel(dc.get(), static_cast<float>(offset.x), static_cast<float>(offset.y));
-        } catch (...) {
-            interop->EndDraw();
-            throw;
-        }
-        interop->EndDraw();
+    {   // the dock bar: divider, user, Settings, Power
+        float top = m_divider.top, h = m_h - top;
+        auto surface = MakeSurface(m_w, h);
+        Redraw(surface, &Launcher::DrawStatic);
+        auto v = MakeSurfaceVisual(surface, m_w, h);
+        v.Offset({0, top, 0});
+        m_content.Children().InsertAtTop(v);
     }
-    m_content.Children().InsertAtTop(MakeSurfaceVisual(surface, m_w, m_h));
-
-    for (size_t i = 0; i < m_apps.size(); i++) {
-        auto icon = m_comp.CreateSpriteVisual();
-        icon.Size({m_iconPx * s, m_iconPx * s});
-        icon.Offset({m_appCells[i].left, m_appCells[i].top, 0});
-        icon.Brush(brushes[i]);
-        m_content.Children().InsertAtTop(icon);
+    {   // the search bar's surface and its caret (the blink runs on the compositor)
+        float w = m_searchRect.right - m_searchRect.left, h = m_searchRect.bottom - m_searchRect.top;
+        m_searchSurface = MakeSurface(w, h);
+        auto v = MakeSurfaceVisual(m_searchSurface, w, h);
+        v.Offset({m_searchRect.left, m_searchRect.top, 0});
+        m_content.Children().InsertAtTop(v);
+        m_caret = m_comp.CreateSpriteVisual();
+        m_caret.Brush(m_comp.CreateColorBrush(Col(theme::P().text)));
+        m_content.Children().InsertAtTop(m_caret);
+    }
+    {   // the body: one text surface, and the icon sprites on top of it
+        float h = m_bodyBottom - m_bodyTop;
+        m_bodySurface = MakeSurface(m_w, h);
+        auto v = MakeSurfaceVisual(m_bodySurface, m_w, h);
+        v.Offset({0, m_bodyTop, 0});
+        m_content.Children().InsertAtTop(v);
+        m_bodyIcons = m_comp.CreateContainerVisual();
+        m_bodyIcons.Size({m_w, m_h});
+        m_content.Children().InsertAtTop(m_bodyIcons);
     }
 
     // The menu: its own glass, dimming the panel behind it while it is open.
@@ -694,81 +744,98 @@ void Launcher::Build() {
     m_menuHover.Size({m_menuW, m_menuH});
     m_menu.Children().InsertAtTop(m_menuHover);
     auto menuSurface = MakeSurface(m_menuW, m_menuH);
-    {
-        auto interop = menuSurface.as<ICompositionDrawingSurfaceInterop>();
-        winrt::com_ptr<ID2D1DeviceContext> dc;
-        POINT offset{};
-        winrt::check_hresult(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset));
-        try {
-            DrawMenu(dc.get(), static_cast<float>(offset.x), static_cast<float>(offset.y));
-        } catch (...) {
-            interop->EndDraw();
-            throw;
-        }
-        interop->EndDraw();
-    }
+    Redraw(menuSurface, &Launcher::DrawMenu);
     m_menu.Children().InsertAtTop(MakeSurfaceVisual(menuSurface, m_menuW, m_menuH));
     m_panel.Children().InsertAtTop(m_menu);
     m_menuOpen = false;
+
+    SearchDraw();
+    BuildBody();
 }
 
-void Launcher::DrawPanel(ID2D1DeviceContext* dc, float ox, float oy) {
+// The part between the search bar and the dock bar: the home sections, or the results while there is a query.
+// Rebuilt on every keystroke; the glass, shadow and bars are not.
+void Launcher::BuildBody() {
+    const float s = m_s;
+    const bool results = !m_query.empty();
+    m_bodyIcons.Children().RemoveAll();
+    m_appSprites.clear();
+    m_fileSprites.clear();
+    m_resultRows.clear();
+    m_hoverIcon = nullptr;
+    m_hoverIndex = -1;
+    m_hits.clear();
+
+    // An icon on its own sprite, so it can scale and lift without redrawing anything.
+    auto sprite = [&](wuc::CompositionBrush const& brush, D2D1_RECT_F r) {
+        IconV ic;
+        if (!brush) return ic;
+        float w = r.right - r.left, h = r.bottom - r.top;
+        ic.v = m_comp.CreateSpriteVisual();
+        ic.v.Size({w, h});
+        ic.v.Offset({r.left, r.top, 0});
+        ic.v.CenterPoint({w / 2, h / 2, 0});
+        ic.v.Brush(brush);
+        ic.restY = r.top;
+        m_bodyIcons.Children().InsertAtTop(ic.v);
+        return ic;
+    };
+
+    if (results) {
+        for (size_t i = 0; i < m_results.size(); i++) {
+            float top = m_bodyTop + (4 + i * kResultRowH) * s;
+            auto row = R((kPad - 8) * s, top, m_w - (kPad - 8) * s, top + kResultRowH * s);
+            m_resultRows.push_back(row);
+            m_hits.push_back({row, Kind::Result, static_cast<int>(i)});
+            auto const& r = m_results[i];
+            auto brush = r.app ? (m_host.appIcon ? m_host.appIcon(r.path) : nullptr) : FileBrush(r.path, kResultIcon);
+            float ix = row.left + 12 * s, iy = row.top + (kResultRowH - kResultIcon) / 2 * s;
+            sprite(brush, R(ix, iy, ix + kResultIcon * s, iy + kResultIcon * s));
+        }
+    } else {
+        for (size_t i = 0; i < m_apps.size(); i++) {
+            auto const& c = m_appCells[i];
+            m_hits.push_back({R(c.left - kIconPad * s, c.top - kIconPad * s, c.right + kIconPad * s, c.bottom + kIconPad * s),
+                              Kind::App, static_cast<int>(i)});
+            m_appSprites.push_back(sprite(m_host.appIcon(m_apps[i]), c));
+        }
+        for (size_t i = 0; i < m_files.size(); i++) {
+            auto const& c = m_fileCells[i];
+            m_hits.push_back({c, Kind::File, static_cast<int>(i)});
+            float ix = (c.left + c.right) / 2 - kFileIcon * s / 2, iy = c.top + 8 * s;
+            m_fileSprites.push_back(sprite(FileBrush(m_files[i].path, kFileIcon), R(ix, iy, ix + kFileIcon * s, iy + kFileIcon * s)));
+        }
+    }
+    for (auto const& h : m_staticHits) m_hits.push_back(h);
+    Redraw(m_bodySurface, &Launcher::DrawBody);
+
+    // The plate rests on the selected result, or is away on the home view.
+    if (results && !m_resultRows.empty()) Highlight(&m_resultRows[m_sel], 12, false);
+    else Highlight(nullptr, 0, false);
+}
+
+// The dock bar: hairline, the user (account picture or an initial in a circle, name), Settings and Power.
+void Launcher::DrawStatic(ID2D1DeviceContext* dc, float ox, float oy) {
     const float s = m_s;
     Text txt{m_dwrite};
     dc->Clear(D2D1::ColorF(0, 0.0f));
     dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
     auto const& pal = theme::P();
-    winrt::com_ptr<ID2D1SolidColorBrush> white, soft, dim, line;  // "white" = primary ink
+    winrt::com_ptr<ID2D1SolidColorBrush> white, dim, line;  // "white" = primary ink
     dc->CreateSolidColorBrush(pal.text, white.put());
-    dc->CreateSolidColorBrush(pal.textSoft, soft.put());
     dc->CreateSolidColorBrush(pal.dim, dim.put());
     dc->CreateSolidColorBrush(pal.line, line.put());
-    auto at = [&](D2D1_RECT_F r) { return R(r.left + ox, r.top + oy, r.right + ox, r.bottom + oy); };
+    const float dy = oy - m_divider.top;
+    auto at = [&](D2D1_RECT_F r) { return R(r.left + ox, r.top + dy, r.right + ox, r.bottom + dy); };
 
-    auto fLabel = txt.Format(L"Segoe UI Variable Text", 11 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     auto fRow = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
     auto fName = txt.Format(L"Segoe UI Variable Text", 14 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     auto fGlyph = txt.Format(L"Segoe Fluent Icons", 16 * s, DWRITE_FONT_WEIGHT_NORMAL);
     auto fChevron = txt.Format(L"Segoe Fluent Icons", 10 * s, DWRITE_FONT_WEIGHT_NORMAL);
 
-    txt.Draw(dc, L"RECENT APPS", fLabel.get(), at(m_appsLabel), dim.get());
-    if (m_apps.empty())
-        txt.Draw(dc, L"Apps you open show up here", fRow.get(),
-                 at(R(m_appsLabel.left, m_appsLabel.bottom + 4 * s, m_appsLabel.right, m_appsLabel.bottom + 44 * s)), dim.get());
-    txt.Draw(dc, L"RECENT FILES", fLabel.get(), at(m_filesLabel), dim.get());
-    if (m_files.empty())
-        txt.Draw(dc, L"No recent files", fRow.get(),
-                 at(R(m_filesLabel.left, m_filesLabel.bottom + 6 * s, m_filesLabel.right, m_filesLabel.bottom + (6 + kRowH) * s)),
-                 dim.get());
-
-    // Files: the shell's own icon for the type, then the name.
-    for (size_t i = 0; i < std::min(m_files.size(), m_fileRows.size()); i++) {
-        auto const& row = m_fileRows[i];
-        float iconPx = kFileIcon * s;
-        float iy = row.top + (row.bottom - row.top - iconPx) / 2;
-        auto const& path = m_files[i].path;
-        auto it = m_fileIcons.find(IconKey(path));
-        if (it == m_fileIcons.end()) m_iconMiss = true;  // Refresh() loads it and rebuilds
-        if (it != m_fileIcons.end() && it->second.width) {
-            winrt::com_ptr<ID2D1Bitmap> bmp;
-            D2D1_BITMAP_PROPERTIES props =
-                D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-            if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(it->second.width, it->second.height), it->second.bgra.data(),
-                                           it->second.width * 4, &props, bmp.put()))) {
-                float ix = row.left + 8 * s;
-                D2D1_RECT_F dest = R(ix + ox, iy + oy, ix + iconPx + ox, iy + iconPx + oy);
-                dc->DrawBitmap(bmp.get(), &dest, 1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
-            }
-        }
-        txt.Draw(dc, m_files[i].name, fRow.get(), at(R(row.left + (8 + kFileIcon + 10) * s, row.top, row.right - 8 * s, row.bottom)),
-                 soft.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
-    }
-
     dc->FillRectangle(at(m_divider), line.get());
-    dc->FillRectangle(at(m_vsep), line.get());
 
-    // The user: account picture (or an initial in a circle) and name.
     auto circle = [&](D2D1_RECT_F r) {
         float rad = (r.right - r.left) / 2;
         return D2D1::Ellipse({(r.left + r.right) / 2, (r.top + r.bottom) / 2}, rad, rad);
@@ -810,11 +877,115 @@ void Launcher::DrawPanel(ID2D1DeviceContext* dc, float ox, float oy) {
                  DWRITE_TEXT_ALIGNMENT_CENTER);
         txt.Draw(dc, label, fRow.get(), R(r.left + 34 * s, r.top, r.right, r.bottom), white.get());
         if (chevron)
-            txt.Draw(dc, L"\uE70D", fChevron.get(), R(r.right - 24 * s, r.top, r.right - 12 * s, r.bottom), dim.get(),
+            txt.Draw(dc, L"", fChevron.get(), R(r.right - 24 * s, r.top, r.right - 12 * s, r.bottom), dim.get(),
                      DWRITE_TEXT_ALIGNMENT_CENTER);
     };
-    button(m_settingsRect, L'\uE713', L"Settings", false);
-    button(m_powerRect, L'\uE7E8', L"Power", true);
+    button(m_settingsRect, L'', L"Settings", false);
+    button(m_powerRect, L'', L"Power", true);
+}
+
+// The search bar: a pill with a magnifier, the typed text (or the placeholder), scrolled to keep the end in view.
+void Launcher::DrawSearch(ID2D1DeviceContext* dc, float ox, float oy) {
+    const float s = m_s;
+    Text txt{m_dwrite};
+    dc->Clear(D2D1::ColorF(0, 0.0f));
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    auto const& pal = theme::P();
+    const float w = m_searchRect.right - m_searchRect.left, h = m_searchRect.bottom - m_searchRect.top;
+    winrt::com_ptr<ID2D1SolidColorBrush> fill, line, ink, dim;
+    dc->CreateSolidColorBrush(pal.fill, fill.put());
+    dc->CreateSolidColorBrush(pal.line, line.put());
+    dc->CreateSolidColorBrush(pal.text, ink.put());
+    dc->CreateSolidColorBrush(pal.dim, dim.put());
+    auto pill = D2D1::RoundedRect(R(ox + 0.5f, oy + 0.5f, ox + w - 0.5f, oy + h - 0.5f), h / 2, h / 2);
+    dc->FillRoundedRectangle(pill, fill.get());
+    dc->DrawRoundedRectangle(pill, line.get(), 1.0f);
+
+    auto fGlyph = txt.Format(L"Segoe Fluent Icons", 16 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    auto fText = txt.Format(L"Segoe UI Variable Text", 15 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    txt.Draw(dc, L"", fGlyph.get(), R(ox + 14 * s, oy, ox + 34 * s, oy + h), dim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    const float left = 42 * s, area = w - left - 18 * s;
+    if (m_query.empty()) {
+        txt.Draw(dc, L"Search apps and files", fText.get(), R(ox + left, oy, ox + left + area, oy + h), dim.get());
+        return;
+    }
+    float tw = txt.Width(m_query, fText.get());
+    float shift = std::max(0.0f, tw - area);  // longer than the bar: the end stays visible
+    dc->PushAxisAlignedClip(R(ox + left, oy, ox + left + area + 4 * s, oy + h), D2D1_ANTIALIAS_MODE_ALIASED);
+    txt.Draw(dc, m_query, fText.get(), R(ox + left - shift, oy, ox + left - shift + tw + 8 * s, oy + h), ink.get());
+    dc->PopAxisAlignedClip();
+}
+
+// Redraws the search bar and puts the caret at the end of the text; the blink restarts so it stays solid while typing.
+void Launcher::SearchDraw() {
+    const float s = m_s;
+    Redraw(m_searchSurface, &Launcher::DrawSearch);
+    Text txt{m_dwrite};
+    auto fText = txt.Format(L"Segoe UI Variable Text", 15 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    const float w = m_searchRect.right - m_searchRect.left, left = 42 * s, area = w - left - 18 * s;
+    float x = m_searchRect.left + left + std::min(m_query.empty() ? 0.0f : txt.Width(m_query, fText.get()), area);
+    float cw = std::max(1.0f, std::round(1.5f * s)), ch = 20 * s;
+    m_caret.Size({cw, ch});
+    m_caret.Offset({x, m_searchRect.top + ((m_searchRect.bottom - m_searchRect.top) - ch) / 2, 0});
+    auto blink = m_comp.CreateScalarKeyFrameAnimation();
+    blink.InsertKeyFrame(0.0f, 1.0f);
+    blink.InsertKeyFrame(0.55f, 1.0f);
+    blink.InsertKeyFrame(0.56f, 0.0f);
+    blink.InsertKeyFrame(1.0f, 0.0f);
+    blink.Duration(std::chrono::milliseconds(1060));
+    blink.IterationBehavior(wuc::AnimationIterationBehavior::Forever);
+    m_caret.StartAnimation(L"Opacity", blink);
+}
+
+// The labelled sections and file names, or the result rows.
+void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
+    const float s = m_s;
+    Text txt{m_dwrite};
+    dc->Clear(D2D1::ColorF(0, 0.0f));
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+
+    auto const& pal = theme::P();
+    winrt::com_ptr<ID2D1SolidColorBrush> white, soft, dim;  // "white" = primary ink
+    dc->CreateSolidColorBrush(pal.text, white.put());
+    dc->CreateSolidColorBrush(pal.textSoft, soft.put());
+    dc->CreateSolidColorBrush(pal.dim, dim.put());
+    const float dy = oy - m_bodyTop;
+    auto at = [&](D2D1_RECT_F r) { return R(r.left + ox, r.top + dy, r.right + ox, r.bottom + dy); };
+
+    auto fLabel = txt.Format(L"Segoe UI Variable Text", 11 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    auto fRow = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    auto fName = txt.Format(L"Segoe UI Variable Text", 12 * s, DWRITE_FONT_WEIGHT_NORMAL);
+
+    if (!m_query.empty()) {
+        if (m_results.empty())
+            txt.Draw(dc, L"No results for \"" + m_query + L"\"", fRow.get(),
+                     R(ox + kPad * s, oy + 4 * s, ox + m_w - kPad * s, oy + (4 + kResultRowH) * s), dim.get(),
+                     DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        for (size_t i = 0; i < m_results.size(); i++) {
+            auto const& row = m_resultRows[i];
+            float textX = row.left + (12 + kResultIcon + 12) * s;
+            txt.Draw(dc, m_results[i].name, fRow.get(), at(R(textX, row.top, row.right - 64 * s, row.bottom)), white.get(),
+                     DWRITE_TEXT_ALIGNMENT_LEADING, true);
+            txt.Draw(dc, m_results[i].app ? L"App" : L"File", fName.get(), at(R(row.right - 60 * s, row.top, row.right - 14 * s, row.bottom)),
+                     dim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        return;
+    }
+
+    txt.Draw(dc, L"RECENT APPS", fLabel.get(), at(m_appsLabel), dim.get());
+    if (m_apps.empty())
+        txt.Draw(dc, L"Apps you open show up here", fRow.get(),
+                 at(R(m_appsLabel.left, m_appsLabel.bottom + 6 * s, m_appsLabel.right, m_appsLabel.bottom + 46 * s)), dim.get());
+    txt.Draw(dc, L"RECENT FILES", fLabel.get(), at(m_filesLabel), dim.get());
+    if (m_files.empty())
+        txt.Draw(dc, L"No recent files", fRow.get(),
+                 at(R(m_filesLabel.left, m_filesLabel.bottom + 6 * s, m_filesLabel.right, m_filesLabel.bottom + 34 * s)), dim.get());
+    // File names under their icons: one line, ellipsized.
+    for (size_t i = 0; i < m_files.size(); i++) {
+        auto const& c = m_fileCells[i];
+        txt.Draw(dc, m_files[i].name, fName.get(), at(R(c.left + 4 * s, c.top + 44 * s, c.right - 4 * s, c.top + 64 * s)), soft.get(),
+                 DWRITE_TEXT_ALIGNMENT_CENTER, true);
+    }
 }
 
 void Launcher::DrawMenu(ID2D1DeviceContext* dc, float ox, float oy) {
@@ -840,54 +1011,60 @@ void Launcher::Animate(wuc::CompositionObject const& target, wchar_t const* prop
     target.StartAnimation(prop, a);
 }
 
-void Launcher::Show(LauncherAnchor const& anchor, bool standalone) {
-    LARGE_INTEGER t0, t1, fq;
-    QueryPerformanceCounter(&t0);
+void Launcher::Show(LauncherAnchor const& anchor) {
+    LARGE_INTEGER t1, fq;
+    QueryPerformanceCounter(&m_showAt);
     m_anchor = anchor;
     m_s = anchor.scale;
-    m_standalone = standalone;
-    m_sawPalette = false;
-    m_shownAt = std::chrono::steady_clock::now();
+    m_query.clear();
+    m_results.clear();
+    m_sel = 0;
+    m_activated = false;
     ++m_gen;
 
-    // Everything slow (Recent files, their icons, the account picture) is cached; Refresh() updates it after the show.
-    m_stackW = 0; m_glueTop = 0; m_paletteBottom = 0; m_palette = nullptr;  // learned again when the palette appears
+    // Everything slow (Recent files, their icons, the account picture, the app index) is cached; Refresh() updates it after the show.
     try {
         Build();
     } catch (winrt::hresult_error const& e) {
         Log(L"build FAILED " + std::wstring(e.message()));
         return;
     }
+    LARGE_INTEGER built;
+    QueryPerformanceCounter(&built);
 
-    // Rises out of the gap above the dock with the dock's spring (clipped by the window's bottom edge),
+    // Rises out of the gap above the dock with the dock's reveal spring (clipped by the window's bottom edge),
     // growing from its bottom centre.
     const float home = kTop * m_s;
     m_panel.Offset({0, home, 0});
     Place();
     motion::In(m_comp, m_panel, {0, home, 0}, {m_w / 2, m_h}, {0, kRise * m_s});
     if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), {m_w / 2, m_h}, {0, kRise * m_s});
-    ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     SetTimer(m_hwnd, kRefreshTimer, 420, nullptr);  // once, after the rise has settled
 
     m_open = true;
-    if (!m_hook)
-        m_hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, ForegroundProc, 0, 0,
-                                 WINEVENT_OUTOFCONTEXT);
-    winkey::WatchEscape(true);
+    Focus();
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&fq);
-    Log(L"shown, " + std::to_wstring(m_apps.size()) + L" apps, " + std::to_wstring(m_files.size()) + L" files, built in " +
-        std::to_wstring(static_cast<int>((t1.QuadPart - t0.QuadPart) * 1000 / fq.QuadPart)) + L" ms");
+    auto ms = [&](LARGE_INTEGER a, LARGE_INTEGER b) { return std::to_wstring((b.QuadPart - a.QuadPart) * 10000 / fq.QuadPart / 10.0); };
+    Log(L"shown, " + std::to_wstring(m_apps.size()) + L" apps, " + std::to_wstring(m_files.size()) + L" files, build " +
+        ms(m_showAt, built) + L" ms, open latency Show()->window up and focused " + ms(m_showAt, t1) + L" ms");
+}
+
+// The Win key arrives from a hook thread, so Windows may refuse the foreground change; borrowing the
+// foreground thread's input queue is the standard way around that.
+void Launcher::Focus() {
+    DWORD me = GetCurrentThreadId(), fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    bool attached = fg && fg != me && AttachThreadInput(me, fg, TRUE);
+    SetForegroundWindow(m_hwnd);
+    SetFocus(m_hwnd);
+    if (attached) AttachThreadInput(me, fg, FALSE);
+    if (GetForegroundWindow() == m_hwnd) m_activated = true;  // else WM_ACTIVATE may still arrive and set it
+    else Log(L"panel could NOT take focus");
 }
 
 void Launcher::Hide() {
     if (!m_open) return;
     m_open = false;
-    winkey::WatchEscape(false);
-    if (m_hook) {
-        UnhookWinEvent(m_hook);
-        m_hook = nullptr;
-    }
     unsigned gen = ++m_gen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     motion::Out(m_comp, m_panel, {0, kTop * m_s, 0}, {m_w / 2, m_h}, {0, kRise * m_s});
@@ -901,6 +1078,7 @@ void Launcher::Hide() {
 
 void Launcher::Close() {
     ShowWindow(m_hwnd, SW_HIDE);
+    m_caret.StopAnimation(L"Opacity");  // nothing animates while hidden
     m_tracking = false;
     if (m_host.closed) m_host.closed();
 }
@@ -909,97 +1087,27 @@ void Launcher::Raise() {
     if (m_open) SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-bool Launcher::IsPalette(HWND hwnd) const { return IsPaletteTarget(ExeNameOf(hwnd)); }
-
-// Command Palette has the keyboard while the panel is up; the panel goes when something else gets it.
-void Launcher::OnForeground(HWND fg) {
-    if (!m_open || !fg) return;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(fg, &pid);
-    if (pid == GetCurrentProcessId()) return;
-    if (IsPalette(fg)) {
-        m_sawPalette = true;
-        if (!m_palette) Stack(GetAncestor(fg, GA_ROOT));
-        return;
-    }
-    // Before the palette has taken focus, the previous window may still announce itself.
-    if (!m_standalone && !m_sawPalette &&
-        std::chrono::steady_clock::now() - m_shownAt < std::chrono::milliseconds(kGraceMs))
-        return;
-    Log(L"foreground moved to " + ExeNameOf(fg));
-    Hide();
-}
-
-// Command Palette's top-level window (hidden or not), to learn where its bottom edge is.
-HWND Launcher::PaletteWindow() const {
-    struct Find {
-        HWND found = nullptr;
-    } f;
-    EnumWindows([](HWND h, LPARAM l) -> BOOL {
-        RECT r{};
-        if (!GetWindowRect(h, &r) || r.right - r.left < 300 || r.bottom - r.top < 100) return TRUE;
-        if (!IsPaletteTarget(ExeNameOf(h)) || !IsWindowVisible(h)) return TRUE;
-        reinterpret_cast<Find*>(l)->found = h;
-        return FALSE;
-    }, reinterpret_cast<LPARAM>(&f));
-    return f.found;
-}
-
-// Palette and panel as one Start menu: the panel takes the palette's width, and the palette is moved up so it
-// sits directly on the panel, the stack centred above the dock. Checked once after the move (the one-shot
-// kStackTimer): if PowerToys put the palette back, the panel is glued under the palette where it is instead.
-void Launcher::Stack(HWND palette) {
-    RECT wr{}, r{};  // the window rect includes the invisible shadow border; the frame bounds are what is seen
-    if (!palette || !GetWindowRect(palette, &wr) || wr.right <= wr.left) return;
-    if (FAILED(DwmGetWindowAttribute(palette, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, &r, sizeof(r))) || r.right <= r.left) r = wr;
-    m_palette = palette;
-    int pw = r.right - r.left, ph = r.bottom - r.top;
-    m_stackW = static_cast<float>(pw);
-    Relayout();
-    auto const& mon = m_anchor.monitor;
-    int fLeft = std::clamp(m_anchor.centerX - pw / 2, static_cast<int>(mon.left), static_cast<int>(mon.right) - pw);
-    int fTop = m_anchor.bottom - static_cast<int>(m_h) - ph;
-    if (fTop < mon.top + static_cast<int>(8 * m_s)) {  // no room above: glue under it where it is
-        Glue(r);
-        return;
-    }
-    int left = fLeft - (r.left - wr.left), top = fTop - (r.top - wr.top);
-    SetWindowPos(palette, nullptr, left, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    m_stackAt = {left, top};
-    Log(L"stacking: palette " + std::to_wstring(pw) + L"x" + std::to_wstring(ph) + L" frame from " + std::to_wstring(r.left) +
-        L"," + std::to_wstring(r.top) + L" to " + std::to_wstring(fLeft) + L"," + std::to_wstring(fTop));
-    SetTimer(m_hwnd, kStackTimer, 250, nullptr);
-}
-
-void Launcher::Glue(RECT const& r) {
-    m_stackW = static_cast<float>(r.right - r.left);
-    m_anchor.centerX = (r.left + r.right) / 2;
-    m_glueTop = r.bottom;
-    m_paletteBottom = static_cast<float>(r.bottom);
-    Log(L"glueing the panel under the palette at " + std::to_wstring(r.left) + L"," + std::to_wstring(r.bottom));
-    Relayout();
-}
-
 // Window position and size for the current layout; the test points are where a test can click (client px).
 void Launcher::Place() {
     int x = std::clamp(m_anchor.centerX - static_cast<int>(m_w) / 2, static_cast<int>(m_anchor.monitor.left),
                        static_cast<int>(m_anchor.monitor.right - m_w));
     int margin = static_cast<int>(kTop * m_s);
     int mx = static_cast<int>(m_shadowM), mb = static_cast<int>(m_shadowB);
-    int top = (m_glueTop > 0 ? m_glueTop : m_anchor.bottom - static_cast<int>(m_h)) - margin;
+    int top = m_anchor.bottom - static_cast<int>(m_h) - margin;
     int winW = static_cast<int>(m_w) + 2 * mx, winH = static_cast<int>(m_h) + margin + mb;
     SetWindowPos(m_hwnd, HWND_TOPMOST, x - mx, top, winW, winH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    // Under the palette the transparent margin would sit on top of its bottom edge: leave it out of the window.
-    // The side and bottom shadow margins stay in the region so the shadow draws; WM_NCHITTEST lets clicks through them.
-    SetWindowRgn(m_hwnd, m_stackW > 0 ? CreateRectRgn(0, margin, winW, winH) : nullptr, TRUE);
     if (EnvIs(L"HALO_TEST")) {
         auto mid = [&](D2D1_RECT_F const& r) {
             return std::to_wstring(static_cast<int>((r.left + r.right) / 2 + m_shadowM)) + L"," +
                    std::to_wstring(static_cast<int>((r.top + r.bottom) / 2 + kTop * m_s));
         };
-        Log(L"test points: power=" + mid(m_powerRect) + L" settings=" + mid(m_settingsRect) + L" app0=" + mid(m_hits[0].r) +
+        auto none = std::wstring(L"0,0");
+        Log(L"test points: power=" + mid(m_powerRect) + L" settings=" + mid(m_settingsRect) + L" app0=" +
+            (m_appCells.empty() ? none : mid(m_appCells[0])) + L" app1=" + (m_appCells.size() < 2 ? none : mid(m_appCells[1])) +
             L" menu2=" + mid(m_menuHits[2].r) + L" blank=" + mid(m_divider) + L" file0=" +
-            (m_fileRows.empty() ? std::wstring(L"0,0") : mid(m_fileRows[0])));
+            (m_fileCells.empty() ? none : mid(m_fileCells[0])) + L" file7=" + (m_fileCells.size() < 8 ? none : mid(m_fileCells[7])) +
+            L" result2=" + mid(R(kPad * m_s, m_bodyTop + (4 + 2 * kResultRowH) * m_s, m_w - kPad * m_s,
+                                 m_bodyTop + (4 + 3 * kResultRowH) * m_s)));
     }
 }
 
@@ -1011,7 +1119,7 @@ std::wstring Launcher::IconKey(std::wstring const& path) {
     return own ? Lower(path) : ext;
 }
 
-// The slow content: Recent files, their icons, the account picture and name. Run at startup and after each Show.
+// The slow content: Recent files, their icons, the account picture and name, the app index (once). Run at startup and after each Show.
 void Launcher::Prefetch() {
     LoadFiles();
     for (auto const& f : m_files) {
@@ -1021,6 +1129,7 @@ void Launcher::Prefetch() {
         if (!LoadJumboIcon(f.path, img) || !img.width) img = {};
         m_fileIcons.emplace(key, std::move(img));
     }
+    if (!m_indexed) BuildIndex();
     wchar_t name[256] = {};
     ULONG n = ARRAYSIZE(name);
     if (!GetUserNameExW(NameDisplay, name, &n) || !name[0]) {
@@ -1052,14 +1161,95 @@ void Launcher::Relayout() {
 // After the panel is up: refresh the cached content, and rebuild only if something shows differently.
 void Launcher::Refresh() {
     std::wstring before;
-    for (auto const& f : m_files) before += f.path + L"|";
+    for (auto const& f : m_allFiles) before += f.path + L"|";
     bool hadAvatar = !m_avatar.empty();
     Prefetch();
     std::wstring after;
-    for (auto const& f : m_files) after += f.path + L"|";
-    if (after != before || m_iconMiss || hadAvatar != !m_avatar.empty()) {
+    for (auto const& f : m_allFiles) after += f.path + L"|";
+    if (after != before || hadAvatar != !m_avatar.empty()) {
         Log(L"refreshed in the background, rebuilding");
+        RunSearch();
         Relayout();
+    }
+}
+
+// ---- Search -------------------------------------------------------------------------------------
+
+// Start-menu apps and recent files whose names match the query: names that start with it first, then names with
+// a word that does, then the rest; shorter names win ties, apps win over files.
+void Launcher::RunSearch() {
+    m_results.clear();
+    std::wstring q = Lower(m_query);
+    while (!q.empty() && q.back() == L' ') q.pop_back();
+    if (q.empty()) return;
+    struct Scored {
+        int rank;
+        size_t len;
+        Result r;
+    };
+    std::vector<Scored> hits;
+    for (auto const& a : m_index)
+        if (int rk = MatchRank(a.lname, q); rk >= 0) hits.push_back({rk, a.name.size(), {true, a.name, a.path}});
+    for (auto const& f : m_allFiles)
+        if (int rk = MatchRank(Lower(f.name), q); rk >= 0) hits.push_back({rk, f.name.size(), {false, f.name, f.path}});
+    std::stable_sort(hits.begin(), hits.end(), [](Scored const& a, Scored const& b) {
+        if (a.rank != b.rank) return a.rank < b.rank;
+        if (a.len != b.len) return a.len < b.len;
+        return a.r.app && !b.r.app;
+    });
+    for (size_t i = 0; i < hits.size() && i < kMaxResults; i++) m_results.push_back(std::move(hits[i].r));
+}
+
+void Launcher::QueryChanged() {
+    RunSearch();
+    m_sel = 0;
+    SearchDraw();
+    BuildBody();
+}
+
+// Launches an app / file, with the icon's bounce on its way out. The launch does not wait for the animation.
+void Launcher::Activate(Kind kind, int index) {
+    std::wstring path;
+    bool app = false;
+    if (kind == Kind::App && index >= 0 && index < static_cast<int>(m_apps.size())) {
+        path = m_apps[index];
+        app = true;
+        if (index < static_cast<int>(m_appSprites.size())) BounceIcon(m_appSprites[index]);
+    } else if (kind == Kind::File && index >= 0 && index < static_cast<int>(m_files.size())) {
+        path = m_files[index].path;
+        if (index < static_cast<int>(m_fileSprites.size())) BounceIcon(m_fileSprites[index]);
+    } else if (kind == Kind::Result && index >= 0 && index < static_cast<int>(m_results.size())) {
+        path = m_results[index].path;
+        app = m_results[index].app;
+    } else {
+        return;
+    }
+    Hide();
+    if (app) {
+        if (m_host.launch) m_host.launch(path);
+    } else {
+        ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+void Launcher::OnKey(WPARAM vk) {
+    switch (vk) {
+        case VK_ESCAPE:  // closes the Power menu first, then clears the query, then the panel
+            if (m_menuOpen) ToggleMenu(false);
+            else if (!m_query.empty()) {
+                m_query.clear();
+                QueryChanged();
+            } else Hide();
+            break;
+        case VK_RETURN:
+            if (!m_menuOpen && !m_results.empty()) Activate(Kind::Result, m_sel);
+            break;
+        case VK_UP:
+        case VK_DOWN:
+            if (m_menuOpen || m_results.empty()) break;
+            m_sel = std::clamp(m_sel + (vk == VK_DOWN ? 1 : -1), 0, static_cast<int>(m_results.size()) - 1);
+            Highlight(&m_resultRows[m_sel], 12, false);
+            break;
     }
 }
 
@@ -1074,7 +1264,51 @@ Launcher::Hit const* Launcher::HitAt(float x, float y) const {
     return nullptr;
 }
 
-// Moves the single hover plate to the item under the pointer (or fades it away).
+Launcher::IconV const* Launcher::IconOf(Hit const& hit) const {
+    if (hit.kind == Kind::App && hit.index < static_cast<int>(m_appSprites.size()) && m_appSprites[hit.index].v)
+        return &m_appSprites[hit.index];
+    if (hit.kind == Kind::File && hit.index < static_cast<int>(m_fileSprites.size()) && m_fileSprites[hit.index].v)
+        return &m_fileSprites[hit.index];
+    return nullptr;
+}
+
+// The hovered icon swells and lifts on the dock's kind of spring (it overshoots a little); leaving springs it back.
+void Launcher::SpringIcon(IconV const& ic, bool up) {
+    if (!ic.v) return;
+    const float k = up ? kHoverScale : 1.0f, y = ic.restY - (up ? kHoverLift * m_s : 0.0f);
+    auto scale = m_comp.CreateSpringVector3Animation();
+    scale.FinalValue(Ref3({k, k, 1.0f}));
+    scale.DampingRatio(kHoverDamping);
+    scale.Period(std::chrono::milliseconds(kHoverPeriodMs));
+    ic.v.StartAnimation(L"Scale", scale);
+    auto lift = m_comp.CreateSpringScalarAnimation();
+    lift.FinalValue(y);
+    lift.DampingRatio(kHoverDamping);
+    lift.Period(std::chrono::milliseconds(kHoverPeriodMs));
+    ic.v.StartAnimation(L"Offset.Y", lift);
+}
+
+// A click: the icon hops up and settles on the dock's bounce curves while the panel leaves; it springs
+// back from the press squash to the hover size.
+void Launcher::BounceIcon(IconV const& ic) {
+    if (!ic.v) return;
+    auto up = m_comp.CreateCubicBezierEasingFunction({0.3f, 0.5f}, {0.5f, 1.0f});    // dock.cpp BounceUp
+    auto down = m_comp.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.7f, 0.5f});  // dock.cpp BounceDown
+    const float rest = ic.restY - kHoverLift * m_s;
+    auto hop = m_comp.CreateScalarKeyFrameAnimation();
+    hop.InsertKeyFrame(0.5f, rest - kBounceRise * m_s, up);
+    hop.InsertKeyFrame(1.0f, rest, down);
+    hop.Duration(std::chrono::milliseconds(kBounceMs));
+    ic.v.StartAnimation(L"Offset.Y", hop);
+    auto scale = m_comp.CreateSpringVector3Animation();
+    scale.FinalValue(Ref3({kHoverScale, kHoverScale, 1.0f}));
+    scale.DampingRatio(kHoverDamping);
+    scale.Period(std::chrono::milliseconds(kHoverPeriodMs));
+    ic.v.StartAnimation(L"Scale", scale);
+}
+
+// Moves the single hover plate to the item under the pointer (or fades it away). It glides between items on a
+// spring, like the dock's magnification, rather than easing linearly.
 void Launcher::Highlight(D2D1_RECT_F const* r, float radius, bool inMenu) {
     auto shape = inMenu ? m_menuHoverShape : m_hoverShape;
     auto visual = inMenu ? m_menuHover : m_hover;
@@ -1084,7 +1318,8 @@ void Launcher::Highlight(D2D1_RECT_F const* r, float radius, bool inMenu) {
         on = false;
         return;
     }
-    winrt::Windows::Foundation::Numerics::float2 off{r->left, r->top}, size{r->right - r->left, r->bottom - r->top};
+    float2 off{r->left, r->top}, size{r->right - r->left, r->bottom - r->top};
+    if (!inMenu) m_plateTo = *r;
     shape.CornerRadius({radius * m_s, radius * m_s});
     if (!on) {
         shape.StopAnimation(L"Offset");
@@ -1092,14 +1327,15 @@ void Launcher::Highlight(D2D1_RECT_F const* r, float radius, bool inMenu) {
         shape.Offset(off);
         shape.Size(size);
     } else {
-        auto move = m_comp.CreateVector2KeyFrameAnimation();
-        move.InsertKeyFrame(1.0f, off, m_easeOut);
-        move.Duration(std::chrono::milliseconds(90));
-        shape.StartAnimation(L"Offset", move);
-        auto grow = m_comp.CreateVector2KeyFrameAnimation();
-        grow.InsertKeyFrame(1.0f, size, m_easeOut);
-        grow.Duration(std::chrono::milliseconds(90));
-        shape.StartAnimation(L"Size", grow);
+        auto glide = [&](wchar_t const* prop, float2 to) {
+            auto sp = m_comp.CreateSpringVector2Animation();
+            sp.FinalValue(Ref2(to));
+            sp.DampingRatio(0.72f);
+            sp.Period(std::chrono::milliseconds(50));
+            shape.StartAnimation(prop, sp);
+        };
+        glide(L"Offset", off);
+        glide(L"Size", size);
     }
     on = true;
     Animate(visual, L"Opacity", 1.0f, 100);
@@ -1110,15 +1346,24 @@ void Launcher::OnHover(float x, float y) {
     int key = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
     if (key == m_hoverIndex) return;
     m_hoverIndex = key;
+    auto const* ic = hit ? IconOf(*hit) : nullptr;
+    if (ic != m_hoverIcon) {
+        if (m_hoverIcon) SpringIcon(*m_hoverIcon, false);
+        if (ic) SpringIcon(*ic, true);
+        m_hoverIcon = ic;
+    }
+    const bool results = !m_results.empty() && !m_query.empty();
     if (!hit) {
-        Highlight(nullptr, 0, false);
+        if (results) Highlight(&m_resultRows[m_sel], 12, false);  // the plate stays on the selection
+        else Highlight(nullptr, 0, false);
         Highlight(nullptr, 0, true);
     } else if (hit->kind == Kind::MenuItem) {
         auto r = m_menuRows[hit->index];
         Highlight(&r, 10, true);
     } else {
         D2D1_RECT_F r = hit->r;
-        Highlight(&r, hit->kind == Kind::File ? 10 : 14, false);
+        if (hit->kind == Kind::Result) m_sel = hit->index;
+        Highlight(&r, hit->kind == Kind::App ? 14 : 12, false);
         if (m_menuOpen) Highlight(nullptr, 0, true);
     }
 }
@@ -1148,18 +1393,9 @@ void Launcher::ToggleMenu(bool open) {
 
 void Launcher::Click(Hit const& hit) {
     switch (hit.kind) {
-        case Kind::App: {
-            std::wstring target = m_apps[hit.index];
-            Hide();
-            if (m_host.launch) m_host.launch(target);
-            break;
-        }
-        case Kind::File: {
-            std::wstring path = m_files[hit.index].path;
-            Hide();
-            ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            break;
-        }
+        case Kind::App:
+        case Kind::File:
+        case Kind::Result: Activate(hit.kind, hit.index); break;
         case Kind::Settings:
             Hide();
             ShellExecuteW(nullptr, L"open", L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL);
@@ -1200,18 +1436,25 @@ void Launcher::RunPower(int item) {
 
 void Launcher::TestCommand(WPARAM w) {
     if (!m_open) return;
-    HWND palette = nullptr;
     if (w == 2) ToggleMenu(!m_menuOpen);
     else if (w >= 3 && w < 8) RunPower(static_cast<int>(w) - 3);
-    else if (w == 9) OnForeground(GetShellWindow());  // the desktop took the foreground
-    else if (w == 10) {                                // Command Palette's process took it
-        EnumWindows([](HWND h, LPARAM l) -> BOOL {
-            if (!IsWindowVisible(h) || !IsPaletteTarget(ExeNameOf(h))) return TRUE;
-            *reinterpret_cast<HWND*>(l) = h;
-            return FALSE;
-        }, reinterpret_cast<LPARAM>(&palette));
-        if (palette) OnForeground(palette);
-        else Log(L"test: no Command Palette window to borrow");
+    else if (w == 9) {  // a click elsewhere
+        Log(L"lost activation");
+        Hide();
+    } else if (w == 20) {  // a locked session does not run animations; screenshots take the end state instead
+        m_hover.StopAnimation(L"Opacity");
+        m_hover.Opacity(m_hoverOn ? 1.0f : 0.0f);
+        m_hoverShape.StopAnimation(L"Offset");
+        m_hoverShape.StopAnimation(L"Size");
+        m_hoverShape.Offset({m_plateTo.left, m_plateTo.top});
+        m_hoverShape.Size({m_plateTo.right - m_plateTo.left, m_plateTo.bottom - m_plateTo.top});
+        if (m_hoverIcon) {
+            auto v = m_hoverIcon->v;
+            v.StopAnimation(L"Scale");
+            v.StopAnimation(L"Offset.Y");
+            v.Scale({kHoverScale, kHoverScale, 1.0f});
+            v.Offset({v.Offset().x, m_hoverIcon->restY - kHoverLift * m_s, 0});
+        }
     }
 }
 
@@ -1229,19 +1472,38 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     switch (m) {
-        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-        case WM_TIMER:
-            if (w == kStackTimer) {
-                KillTimer(m_hwnd, kStackTimer);
-                RECT r{};
-                if (m_open && m_palette && GetWindowRect(m_palette, &r) &&
-                    (std::abs(r.left - m_stackAt.x) > 3 || std::abs(r.top - m_stackAt.y) > 3)) {
-                    Log(L"the palette is not where it was put, gluing under it");
-                    Glue(r);
-                } else if (m_open) {
-                    Log(L"stack holds");
-                }
+        case WM_ACTIVATE:
+            if (LOWORD(w) != WA_INACTIVE) {
+                m_activated = true;
+            } else if (m_open && m_activated && !EnvIs(L"HALO_TEST_STAY")) {  // a click elsewhere, or another window took the foreground
+                Log(L"lost activation");
+                Hide();
             }
+            break;  // DefWindowProc gives the keyboard focus to the window
+        case WM_KEYDOWN:
+            if (m_open) OnKey(w);
+            return 0;
+        case WM_CHAR: {
+            if (!m_open || m_menuOpen) return 0;
+            const wchar_t c = static_cast<wchar_t>(w);
+            if (c == 8) {  // Backspace (a surrogate pair goes as one)
+                if (m_query.empty()) return 0;
+                if (m_query.size() > 1 && IS_LOW_SURROGATE(m_query.back()) && IS_HIGH_SURROGATE(m_query[m_query.size() - 2]))
+                    m_query.pop_back();
+                m_query.pop_back();
+            } else if (c == 127) {  // Ctrl+Backspace: the last word and the spaces before it
+                if (m_query.empty()) return 0;
+                while (!m_query.empty() && m_query.back() == L' ') m_query.pop_back();
+                while (!m_query.empty() && m_query.back() != L' ') m_query.pop_back();
+            } else if (c >= 32 && m_query.size() < kMaxQuery && !(c == L' ' && m_query.empty())) {
+                m_query.push_back(c);
+            } else {
+                return 0;
+            }
+            QueryChanged();
+            return 0;
+        }
+        case WM_TIMER:
             if (w == kRefreshTimer) {
                 KillTimer(m_hwnd, kRefreshTimer);
                 if (m_open) Refresh();
@@ -1260,15 +1522,21 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (m_open) OnHover(-1, -1);
             return 0;
         case WM_LBUTTONDOWN:
-            // The shadow margins (sides, bottom) are outside the panel. HTTRANSPARENT would only pass the
-            // click to windows on this thread, so treat it as a click outside: dismiss, like macOS.
+            // The shadow margins (sides, bottom) are outside the panel: treat a click there as a click
+            // outside and dismiss, like macOS.
             if (m_open && (mx < m_shadowM || mx >= m_shadowM + m_w || my >= kTop * m_s + m_h)) {
-                Close();
+                Hide();
                 return 0;
             }
             if (m_open) {
                 auto const* hit = HitAt(mx - m_shadowM, my - kTop * m_s);
                 m_pressedIndex = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
+                if (auto const* ic = hit ? IconOf(*hit) : nullptr) {  // the press squash
+                    auto sq = m_comp.CreateVector3KeyFrameAnimation();
+                    sq.InsertKeyFrame(1.0f, {kPressScale, kPressScale, 1.0f}, m_easeOut);
+                    sq.Duration(std::chrono::milliseconds(70));
+                    ic->v.StartAnimation(L"Scale", sq);
+                }
             }
             return 0;
         case WM_LBUTTONUP:
@@ -1278,8 +1546,9 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 if (hit && key == m_pressedIndex) {
                     Hit copy = *hit;
                     Click(copy);
-                } else if (!hit && m_menuOpen) {
-                    ToggleMenu(false);  // a click on the panel itself closes the menu
+                } else {
+                    if (m_hoverIcon) SpringIcon(*m_hoverIcon, true);  // a press that went elsewhere: back from the squash
+                    if (!hit && m_menuOpen) ToggleMenu(false);        // a click on the panel itself closes the menu
                 }
             }
             m_pressedIndex = -1;

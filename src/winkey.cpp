@@ -12,7 +12,7 @@ HHOOK g_hook = nullptr;
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
 HWND g_target = nullptr;
-std::atomic<bool> g_watchEsc{false};  // the launcher panel is up: report Esc
+std::atomic<bool> g_watchEsc{false};  // a menu is up: report Esc
 bool g_testMode = false;  // HALO_TEST_WINKEY=1: also handle injected input (tests drive it with SendInput)
 Tracker g_track;
 DWORD g_swallow = 0;  // Win+A / Win+N went down and we swallowed it; swallow its repeats and release too
@@ -121,17 +121,5 @@ UINT EscapeMessage() {
 }
 
 void WatchEscape(bool on) { g_watchEsc = on; }
-
-void OpenPalette() {
-    // Win is already released (the tap's Win-up went through before this message ran).
-    INPUT in[6] = {};
-    Key(in[0], VK_LWIN, false);
-    Key(in[1], VK_MENU, false);
-    Key(in[2], VK_SPACE, false);
-    Key(in[3], VK_SPACE, true);
-    Key(in[4], VK_MENU, true);
-    Key(in[5], VK_LWIN, true);
-    SendInput(6, in, sizeof(INPUT));
-}
 
 }  // namespace halo::winkey
