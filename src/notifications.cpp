@@ -32,6 +32,7 @@
 #include "motion.h"
 #include "services.h"
 #include "theme.h"
+#include "tokens.h"
 
 #ifndef HALO_COMPOSITION_INTEROP_DEFINED
 #define HALO_COMPOSITION_INTEROP_DEFINED
@@ -347,8 +348,8 @@ struct NotificationCenter::Impl {
     void Place();
     void ApplyGeometry();
     void Dismissed() { if (api->onDismiss) api->onDismiss(); else Close(); }
-    // Attached: up out of the Control Center below it (the window's bottom edge clips it). Standalone: in from the right.
-    float2 Travel() const { return attached ? float2{0, (winH + motion::kPad) * s} : float2{(kW + 2 * motion::kPad) * s, 0}; }
+    // A short rise as it fades in (attached, out of the Control Center below it); standalone, in from the right.
+    float2 Travel() const { return attached ? float2{0, ui::kEnterTravel * s} : float2{ui::kEnterTravel * 2 * s, 0}; }
     void AnimateIn(Card& c, int order);
     void AnimateOut(Card& c);
     int CardAt(float x, float y, int* part);

@@ -2,6 +2,7 @@
 #include "launcher.h"
 #include "motion.h"
 #include "theme.h"
+#include "tokens.h"
 
 #include <windows.ui.composition.interop.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -1037,7 +1038,7 @@ void Launcher::Show(LauncherAnchor const& anchor) {
 
     // Rises out of the gap above the dock with the dock's reveal spring (clipped by the window's bottom edge).
     const float home = kTop * m_s;
-    const float2 rise{0, m_h + m_shadowB};  // up out of the window's bottom edge, just above the dock
+    const float2 rise{0, ui::kEnterTravel * m_s};  // a short rise as it fades in, just above the dock
     motion::In(m_comp, m_panel, {0, home, 0}, rise);
     if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), rise);
     Place();  // shows the window: after the slide is set up, so no frame shows the panel at rest first
@@ -1069,7 +1070,7 @@ void Launcher::Hide() {
     m_open = false;
     unsigned gen = ++m_gen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    const float2 rise{0, m_h + m_shadowB};
+    const float2 rise{0, ui::kEnterTravel * m_s};
     motion::Out(m_comp, m_panel, {0, kTop * m_s, 0}, rise);
     if (m_shadowHold) motion::Out(m_comp, m_shadowHold, PanelHome(), rise);
     batch.End();

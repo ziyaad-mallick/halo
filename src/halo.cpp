@@ -1135,7 +1135,13 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case kMsgEdge:
             Log(w == halo::edge::kBottom ? L"edge: bottom right" : w == halo::edge::kTop ? L"edge: top" : L"edge: right");
-            if (w == halo::edge::kBottom && m_intellihide && m_intellihide->IsFullscreen()) return 0;  // a video's controls, not us
+            if (w == halo::edge::kBottom) {  // a fullscreen video's controls live there: not us. (Intellihide's
+                // "fullscreen" also counts any maximised window, since the taskbar is hidden: ask the shell.)
+                QUERY_USER_NOTIFICATION_STATE q{};
+                if (SUCCEEDED(SHQueryUserNotificationState(&q)) &&
+                    (q == QUNS_BUSY || q == QUNS_RUNNING_D3D_FULL_SCREEN || q == QUNS_PRESENTATION_MODE))
+                    return 0;
+            }
             OpenPanel(w == halo::edge::kBottom, w != halo::edge::kBottom);  // the corner: Quick Settings alone; touch: both, no auto-hide
             return 0;
         case WM_TIMER:
