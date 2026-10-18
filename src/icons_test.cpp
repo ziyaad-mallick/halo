@@ -84,6 +84,7 @@ bool SavePng(IWICImagingFactory* factory, const IconImage& img, const std::wstri
 }  // namespace
 
 int wmain() {
+    if (_wgetenv(L"ICONS_DPI")) SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hrCom)) {
         std::wprintf(L"CoInitializeEx failed: 0x%08lX\n", static_cast<unsigned long>(hrCom));

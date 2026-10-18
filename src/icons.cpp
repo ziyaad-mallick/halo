@@ -519,21 +519,37 @@ bool SmallInFrame(const IconImage& img) {
     return maxX >= 0 && maxX < img.width / 4 && maxY < img.height / 4;
 }
 
-// 256px icon of a file via IShellItemImageFactory, which extracts the large
-// icon itself instead of trusting the image-list cache.
-bool LoadFactoryIcon(const std::wstring& path, IconImage& out) {
+// 256px icon of a file straight from its icon resource: IExtractIconW asked
+// for 256px. The image list and IShellItemImageFactory both give a 32px icon
+// (the factory on a white plate) for some .lnk pins in a per-monitor-DPI-aware
+// process.
+bool LoadExtractedIcon(const std::wstring& path, IconImage& out) {
     out = {};
-    ComRef<IShellItemImageFactory> factory;
-    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_IShellItemImageFactory,
-                                           reinterpret_cast<void**>(factory.put())))) {
+    ComRef<IShellItem> item;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_IShellItem,
+                                           reinterpret_cast<void**>(item.put())))) {
         return false;
     }
-    HBITMAP hbmp = nullptr;
-    if (FAILED(factory->GetImage(SIZE{256, 256}, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &hbmp)) || !hbmp) {
+    ComRef<IExtractIconW> extract;
+    if (FAILED(item->BindToHandler(nullptr, BHID_SFUIObject, IID_IExtractIconW,
+                                   reinterpret_cast<void**>(extract.put())))) {
         return false;
     }
-    Owned<HBITMAP, &DeleteObject> bmp(hbmp);
-    return HBitmapToBgra(hbmp, out) && !SmallInFrame(out);
+    wchar_t file[MAX_PATH] = {};
+    int index = 0;
+    UINT flags = 0;
+    if (FAILED(extract->GetIconLocation(GIL_FORSHELL, file, MAX_PATH, &index, &flags))) return false;
+    HICON large = nullptr;
+    HRESULT hr = extract->Extract(file, index, &large, nullptr, MAKELONG(256, 16));
+    if (hr == S_FALSE || !large) {  // the handler wants the caller to extract it
+        if (large) DestroyIcon(large);
+        large = nullptr;
+        if (FAILED(SHDefExtractIconW(file, index, flags, &large, nullptr, MAKELONG(256, 16))) || !large) return false;
+    } else if (FAILED(hr)) {
+        return false;
+    }
+    Owned<HICON, &DestroyIcon> icon(large);
+    return HIconToBgra(large, out) && !SmallInFrame(out);
 }
 
 bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
@@ -560,7 +576,7 @@ bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
         if (HIconToBgra(hicon, out)) {
             if (!SmallInFrame(out)) return true;
             IconImage large;
-            if (LoadFactoryIcon(path, large)) out = std::move(large);
+            if (LoadExtractedIcon(path, large)) out = std::move(large);
             return true;  // the small one is still better than nothing
         }
     }
