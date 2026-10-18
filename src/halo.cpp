@@ -40,6 +40,8 @@
 #include "label.h"
 #include "multimon.h"
 #include "previews.h"
+#include "menu.h"
+#include "pins.h"
 #include "winkey.h"
 #include "edge.h"
 
@@ -87,6 +89,7 @@ constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
 constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Control Center) / kRight (notifications)
 constexpr UINT kMsgTestNotifCenter = WM_APP + 21;  // HALO_TEST=1: toggle the Notification Center
+constexpr UINT kMsgTestMenu = WM_APP + 31;    // HALO_TEST=1: wParam = dock item; lParam 0 = open its menu, 1 = close, 100+r = hover row r, 200+r = choose row r
 constexpr UINT kMsgTestBounce = WM_APP + 30;  // HALO_TEST=1: wParam = dock item to bounce (no launch)
 constexpr UINT kGenieHoldMs = 620;  // dock stays up for the 320 ms scale effect + 300 ms (mods/halo-genie.wh.cpp)
 constexpr int kHotkeyQuit = 1;
@@ -144,7 +147,7 @@ private:
     LRESULT OnMessage(UINT, WPARAM, LPARAM);
     void InitComposition();
     void InitGraphics();
-    wuc::ContainerVisual BuildPill(int noiseHeight = 0);
+    wuc::ContainerVisual BuildPill(int noiseHeight = 0, float radius = 0.0f);
     wuc::SpriteVisual BuildPillShadow(wuc::ContainerVisual const& pill);
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
@@ -156,6 +159,8 @@ private:
     void ShowPreviewsFor(int item);
     void RefreshPreviews();
     void HidePreviews(bool instant = false);
+    void OpenMenuFor(int item);
+    void ReloadPins();
     void PointerMove(float x, float y = 0.0f);
     void PointerLeave();
     void Reveal();
@@ -183,6 +188,8 @@ private:
     struct Item {
         std::wstring launch;  // .lnk to open when the app isn't running (empty for unpinned apps)
         std::wstring key;     // the running app's key, empty if not running
+        std::wstring pinPath; // what Keep in Dock would store for an unpinned app
+        std::wstring file;    // the exe or shortcut target Show in Explorer selects; empty for Store apps
     };
     std::vector<Item> m_items;  // what the dock shows, left to right
     std::vector<std::wstring> m_appNames;  // friendly display names for hover labels
@@ -193,6 +200,7 @@ private:
     std::unique_ptr<halo::AppLabel> m_label;
     std::unique_ptr<halo::Launcher> m_launcher;
     std::unique_ptr<halo::Previews> m_previews;
+    std::unique_ptr<halo::Menu> m_menu;
     int m_hoverItem = -1;           // the dock icon the pointer is on
     std::wstring m_previewKey;      // the app the strip shows
     std::unique_ptr<halo::IntellihideDetector> m_intellihide;
@@ -249,7 +257,7 @@ bool Halo::Create(HINSTANCE inst) {
     GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     m_scale.v = dpiX / 96.0f;
 
-    Step(L"pinned apps", [&] { m_apps = LoadPinnedApps(); });
+    Step(L"pinned apps", [&] { m_apps = halo::pins::Load(); });
 
     // Metrics in physical px. The window is as wide as the monitor and tall
     // enough for a fully magnified, bouncing icon above the pill; only the
@@ -315,6 +323,16 @@ bool Halo::Create(HINSTANCE inst) {
                 host.closed = [this] { if (!m_trackingMouse) PointerLeave(); };  // the dock may auto-hide again
                 m_launcher = std::make_unique<halo::Launcher>(inst, m_comp, m_gdev, std::move(host));
                 m_tracker->onForeground = [this](RunningApp const& app) { m_launcher->Note(LaunchTarget(app)); };
+            });
+            Step(L"menu", [&] {
+                halo::MenuHost host;
+                host.glass = [this](int noiseHeight, float radius) { return BuildPill(noiseHeight, radius); };
+                host.opened = [] { halo::winkey::WatchEscape(true); };  // the hook posts Esc to us
+                host.closed = [this] {
+                    if (!(m_launcher && m_launcher->IsOpen())) halo::winkey::WatchEscape(false);
+                    if (!m_trackingMouse) PointerLeave();  // the dock may auto-hide again
+                };
+                m_menu = std::make_unique<halo::Menu>(inst, m_comp, m_gdev, std::move(host));
             });
             Step(L"previews", [&] {
                 halo::PreviewsHost host;
@@ -464,7 +482,7 @@ wuc::CompositionBrush Halo::MakeNoiseBrush(int w, int h) {
 // grain and a 1px rim whose vertical gradient is bright on top and faintly
 // bright again at the bottom. Layers size relative to the container, which
 // the dock resizes and clips.
-wuc::ContainerVisual Halo::BuildPill(int noiseHeight) {
+wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius) {
     auto pill = m_comp.CreateContainerVisual();
 
     auto glass = m_comp.CreateSpriteVisual();
@@ -494,7 +512,7 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight) {
 
     // The rim is a stroke inset by half its width, so it stays inside the clip.
     const float t = m_scale.f(1);
-    const float r = m_metrics.cornerRadius - t / 2;
+    const float r = (radius > 0 ? radius : m_metrics.cornerRadius) - t / 2;
     auto rimShape = m_comp.CreateRoundedRectangleGeometry();
     const bool hasEdge = halo::theme::P().edge.a != 0;
     const float ri = hasEdge ? t : 0.0f;  // the white rim sits just inside the outer hairline
@@ -622,6 +640,7 @@ void Halo::RefreshDock() {
     // before the slow part, loading its icon.
     SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     if (m_launcher) m_launcher->Raise();  // the panel stays above the dock
+    if (m_menu) m_menu->Raise();
     auto running = m_tracker->Apps();
     std::vector<bool> pinned(running.size());
     std::vector<Dock::Item> items;
@@ -631,6 +650,9 @@ void Halo::RefreshDock() {
         auto brush = IconBrushFor(pin.linkPath);
         if (!brush) continue;
         Item item{pin.linkPath, {}};
+        if (!pin.targetPath.empty()) item.file = pin.targetPath;
+        else if (!_wcsnicmp(pin.linkPath.c_str(), L"shell:", 6)) item.file.clear();
+        else item.file = pin.linkPath;
         for (size_t i = 0; i < running.size(); i++) {
             auto const& r = running[i];
             if ((!pin.aumid.empty() && !_wcsicmp(pin.aumid.c_str(), r.aumid.c_str())) ||
@@ -651,7 +673,9 @@ void Halo::RefreshDock() {
         if (!brush) brush = IconBrushFor(running[i].exe);
         if (!brush) continue;
         items.push_back({L"u:" + running[i].key, brush, true, true});
-        m_items.push_back({{}, running[i].key});
+        m_items.push_back({{}, running[i].key,
+                           running[i].aumid.empty() ? running[i].exe : L"shell:AppsFolder\\" + running[i].aumid,
+                           running[i].exe});
 
         std::wstring name;
         if (!running[i].aumid.empty()) {
@@ -667,10 +691,10 @@ void Halo::RefreshDock() {
     UpdateRegion();
     if (_wgetenv(L"HALO_TEST"))  // where a test can hover: the pointer x of each running app's icon
         for (size_t i = 0; i < m_items.size(); i++)
-            if (!m_items[i].key.empty())
+            if (!m_items[i].key.empty() || _wgetenv(L"HALO_TEST_MENU_DRYRUN"))
                 Log(L"test icon " + std::to_wstring(i) + L" " + m_appNames[i] + L" x=" +
                     std::to_wstring(static_cast<int>(m_dock->RestIconCenter(i).first)) + L" windows=" +
-                    std::to_wstring(m_tracker->WindowsOf(m_items[i].key).size()));
+                    std::to_wstring(m_tracker->WindowsOf(m_items[i].key).size()) + (m_items[i].key.empty() ? L" idle" : L" running") + (m_items[i].launch.empty() ? L" unpinned" : L" pinned"));
 }
 
 RECT Halo::GetPillRectScreen() const {
@@ -781,6 +805,72 @@ void Halo::HidePreviews(bool instant) {
     if (m_previews) m_previews->Hide(instant);
 }
 
+// Re-reads the pin list and rebuilds the dock from it.
+void Halo::ReloadPins() {
+    m_apps = halo::pins::Load();
+    if (m_dock) RefreshDock();
+}
+
+// The right-click menu of dock icon `item`: its open windows, then Keep in / Remove from Dock, Show in Explorer, Quit.
+void Halo::OpenMenuFor(int item) {
+    if (!m_menu || !m_dock || item < 0 || item >= static_cast<int>(m_items.size())) return;
+    Item const it = m_items[item];  // a copy: the menu outlives a RefreshDock
+    const bool dry = _wgetenv(L"HALO_TEST_MENU_DRYRUN") != nullptr;
+    const bool pinned = !it.launch.empty();
+    const bool running = !it.key.empty();
+
+    HidePreviews(true);
+    KillTimer(m_hwnd, kPreviewTimer);
+    if (m_label) m_label->Hide();
+    m_dock->SetPressed(-1);
+
+    std::vector<halo::MenuEntry> entries;
+    if (running) {
+        for (HWND w : m_tracker->WindowsOf(it.key)) {
+            if (!IsWindow(w)) continue;
+            wchar_t t[256] = {};
+            GetWindowTextW(w, t, ARRAYSIZE(t));
+            entries.push_back({t[0] ? t : L"Untitled", false, [this, w] { ActivateWindow(w); }});
+        }
+        if (!entries.empty()) entries.push_back({L"", true, nullptr});
+    }
+    if (pinned) {
+        entries.push_back({L"Remove from Dock", false, [this, it, dry] {
+            if (dry) { Log(L"menu: DRY RUN, would unpin " + it.launch); return; }
+            if (halo::pins::Unpin(it.launch)) ReloadPins();
+        }});
+    } else if (!it.pinPath.empty()) {
+        entries.push_back({L"Keep in Dock", false, [this, it] {
+            if (halo::pins::Pin(it.pinPath)) ReloadPins();
+        }});
+    }
+    if (!it.file.empty()) {
+        entries.push_back({L"Show in Explorer", false, [it, dry] {
+            if (dry) { Log(L"menu: DRY RUN, would show " + it.file + L" in Explorer"); return; }
+            PIDLIST_ABSOLUTE pidl = nullptr;
+            if (SUCCEEDED(SHParseDisplayName(it.file.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) {
+                SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+                CoTaskMemFree(pidl);
+            } else {
+                Log(L"menu: Show in Explorer failed for " + it.file);
+            }
+        }});
+    }
+    if (running) {
+        if (!entries.empty()) entries.push_back({L"", true, nullptr});
+        entries.push_back({L"Quit", false, [this, it, dry] {
+            auto wins = m_tracker->WindowsOf(it.key);
+            if (dry) { Log(L"menu: DRY RUN, would close " + std::to_wstring(wins.size()) + L" windows of " + it.key); return; }
+            for (HWND w : wins) PostMessageW(w, WM_CLOSE, 0, 0);
+        }});
+    }
+    if (entries.empty()) return;
+    Log(L"menu: item " + std::to_wstring(item) + L" '" + (item < static_cast<int>(m_appNames.size()) ? m_appNames[item] : L"") +
+        L"' pinned=" + (pinned ? L"1" : L"0") + L" running=" + (running ? L"1" : L"0"));
+    auto [cx, topY] = m_dock->RestIconCenter(item);
+    m_menu->Show(std::move(entries), m_full.left + static_cast<int>(cx), GetPillRectScreen().top, m_monitor, m_scale.v);
+}
+
 // (Re)lists the windows of the app the strip shows; follows its icon, or drops the strip if the app is gone.
 void Halo::RefreshPreviews() {
     if (!m_previews || !m_previews->IsVisible() || !m_tracker || !m_dock) return;
@@ -806,6 +896,7 @@ void Halo::ShowPreviewsFor(int item) {
 void Halo::PointerMove(float x, float y) {
     if (m_autoHide) Reveal();
     if (m_dock) m_dock->OnPointerMove(x);
+    if (m_menu && m_menu->IsOpen()) return;  // no name label or preview strip over an open menu
     if (m_dock && m_previews) {
         int hit = m_dock->HitTest(x, y);
         bool running = hit >= 0 && hit < static_cast<int>(m_items.size()) && !m_items[hit].key.empty();
@@ -905,6 +996,7 @@ void Halo::Reveal() {
 void Halo::StartHide() {
     if (m_state != State::Shown) return;
     if (m_launcher && m_launcher->IsOpen()) return;  // the panel is up; its close brings the hide back
+    if (m_menu && m_menu->IsOpen()) return;          // likewise the right-click menu
     m_state = State::Hiding;
     HidePreviews(true);
     if (m_label) m_label->Hide();
@@ -985,8 +1077,9 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     if (m == m_genieMsg && m) return DockIconForWindow(reinterpret_cast<HWND>(w), l);
     if (m == halo::winkey::Message()) { OpenLauncher(); return 0; }  // Win tapped alone
-    if (m == halo::winkey::EscapeMessage()) {                        // Esc, while the panel is up
-        if (m_launcher) m_launcher->Hide();
+    if (m == halo::winkey::EscapeMessage()) {                        // Esc, while the panel or a menu is up
+        if (m_menu && m_menu->IsOpen()) m_menu->Close();
+        else if (m_launcher) m_launcher->Hide();
         return 0;
     }
     if (m == halo::winkey::ControlCenterMessage()) {  // Win+A (wParam 0) / Win+N (1): both toggle the one panel
@@ -1005,6 +1098,14 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_MOUSELEAVE:
             m_trackingMouse = false;
             PointerLeave();
+            return 0;
+        case kMsgTestMenu:
+            if (m_menu && _wgetenv(L"HALO_TEST")) {
+                if (l == 0) { Reveal(); OpenMenuFor(static_cast<int>(w)); }
+                else if (l == 1) m_menu->Close();
+                else if (l >= 100 && l < 200) m_menu->TestHover(static_cast<int>(l) - 100);
+                else if (l >= 200) m_menu->TestActivate(static_cast<int>(l) - 200);
+            }
             return 0;
         case kMsgTestBounce: if (m_dock && _wgetenv(L"HALO_TEST")) m_dock->Bounce(static_cast<int>(w)); return 0;
         case kMsgTestMove: Reveal(); PointerMove(static_cast<float>(w), m_metrics.bottom - m_metrics.pillHeight / 2.0f); return 0;
@@ -1094,6 +1195,12 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 }
             }
             return 0;
+        case WM_RBUTTONUP:
+            if (m_dock && m_state == State::Shown) {
+                int hit = m_dock->HitTest(mx, my);
+                if (hit >= 0 && hit < static_cast<int>(m_items.size())) OpenMenuFor(hit);
+            }
+            return 0;
         case kMsgAppsChanged:
             if (m_dock) RefreshDock();
             RefreshPreviews();
@@ -1101,7 +1208,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
             return 0;
-        case WM_CLOSE: m_previews.reset(); m_cc.reset(); m_notif.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
+        case WM_CLOSE: m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);

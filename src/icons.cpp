@@ -504,6 +504,28 @@ std::vector<PinnedApp> LoadPinnedApps() {
     return apps;
 }
 
+bool MakePinnedApp(const std::wstring& path, PinnedApp& out) {
+    out = {};
+    if (path.empty()) return false;
+    out.linkPath = path;
+    if (path.size() > wcslen(kAppsFolder) && _wcsnicmp(path.c_str(), kAppsFolder, wcslen(kAppsFolder)) == 0) {
+        out.aumid = path.substr(wcslen(kAppsFolder));
+        ComRef<IShellItem> item;
+        if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_IShellItem,
+                                                  reinterpret_cast<void**>(item.put()))))
+            out.name = ItemName(item.get(), SIGDN_NORMALDISPLAY);
+        if (out.name.empty()) out.name = out.aumid;
+        return true;
+    }
+    const auto slash = path.find_last_of(L"\\/");
+    out.name = StripExtension(slash == std::wstring::npos ? path : path.substr(slash + 1));
+    if (path.size() > 4 && _wcsicmp(path.c_str() + path.size() - 4, L".lnk") == 0)
+        out.targetPath = ResolveLinkTarget(path, &out.aumid);
+    else
+        out.targetPath = path;  // a bare exe
+    return !out.name.empty();
+}
+
 // True if all opaque pixels sit inside the top-left quarter: the jumbo image
 // list hands back a 32px icon in a 256px frame when the shell's icon cache has
 // no large version yet (seen at logon for Electron .lnk pins).

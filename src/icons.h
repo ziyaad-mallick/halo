@@ -25,6 +25,10 @@ struct IconImage {
 // TaskBar\*.lnk in directory order (desktop shortcuts only).
 std::vector<PinnedApp> LoadPinnedApps();
 
+// Builds the PinnedApp for a launch path as the dock stores it: a .lnk, a bare exe, or
+// shell:AppsFolder\<AUMID>. False if the path is empty. Needs COM, like LoadPinnedApps.
+bool MakePinnedApp(const std::wstring& path, PinnedApp& out);
+
 // Largest available icon for a file, .lnk or shell:AppsFolder\<AUMID> item (256x256 "jumbo" via the shell
 // system image list SHIL_JUMBO, falling back to SHIL_EXTRALARGE 48x48).
 // Packaged apps (shell:AppsFolder) get the unplated Square44x44Logo the taskbar shows, read from
