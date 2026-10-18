@@ -14,10 +14,18 @@ $running = Join-Path $app 'guardian.exe'
 if (Get-Process guardian -ErrorAction SilentlyContinue) {
     if (Test-Path $running) { & $running --quit | Out-Null } else { & $Guardian --quit | Out-Null }
     $deadline = (Get-Date).AddSeconds(10)
-    while ((Get-Process halo, guardian -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    # Only the installed copies: test builds from build/ may be running too.
+    $live = { Get-Process halo, guardian -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$app\*" } }
+    while ((& $live) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
 }
-Copy-Item $Halo (Join-Path $app 'halo.exe') -Force
-Copy-Item $Guardian (Join-Path $app 'guardian.exe') -Force
+# The guardian may have just TerminateProcess'd a halo that ignored WM_CLOSE; the
+# image stays locked for a moment after the process is gone.
+foreach ($pair in @(@($Halo, 'halo.exe'), @($Guardian, 'guardian.exe'))) {
+    for ($i = 0; ; $i++) {
+        try { Copy-Item $pair[0] (Join-Path $app $pair[1]) -Force; break }
+        catch { if ($i -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
+    }
+}
 Start-Process $running
 Start-Sleep 3
 Get-Process halo, guardian -ErrorAction SilentlyContinue | Select-Object Name, Id, Path
