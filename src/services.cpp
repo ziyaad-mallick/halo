@@ -629,11 +629,11 @@ void Media::Start(HWND notify, UINT event, std::function<void()> changed) {
     m_notify = notify;
     m_event = event;
     m_changed = std::move(changed);
-    Init(m_gen);
+    Init(m_gen, *m_gen);
 }
 
 void Media::Stop() {
-    m_gen++;
+    ++*m_gen;
     m_mgrRev.revoke();
     m_pbRev.revoke();
     m_propRev.revoke();
@@ -643,10 +643,10 @@ void Media::Stop() {
     m_changed = nullptr;
 }
 
-winrt::fire_and_forget Media::Init(unsigned gen) {
+winrt::fire_and_forget Media::Init(std::shared_ptr<unsigned> live, unsigned gen) {
     try {
         auto mgr = co_await Manager::RequestAsync();
-        if (gen != m_gen) co_return;
+        if (gen != *live) co_return;
         m_mgr = mgr;
         HWND h = m_notify;
         UINT e = m_event;
@@ -688,7 +688,8 @@ void DecodeArt(std::vector<uint8_t> const& bytes, MediaState& out) {
 }  // namespace
 
 winrt::fire_and_forget Media::PullAsync() {
-    unsigned gen = m_gen;
+    auto live = m_gen, newest = m_seq;
+    const unsigned gen = *live, seq = ++*newest;
     if (!m_mgr) co_return;
     try {
         auto sess = m_mgr.GetCurrentSession();
@@ -713,7 +714,7 @@ winrt::fire_and_forget Media::PullAsync() {
             next.canPrev = c.IsPreviousEnabled();
             next.canNext = c.IsNextEnabled();
             auto props = co_await sess.TryGetMediaPropertiesAsync();
-            if (gen != m_gen) co_return;
+            if (gen != *live || seq != *newest) co_return;
             next.title = props.Title().c_str();
             next.artist = props.Artist().c_str();
             if (next.title == m_state.title && next.artist == m_state.artist) {
@@ -722,16 +723,19 @@ winrt::fire_and_forget Media::PullAsync() {
             } else if (auto thumb = props.Thumbnail()) {
                 try {
                     auto stream = co_await thumb.OpenReadAsync();
-                    winrt::Windows::Storage::Streams::DataReader reader(stream);
-                    co_await reader.LoadAsync(static_cast<uint32_t>(stream.Size()));
-                    std::vector<uint8_t> bytes(stream.Size());
-                    reader.ReadBytes(bytes);
-                    DecodeArt(bytes, next);
+                    const auto size = static_cast<uint32_t>(stream.Size());
+                    if (size && size < (8u << 20)) {  // a huge or empty thumbnail is not worth loading on the UI thread
+                        winrt::Windows::Storage::Streams::DataReader reader(stream);
+                        co_await reader.LoadAsync(size);
+                        std::vector<uint8_t> bytes(size);
+                        reader.ReadBytes(bytes);
+                        DecodeArt(bytes, next);
+                    }
                 } catch (...) {}
-                if (gen != m_gen) co_return;
+                if (gen != *live || seq != *newest) co_return;
             }
         }
-        if (gen != m_gen) co_return;
+        if (gen != *live || seq != *newest) co_return;
         m_state = std::move(next);
         if (m_changed) m_changed();
     } catch (...) {}
@@ -739,15 +743,15 @@ winrt::fire_and_forget Media::PullAsync() {
 
 void Media::PlayPause() {
     if (DryRun()) return Log(L"DRYRUN media play/pause");
-    if (m_sess) m_sess.TryTogglePlayPauseAsync();
+    try { if (m_sess) m_sess.TryTogglePlayPauseAsync(); } catch (...) {}  // the player may have just quit
 }
 void Media::Next() {
     if (DryRun()) return Log(L"DRYRUN media next");
-    if (m_sess) m_sess.TrySkipNextAsync();
+    try { if (m_sess) m_sess.TrySkipNextAsync(); } catch (...) {}
 }
 void Media::Prev() {
     if (DryRun()) return Log(L"DRYRUN media previous");
-    if (m_sess) m_sess.TrySkipPreviousAsync();
+    try { if (m_sess) m_sess.TrySkipPreviousAsync(); } catch (...) {}
 }
 
 }  // namespace halo::svc

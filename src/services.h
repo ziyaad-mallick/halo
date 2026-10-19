@@ -155,7 +155,9 @@ public:
 private:
     using Session = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession;
     using Manager = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
-    winrt::fire_and_forget Init(unsigned gen);
+    // As in Radios, the coroutines compare against shared counters, never members: a pull that resumes after
+    // the owner is gone returns before touching `this`. m_seq drops a pull that a newer one has overtaken.
+    winrt::fire_and_forget Init(std::shared_ptr<unsigned> live, unsigned gen);
     winrt::fire_and_forget PullAsync();
     HWND m_notify{};
     UINT m_event{};
@@ -166,7 +168,7 @@ private:
     Session::PlaybackInfoChanged_revoker m_pbRev;
     Session::MediaPropertiesChanged_revoker m_propRev;
     MediaState m_state;
-    unsigned m_gen = 0;
+    std::shared_ptr<unsigned> m_gen = std::make_shared<unsigned>(0), m_seq = std::make_shared<unsigned>(0);
 };
 
 }  // namespace halo::svc
