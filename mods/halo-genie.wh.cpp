@@ -2,7 +2,7 @@
 // @id              halo-genie
 // @name            Halo Genie
 // @description     macOS Scale-effect minimize/restore into Halo's dock icons (GPU compositor), plus a zoom for maximize/un-maximize.
-// @version         2.0.0
+// @version         2.1.0
 // @author          Ziyaad Mallick (fork of MacOS Minimize Animation by Abdullah Masood)
 // @include         *
 // @exclude         halo.exe
@@ -134,10 +134,12 @@ struct Anim {
 };
 
 typedef LRESULT (WINAPI *DefWindowProcW_t)(HWND, UINT, WPARAM, LPARAM);
+typedef LRESULT (WINAPI *DefWindowProcA_t)(HWND, UINT, WPARAM, LPARAM);
 typedef BOOL (WINAPI *ShowWindow_t)(HWND, int);
 typedef BOOL (WINAPI *SetWindowPlacement_t)(HWND, const WINDOWPLACEMENT*);
 typedef BOOL (WINAPI *CloseWindow_t)(HWND);
 DefWindowProcW_t DefWindowProcW_Original;
+DefWindowProcA_t DefWindowProcA_Original;
 ShowWindow_t ShowWindow_Original, ShowWindowAsync_Original;
 SetWindowPlacement_t SetWindowPlacement_Original;
 CloseWindow_t CloseWindow_Original;
@@ -408,6 +410,22 @@ static IDXGIDevice* AcquireDxgiDevice() {
     return g_dxgi;
 }
 
+// Creating the D3D device is most of a first minimize's cost (~100-300 ms, held on the app's own thread), so
+// it is made in the background as soon as the pointer is over a minimize button: ready by the click.
+std::atomic<bool> g_warming{false};
+static DWORD WINAPI PrewarmThread(LPVOID) {
+    if (IDXGIDevice* d = AcquireDxgiDevice()) d->Release();  // the device stays cached in g_dxgi
+    g_workers.fetch_sub(1, std::memory_order_release);
+    return 0;
+}
+static void Prewarm() {
+    if (g_dxgi || g_unloading.load() || g_warming.exchange(true)) return;
+    g_workers.fetch_add(1, std::memory_order_relaxed);
+    HANDLE t = CreateThread(nullptr, 0, PrewarmThread, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    else g_workers.fetch_sub(1, std::memory_order_release), g_warming = false;
+}
+
 static void ReleaseDxgiDevice() {
     std::lock_guard<std::mutex> lock(g_d3dMutex);
     if (g_dxgi) { g_dxgi->Release(); g_dxgi = nullptr; }
@@ -420,6 +438,22 @@ static RECT Union(const RECT& a, const RECT& b) {
 }
 
 template <class T> static void Rel(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
+// Waits up to `ms` (or until `done`), dispatching this thread's messages: the ghost window lives on this thread,
+// so it must answer whatever the system sends it (a thread that never pumps looks hung and gets the busy cursor).
+template <class F> static void PumpUntil(double ms, F done) {
+    LARGE_INTEGER freq, t0, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        QueryPerformanceCounter(&now);
+        double left = ms - (now.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        if (left <= 0 || done()) return;
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)std::min(left, 4.0) + 1, QS_ALLINPUT);
+    }
+}
 
 static DWORD WINAPI Worker(LPVOID param) {
     std::shared_ptr<Anim> a(*(std::shared_ptr<Anim>*)param);
@@ -442,8 +476,12 @@ static DWORD WINAPI Worker(LPVOID param) {
     box = {box.left - pad, box.top - pad, box.right + pad, box.bottom + pad};
     const int vLeft = box.left, vTop = box.top, vW = box.right - box.left, vH = box.bottom - box.top;
 
-    HWND ghost = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+    // Layered + transparent: the ghost is invisible to the mouse, so the pointer keeps the dock (and its hover) and
+    // never lands on this thread's window. (WS_EX_TRANSPARENT alone still hit-tests across threads.)
+    HWND ghost = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT |
+                                     WS_EX_NOACTIVATE,
                                  L"STATIC", nullptr, WS_POPUP, vLeft, vTop, vW, vH, nullptr, nullptr, nullptr, nullptr);
+    if (ghost) SetLayeredWindowAttributes(ghost, 0, 255, LWA_ALPHA);
 
     IDXGIDevice* dxgi = ghost ? AcquireDxgiDevice() : nullptr;
     IDCompositionDevice* dev = nullptr;
@@ -535,7 +573,7 @@ static DWORD WINAPI Worker(LPVOID param) {
     a->firstShown = true;
 
     if (built && zoom) {  // the real window's final rect: known once the caller has resized it
-        for (int i = 0; i < 150 && !a->toReady.load() && !a->abort.load() && !g_unloading.load(); i++) Sleep(1);
+        PumpUntil(150, [&] { return a->toReady.load() || a->abort.load() || g_unloading.load(); });
         if (a->toReady.load()) zoomTracks(a->toFinal);
     }
 
@@ -553,12 +591,7 @@ static DWORD WINAPI Worker(LPVOID param) {
         QueryPerformanceCounter(&t0);
         if (ok) {
             // No rendering from here on: just wait out the timeline (plus a frame of slack).
-            for (;;) {
-                QueryPerformanceCounter(&now);
-                double elapsed = (now.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
-                if (elapsed >= durMs + 40.0 || a->abort.load() || g_unloading.load()) break;
-                Sleep(4);
-            }
+            PumpUntil(durMs + 40.0, [&] { return a->abort.load() || g_unloading.load(); });
             DwmFlush();
         }
         QueryPerformanceCounter(&now);
@@ -670,8 +703,15 @@ static bool Launch(const std::shared_ptr<Anim>& a, bool wait) {
 // Runs `real` (the call that changes the window) under the animation `kind`.
 template <class F>
 static auto Run(HWND h, Kind kind, F real) -> decltype(real()) {
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
     auto a = Begin(h, kind);
     if (!a) return real();
+    struct Stall {  // how long the app's own thread is held before the real call (logged)
+        LARGE_INTEGER &f, &t0, &t1; Kind k;
+        ~Stall() { QueryPerformanceCounter(&t1); Wh_Log(L"genie kind=%d caller stall %.1f ms", (int)k, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart); }
+    } stall{freq, t0, t1, kind};
     SetTransitions(h, FALSE);
     if (kind == Restore) {  // hide the restored window, then play out of the icon
         a->cloaked = true;
@@ -740,7 +780,9 @@ BOOL WINAPI CloseWindow_Hook(HWND h) {
 }
 
 LRESULT WINAPI DefWindowProcW_Hook(HWND h, UINT msg, WPARAM w, LPARAM l) {
-    if (msg == WM_SYSCOMMAND) {
+    if (msg == WM_NCMOUSEMOVE && w == HTMINBUTTON) {
+        Prewarm();
+    } else if (msg == WM_SYSCOMMAND) {
         Kind k;
         if (Classify(h, (int)(w & 0xFFF0), true, &k)) return Run(h, k, [&] { return DefWindowProcW_Original(h, msg, w, l); });
     } else if (msg == WM_DESTROY) {
@@ -750,9 +792,24 @@ LRESULT WINAPI DefWindowProcW_Hook(HWND h, UINT msg, WPARAM w, LPARAM l) {
     return DefWindowProcW_Original(h, msg, w, l);
 }
 
+// ANSI windows (older apps, some games' launchers) minimize through DefWindowProcA.
+LRESULT WINAPI DefWindowProcA_Hook(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_NCMOUSEMOVE && w == HTMINBUTTON) {
+        Prewarm();
+    } else if (msg == WM_SYSCOMMAND) {
+        Kind k;
+        if (Classify(h, (int)(w & 0xFFF0), true, &k)) return Run(h, k, [&] { return DefWindowProcA_Original(h, msg, w, l); });
+    } else if (msg == WM_DESTROY) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_cache.erase(h);
+    }
+    return DefWindowProcA_Original(h, msg, w, l);
+}
+
 BOOL Wh_ModInit() {
     g_haloMsg = RegisterWindowMessageW(L"Halo.DockIconForWindow");
     Wh_SetFunctionHook((void*)DefWindowProcW, (void*)DefWindowProcW_Hook, (void**)&DefWindowProcW_Original);
+    Wh_SetFunctionHook((void*)DefWindowProcA, (void*)DefWindowProcA_Hook, (void**)&DefWindowProcA_Original);
     Wh_SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook, (void**)&ShowWindow_Original);
     Wh_SetFunctionHook((void*)ShowWindowAsync, (void*)ShowWindowAsync_Hook, (void**)&ShowWindowAsync_Original);
     Wh_SetFunctionHook((void*)SetWindowPlacement, (void*)SetWindowPlacement_Hook, (void**)&SetWindowPlacement_Original);

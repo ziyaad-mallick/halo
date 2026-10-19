@@ -148,6 +148,13 @@ static DWORD WINAPI ShotThread(LPVOID p) {
         char name[64];
         snprintf(name, sizeof(name), "%s_%03dms.png", sp->prefix.c_str(), sp->ms[i]);
         Shot(name);
+        {   // what the mouse would hit mid-animation: the ghost must be click-through
+            POINT pt = {460, 300};  // the test window's centre: covered by the ghost while it plays
+            HWND under = WindowFromPoint(pt);
+            wchar_t cls[64] = {}; GetClassNameW(under, cls, 64);
+            DWORD pid = 0; GetWindowThreadProcessId(under, &pid);
+            printf("  under window centre: %ls (own process: %d)\n", cls, (int)(pid == GetCurrentProcessId()));
+        }
         QueryPerformanceCounter(&now);
         printf("%s taken at %.0f ms\n", name, (now.QuadPart - sp->t0.QuadPart) * 1000.0 / f.QuadPart);
     }
@@ -167,7 +174,13 @@ static void Play(HWND h, Kind kind, const std::vector<int>& shots, const char* p
         RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);  // a real app repaints itself on restore
         ok =Prepare(a) && Launch(a, false);
     } else {
-        ok = Prepare(a) && Launch(a, true);
+        LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        ok = Prepare(a);
+        LARGE_INTEGER tp; QueryPerformanceCounter(&tp);
+        printf("%s: prepare (capture) %.1f ms\n", prefix, (tp.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
+        ok = ok && Launch(a, true);
+        QueryPerformanceCounter(&t1);
+        printf("%s: caller stall %.1f ms\n", prefix, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
         if (ok) ShowWindow(h, SW_HIDE);  // the "real" minimize
     }
     printf("%s: launched=%d\n", prefix, (int)ok);
@@ -201,11 +214,19 @@ int main(int argc, char** argv) {
     Geometry icon = {cx - 24, cy - 24, 48, 48};
     g_crop = {60, 40, std::min(sw, sw / 2 + 300), sh};
     printf("screen %dx%d icon centre (%.0f,%.0f) crop %ld,%ld-%ld,%ld\n", sw, sh, cx, cy, g_crop.left, g_crop.top, g_crop.right, g_crop.bottom);
+    if (GetEnvironmentVariableW(L"GENIE_PREWARM", nullptr, 0)) {  // as if the pointer had crossed the minimize button
+        Prewarm();
+        Pump(400);
+    }
     Shot("00_before.png");
     Play(h, Minimize, shots, "minimize", icon);
     Shot("01_minimized.png");
     Pump(300);
     Play(h, Restore, shots, "restore", icon);
+    Pump(300);
+    Play(h, Minimize, {}, "minimize-again", icon);  // second time: the D3D device already exists
+    Pump(300);
+    Play(h, Restore, {}, "restore-again", icon);
     { DWORD c = 0; DwmGetWindowAttribute(h, DWMWA_CLOAKED, &c, sizeof(c));
       printf("after restore: visible=%d cloaked=%lu iconic=%d\n", (int)IsWindowVisible(h), c, (int)IsIconic(h)); }
     Shot("02_restored.png");
