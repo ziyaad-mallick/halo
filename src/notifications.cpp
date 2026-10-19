@@ -763,7 +763,13 @@ void NotificationCenter::Impl::ClearAll() {
     for (auto const& n : all)
         if (!hidden.count(n.id)) r.ids.push_back(n.id);
     svc::Log(L"notifications: clear all (" + std::to_wstring(r.ids.size()) + L")");
-    Dismiss(r);
+    if (dry || r.ids.empty()) { Dismiss(r); return; }
+    // One call, not a RemoveNotification round trip per toast (each is a cross-process call: hundreds froze the panel).
+    for (UINT id : r.ids) hidden.insert(id);
+    try { wun::Management::UserNotificationListener::Current().ClearNotifications(); }
+    catch (winrt::hresult_error const& e) { svc::Log(L"notifications: ClearNotifications failed, hidden locally: " + std::wstring(e.message().c_str())); }
+    hoverCard = -1;
+    Update(false);
 }
 
 void NotificationCenter::Impl::Activate(Row const& r) {
