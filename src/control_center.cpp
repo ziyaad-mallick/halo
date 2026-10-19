@@ -211,7 +211,7 @@ struct ControlCenter::Impl {
     size_t listCap = SIZE_MAX;  // the most list rows Layout() may show (it lowers this when the panel would not fit)
     float volume = 0;
     bool muted = false, micMuted = false, dnd = false, wifiOn = false, btOn = false, dark = false, energy = false, night = false;
-    bool hotspotAvail = false, hotspotOn = false, savedWifi = true, savedBt = true, btAsked = false;
+    bool hotspotAvail = false, hotspotOn = false, savedWifi = true, savedBt = true, btAsked = false, btDone = false;  // btDone: the paired-device read has answered
     int bright = -1;
     svc::Battery battery;
     svc::PowerMode mode = svc::PowerMode::Unknown;
@@ -425,7 +425,8 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (svc::brightness::Supported()) bright = svc::brightness::Level();
             Render();
             return 0;
-        case kMsgWifi: case kMsgBt: Render(); return 0;
+        case kMsgBt: btDone = true; Render(); return 0;
+        case kMsgWifi: Render(); return 0;
         case kMsgLate: {
             std::unique_ptr<Late> r(reinterpret_cast<Late*>(l));
             if (st == St::Open && r) {
@@ -977,14 +978,17 @@ void ControlCenter::Impl::Click(Item const& it) {
             Pulse(it);
             break;
         case Id::WifiText:
+            if (!radios.HasWifi()) return;  // no adapter (an Ethernet-only desktop): nothing to list
             expand = expand == Expand::Wifi ? Expand::None : Expand::Wifi;
             if (expand == Expand::Wifi) svc::WifiRefresh(hwnd, kMsgWifi);
             break;
         case Id::BtText:
+            if (!radios.HasBluetooth()) return;
             expand = expand == Expand::Bluetooth ? Expand::None : Expand::Bluetooth;
-            if (expand == Expand::Bluetooth) svc::BtRefresh(hwnd, kMsgBt);
+            if (expand == Expand::Bluetooth) { btDone = false; svc::BtRefresh(hwnd, kMsgBt); }
             break;
         case Id::WifiNet:
+            if (static_cast<size_t>(it.arg) >= svc::WifiNets().size()) return;
             svc::WifiConnect(svc::WifiNets()[it.arg].ssid);
             expand = Expand::None;
             break;
@@ -1414,9 +1418,15 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 tile(r);
                 if (it.id == Id::DisplayTile && bright >= 0)
                     txt(L"Display", fTitle.get(), {r.left + kS4, r.top + kS4, r.right - kS4, r.top + kS4 + kTitleLine}, kText);
-                if (it.id == Id::ListTile)
-                    txt(expand == Expand::Wifi ? L"Wi-Fi networks" : L"Bluetooth devices", fTitle.get(),
+                if (it.id == Id::ListTile) {
+                    const bool wifi = expand == Expand::Wifi;
+                    txt(wifi ? L"Wi-Fi networks" : L"Bluetooth devices", fTitle.get(),
                         {r.left + kS4, r.top + kS4, r.right - kS4, r.top + kS4 + kTitleLine}, kText);
+                    if (wifi ? svc::WifiNets().empty() : btDone && svc::BtDevices().empty()) {  // the one row Layout() always reserves
+                        const float t = r.top + kS4 + kTitleLine + kS1;
+                        txt(wifi ? L"No saved networks" : L"No paired devices", fSub.get(), {r.left + kS4, t, r.right - kS4, t + kListRowH}, kDim);
+                    }
+                }
                 break;
             case Id::SoundTile:
                 txt(L"Sound", fTitle.get(), {r.left + kS4, r.top, r.left + 112, r.bottom}, theme::A(kText, speaker.Available() ? 1.0f : 0.5f));
@@ -1512,6 +1522,8 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             case Id::OutDev: case Id::WifiNet: case Id::BtDev: {
                 std::wstring name, sub;
                 bool mark = false;
+                const size_t have = it.id == Id::OutDev ? outs.size() : it.id == Id::WifiNet ? svc::WifiNets().size() : svc::BtDevices().size();
+                if (static_cast<size_t>(it.arg) >= have) break;  // a chip or list changed under a stale item: draw nothing, never index past the end
                 if (it.id == Id::OutDev) { name = outs[it.arg].name; mark = outs[it.arg].isDefault; }
                 else if (it.id == Id::WifiNet) {
                     auto const& n = svc::WifiNets()[it.arg];
