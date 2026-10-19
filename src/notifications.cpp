@@ -522,7 +522,11 @@ LRESULT CALLBACK NotificationCenter::Impl::MsgThunk(HWND h, UINT m, WPARAM w, LP
 }
 
 void NotificationCenter::Impl::OnSnapshot(Snapshot& snap) {
-    if (!snap.ok) { svc::Log(L"notifications: read failed: " + snap.error); return; }
+    if (!snap.ok) {  // access denied or the listener failed: show the empty state rather than a bare header and calendar
+        svc::Log(L"notifications: read failed: " + snap.error);
+        if (!haveData) { haveData = true; if (st == St::Open) Update(false); }
+        return;
+    }
     for (auto& [k, ic] : snap.icons) icons[k] = std::move(ic);
     std::sort(snap.items.begin(), snap.items.end(), [](Notif const& a, Notif const& b) { return a.ft > b.ft; });
     all = std::move(snap.items);
