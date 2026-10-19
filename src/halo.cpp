@@ -41,6 +41,7 @@
 #include "label.h"
 #include "multimon.h"
 #include "previews.h"
+#include "swoop.h"
 #include "menu.h"
 #include "pins.h"
 #include "winkey.h"
@@ -183,6 +184,7 @@ private:
     std::wstring LaunchTarget(RunningApp const& app) const;
     void LaunchRecent(std::wstring const& target);
     LRESULT DockIconForWindow(HWND win, LPARAM op);
+    bool SwoopTarget(HWND win, RECT const& from, RECT& icon);
     void StartHide();
     RECT GetPillRectScreen() const;
     void MigrateToMonitor(HMONITOR mon, bool reveal = true);
@@ -204,6 +206,7 @@ private:
     std::vector<std::wstring> m_appNames;  // friendly display names for hover labels
     std::map<std::wstring, wuc::CompositionBrush> m_brushes;  // by icon source path, so rebuilds reuse them
     std::unique_ptr<WindowTracker> m_tracker;
+    std::unique_ptr<halo::Swoop> m_swoop;  // after m_tracker: dies first, giving windows their transitions back
     std::unique_ptr<Dock> m_dock;
     std::unique_ptr<DockCluster> m_cluster;
     std::unique_ptr<halo::AppLabel> m_label;
@@ -584,6 +587,7 @@ void Halo::ApplySettings(bool themeFlipped) {
         }() + L")");
 
     halo::edge::Configure(c.cc.hotCorner, c.cc.cornerWidth, c.cc.cornerDelay);
+    if (m_swoop) m_swoop->SetEnabled(!c.reduceMotion);
     m_autoHide = !_wgetenv(L"HALO_TEST") && c.taskbar.autohide;
     if (!c.taskbar.autohide) Reveal();
     else if (!prev.taskbar.autohide && !m_trackingMouse) PointerLeave();
@@ -678,7 +682,17 @@ void Halo::BuildDock() {
         auto shadow = BuildPillShadow(pill);
         if (shadow && pill.Parent()) pill.Parent().Children().InsertBelow(shadow, pill);
     });
-    if (!m_tracker) m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
+    if (!m_tracker) {
+        m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
+        m_swoop = std::make_unique<halo::Swoop>([this](HWND w, RECT const& from, RECT& icon) { return SwoopTarget(w, from, icon); },
+                                                !m_cfg.reduceMotion);
+        for (HWND w : m_tracker->Windows()) m_swoop->Track(w);
+        m_tracker->onWindow = [this](HWND w, bool added) {
+            if (!m_swoop) return;
+            if (added) m_swoop->Track(w);
+            else m_swoop->Forget(w);
+        };
+    }
     RefreshDock();
 }
 
@@ -878,8 +892,13 @@ void Halo::UpdateRegion() {
 // restore runs in the app and the genie mod can animate it.
 void Halo::ActivateWindow(HWND w) {
     HidePreviews();
-    if (IsIconic(w)) SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
-    SetForegroundWindow(w);
+    auto restore = [w] {
+        if (IsIconic(w)) SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
+        SetForegroundWindow(w);
+    };
+    // Windows the mod can't animate (Chromium) get Halo's own swoop out of the icon, which calls restore itself.
+    if (m_swoop && IsIconic(w) && m_swoop->Restore(w, restore)) return;
+    restore();
 }
 
 // macOS: a running app comes to the front (its most recent window, restored if minimized) with a
@@ -1219,6 +1238,7 @@ void Halo::StartHide() {
 //   On 1 and 2 the dock is also revealed and held for kGenieHoldMs so the swoop lands on a visible icon.
 LRESULT Halo::DockIconForWindow(HWND win, LPARAM op) {
     if (!m_dock || !m_tracker) return 0;
+    if (op != 3 && m_swoop) m_swoop->ModAsked(win);  // the mod is animating it: Halo's own swoop stays out
     std::wstring key = m_tracker->KeyOf(win);
     if (key.empty()) return 0;
     for (size_t i = 0; i < m_items.size(); i++) {
@@ -1233,6 +1253,24 @@ LRESULT Halo::DockIconForWindow(HWND win, LPARAM op) {
         return static_cast<LRESULT>(size | pack(x + m_full.left) << 16 | pack(y + m_full.top) << 32);
     }
     return 0;
+}
+
+// Where Halo's own swoop lands: the window's dock icon, if the dock is up on the window's monitor. Not when it
+// is hidden (the mod reveals it; here the window simply goes) or under reduce_motion.
+bool Halo::SwoopTarget(HWND win, RECT const& from, RECT& icon) {
+    if (!m_dock || !m_tracker || m_state != State::Shown || m_cfg.reduceMotion) return false;
+    if (MonitorFromRect(&from, MONITOR_DEFAULTTONEAREST) != m_currentMon) return false;
+    std::wstring key = m_tracker->KeyOf(win);
+    if (key.empty()) return false;
+    for (size_t i = 0; i < m_items.size(); i++) {
+        if (m_items[i].key != key) continue;
+        auto [x, y] = m_dock->RestIconCenter(i);
+        float half = m_metrics.restSize / 2;
+        icon = {static_cast<LONG>(std::lround(x + m_full.left - half)), static_cast<LONG>(std::lround(y + m_full.top - half)),
+                static_cast<LONG>(std::lround(x + m_full.left + half)), static_cast<LONG>(std::lround(y + m_full.top + half))};
+        return true;
+    }
+    return false;
 }
 
 LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -1438,7 +1476,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
             return 0;
-        case WM_CLOSE: m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
+        case WM_CLOSE: m_swoop.reset(); m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);
