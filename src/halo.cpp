@@ -1359,7 +1359,9 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == kHideTimer) {
                 KillTimer(m_hwnd, kHideTimer);
-                StartHide();
+                // Only a window over the dock, or a fullscreen app, takes it away (PointerLeave arms the timer on
+                // that condition too). The genie hold arms it regardless: with nothing in the way the dock stays up.
+                if (!m_intellihide || m_intellihide->HasOverlap() || m_intellihide->IsFullscreen()) StartHide();
             } else if (w == kPanelStagger) {
                 KillTimer(m_hwnd, kPanelStagger);
                 if (m_cc && m_cc->IsOpen() && m_notif) {
