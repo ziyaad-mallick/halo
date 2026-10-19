@@ -348,6 +348,17 @@ constexpr SettingsPage kSettingsPages[] = {
 constexpr wchar_t kSettingsApp[] =
     L"shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
 
+// ShellExecute without its error dialog: a file deleted since the list was made (or a Settings page this Windows
+// lacks) must fail quietly, not park a modal message box on the shell's one UI thread.
+void OpenQuietly(std::wstring const& target) {
+    SHELLEXECUTEINFOW sei{sizeof(sei)};
+    sei.fMask = SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = L"open";
+    sei.lpFile = target.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) Log(L"open failed (" + std::to_wstring(GetLastError()) + L"): " + target);
+}
+
 IReference<float3> Ref3(float3 v) { return v; }  // spring animations take IReference<float3>
 IReference<float2> Ref2(float2 v) { return v; }
 
@@ -1225,6 +1236,8 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     m_scroll = 0;
     m_allApps = false;
     m_activated = false;
+    m_pressedIndex = -1;  // a press from the last visit must not complete a click on this one
+    m_wheel = 0;
     ++m_gen;
 
     // Everything slow (Recent files, their icons, the account picture, the app index) is cached; Refresh() updates it after the show.
@@ -1378,6 +1391,7 @@ void Launcher::Refresh() {
     std::wstring after;
     for (auto const& f : m_allFiles) after += f.path + L"|";
     if (after != before || hadAvatar != !m_avatar.empty()) {
+        if (m_menuOpen) return;  // Relayout would not rebuild, and the rows must stay in step with m_results; next Show picks it up
         Log(L"refreshed in the background, rebuilding");
         RunSearch();
         Relayout();
@@ -1533,7 +1547,7 @@ void Launcher::Activate(Kind kind, int index) {
     if (app) {
         if (m_host.launch) m_host.launch(path);
     } else {
-        ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        OpenQuietly(path);
     }
 }
 
@@ -1707,7 +1721,7 @@ void Launcher::Click(Hit const& hit) {
         case Kind::Result: Activate(hit.kind, hit.index); break;
         case Kind::Settings:
             Hide();
-            ShellExecuteW(nullptr, L"open", L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL);
+            OpenQuietly(L"ms-settings:");
             break;
         case Kind::Power: ToggleMenu(!m_menuOpen); break;
         case Kind::AllApps: ToggleAllApps(); break;
@@ -1854,7 +1868,18 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             Log(L"app index: " + std::to_wstring(m_index.size() - before) + L" more from the Apps folder, " +
                 std::to_wstring(m_index.size()) + L" apps");
             if (m_open && Listing()) {  // what is on screen may have changed
+                // New apps slot in among the matches: keep the selected item selected, not the selected row, so
+                // an Enter already on its way launches what the user was looking at.
+                const std::wstring keep = m_sel < static_cast<int>(m_results.size()) ? m_results[m_sel].path : std::wstring();
                 RunSearch();
+                if (auto it = std::find_if(m_matches.begin(), m_matches.end(), [&](Result const& r) { return !keep.empty() && r.path == keep; });
+                    it != m_matches.end()) {
+                    const int k = static_cast<int>(it - m_matches.begin()), rows = ListRows();
+                    if (k < m_scroll) m_scroll = k;
+                    else if (k >= m_scroll + rows) m_scroll = k - rows + 1;
+                    ShowMatches();
+                    m_sel = k - m_scroll;
+                }
                 BuildBody();
             }
             return 0;
