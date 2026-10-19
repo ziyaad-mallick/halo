@@ -732,7 +732,11 @@ void Halo::RefreshDock() {
     std::vector<Dock::Item> items;
     m_items.clear();
     m_appNames.clear();
+    // The pill can't grow past the screen: pinned apps take the room first, then running ones in the order they
+    // appeared; the rest stay reachable from Alt+Tab and the Start panel's recents.
+    const size_t cap = m_dock->MaxItems(static_cast<float>(m_width - m_scale.px(16)));
     for (auto const& pin : m_apps) {
+        if (items.size() >= cap) break;
         auto brush = IconBrushFor(pin.linkPath);
         if (!brush) brush = FallbackIconBrush();  // uninstalled or unreadable: shown plain, removable from its menu
         if (!brush) continue;
@@ -754,6 +758,10 @@ void Halo::RefreshDock() {
     }
     for (size_t i = 0; i < running.size(); i++) {
         if (pinned[i] || running[i].exe.empty()) continue;
+        if (items.size() >= cap) {
+            Log(L"dock full (" + std::to_wstring(cap) + L" icons fit): " + running[i].key + L" and later apps not shown");
+            break;
+        }
         // Packaged apps' exes often carry no icon; their Start entry has the logo.
         wuc::CompositionBrush brush{nullptr};
         if (!running[i].aumid.empty()) brush = IconBrushFor(L"shell:AppsFolder\\" + running[i].aumid);

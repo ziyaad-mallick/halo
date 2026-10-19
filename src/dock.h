@@ -95,6 +95,9 @@ public:
     float RestWidth() const;
     float MaxWidth() const;
 
+    // How many icons fit in `availWidth` px with the wave at full magnification (at least 1).
+    size_t MaxItems(float availWidth) const;
+
 private:
     struct Entry {
         std::wstring key;
