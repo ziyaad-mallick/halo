@@ -2,8 +2,9 @@
 // The Launcher panel: Start. A glass panel that rises above the dock when the Windows key or the Start
 // logo is pressed, and takes the keyboard (it is the only search UI):
 //
-//   Search bar   - type to filter Start-menu apps and recent files; Enter launches the top result
-//   Recent apps  - up to 6, an MRU kept in %LOCALAPPDATA%\Halo\recent.txt
+//   Search bar   - type to filter every app (Start-menu shortcuts and the Apps folder, so Store apps too),
+//                  Settings pages and recent files; Enter launches the selected result
+//   Recent apps  - up to 6, an MRU kept in %LOCALAPPDATA%\Halo\recent.txt; "All apps" lists every app, A to Z
 //   Recent files - 2 x 6 from the shell's Recent folder, newest first
 //   user · Settings · Power (Sleep, Restart, Shut down, Lock, Sign out)
 //
@@ -70,13 +71,16 @@ public:
     void Note(std::wstring const& target);
 
     // HALO_TEST: wParam 2 = toggle the Power menu, 3+n = run Power item n (dry run), 9 = pretend the panel
-    // lost activation (a click elsewhere), 20 = snap the hover plate and icon to where their animations end.
+    // lost activation (a click elsewhere), 20 = snap the hover plate and icon to where their animations end,
+    // 21 = toggle All apps, 22 = scroll the list down 5 rows.
     void TestCommand(WPARAM w);
+
+    using Found = std::vector<std::pair<std::wstring, std::wstring>>;  // apps found: (name, launch target)
 
     void Raise();                // back to the top of the topmost band
 
 private:
-    enum class Kind { App, File, Result, Settings, Power, MenuItem };
+    enum class Kind { App, File, Result, Settings, Power, MenuItem, AllApps };
     struct Hit {
         D2D1_RECT_F r;
         Kind kind;
@@ -86,11 +90,11 @@ private:
         std::wstring name, path;
     };
     struct AppEntry {
-        std::wstring name, lname, path;  // path: the Start-menu .lnk, which the host launches
+        std::wstring name, lname, path;  // path: the Start-menu .lnk or shell:AppsFolder\<id>, which the host launches
     };
     struct Result {
-        bool app;
-        std::wstring name, path;
+        enum class Type { App, Setting, File } type;  // also the order among equally good matches
+        std::wstring name, path;                     // path: a launch target, an ms-settings: URI or a file
     };
     struct IconV {  // a hoverable icon: its own visual, so it scales and lifts on its own
         wuc::SpriteVisual v{nullptr};
@@ -111,12 +115,20 @@ private:
     wuc::SpriteVisual MakeSurfaceVisual(wuc::CompositionDrawingSurface const& s, float w, float h);
     wuc::CompositionBrush FileBrush(std::wstring const& path, float logicalPx);
     void LoadFiles();
-    void BuildIndex();  // Start-menu apps, once
+    void BuildIndex();  // every app, once (the Apps folder arrives later, on kMsgAppsFolder)
+    void AddToIndex(Found const& found);
     void Prefetch();
     void Refresh();
     void Relayout();
     void Place();
     void RunSearch();
+    void ShowMatches();  // m_results = the rows of m_matches that fit, from m_scroll
+    void Scroll(int rows);
+    void ToggleAllApps();
+    bool Listing() const { return !m_query.empty() || m_allApps; }
+    bool ListHeader() const { return m_allApps && m_query.empty(); }
+    float ListTop() const;
+    int ListRows() const;
     void QueryChanged();
     void SearchDraw();  // search bar text + caret
     void Activate(Kind kind, int index);
@@ -169,6 +181,7 @@ private:
     float m_w = 0, m_h = 0;       // panel size
     float m_menuW = 0, m_menuH = 0, m_menuX = 0, m_menuY = 0;
     std::vector<Hit> m_hits, m_menuHits, m_staticHits;
+    D2D1_RECT_F m_allAppsRect{};  // "All apps" on the home view, "Back" on the list: the same place
     D2D1_RECT_F m_searchRect{}, m_appsLabel{}, m_filesLabel{}, m_divider{}, m_avatarRect{}, m_nameRect{}, m_settingsRect{}, m_powerRect{};
     float m_bodyTop = 0, m_bodyBottom = 0;  // the body surface spans these panel y's
     std::vector<D2D1_RECT_F> m_appCells, m_fileCells, m_resultRows, m_menuRows;  // icon rects, file cells, result rows, menu rows (menu coordinates)
@@ -180,9 +193,13 @@ private:
     std::vector<FileEntry> m_files;       // the head of m_allFiles the panel shows
     std::vector<FileEntry> m_allFiles;    // the Recent folder, newest first (search looks through all of it)
     std::vector<AppEntry> m_index;        // every Start-menu app
-    std::vector<Result> m_results;
+    std::vector<Result> m_matches;        // everything the query (or All apps) found, best first
+    std::vector<Result> m_results;        // the rows of it on screen
+    int m_scroll = 0;                     // index in m_matches of the first row
+    int m_wheel = 0;                      // wheel delta not yet a whole row
+    bool m_allApps = false;
     std::wstring m_query;
-    int m_sel = 0;                        // selected result
+    int m_sel = 0;                        // selected row of m_results
     std::wstring m_user;
     std::vector<uint8_t> m_avatar;        // BGRA premultiplied, m_avatarPx square; empty = draw an initial
     int m_avatarPx = 0;

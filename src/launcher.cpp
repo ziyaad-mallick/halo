@@ -20,6 +20,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cwctype>
+#include <memory>
+#include <thread>
 
 // Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
 struct ICompositorDesktopInterop : IUnknown {
@@ -93,6 +95,7 @@ constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
 constexpr int kMaxApps = 6, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
 constexpr UINT_PTR kRefreshTimer = 1;
+constexpr UINT kMsgAppsFolder = WM_APP + 1;  // lParam: a Launcher::Found* from the Apps folder thread, owned by the panel
 constexpr float kPanelRadius = 28;  // local: theme.h has no panel-radius token
 // Icon motion, matched to the dock: hover swells and lifts on a spring, a press squashes, a click bounces.
 constexpr float kHoverScale = 1.18f, kHoverLift = 3, kPressScale = 0.94f, kBounceRise = 8;
@@ -262,6 +265,85 @@ void ScanLinks(std::wstring const& dir, std::vector<std::pair<std::wstring, std:
     FindClose(h);
 }
 
+// Every entry of the Apps folder, which is what Windows' own All apps list shows (Store apps included), as
+// (name, shell:AppsFolder\<id>). Documents and web links that installers put in the Start menu are left out.
+void ScanAppsFolder(Launcher::Found& out) {
+    winrt::com_ptr<IShellItem> folder;
+    winrt::com_ptr<IEnumShellItems> items;
+    if (FAILED(SHCreateItemFromParsingName(L"shell:AppsFolder", nullptr, IID_PPV_ARGS(folder.put()))) ||
+        FAILED(folder->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(items.put()))))
+        return;
+    for (winrt::com_ptr<IShellItem> item; items->Next(1, item.put(), nullptr) == S_OK; item = nullptr) {
+        wchar_t *name = nullptr, *id = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &name)) &&
+            SUCCEEDED(item->GetDisplayName(SIGDN_PARENTRELATIVEPARSING, &id)) && name[0] && id[0]) {
+            std::wstring lid = Lower(id);
+            bool doc = lid.starts_with(L"http");
+            for (auto ext : {L".txt", L".pdf", L".chm", L".htm", L".html", L".url", L".rtf"}) doc = doc || lid.ends_with(ext);
+            if (!doc) out.emplace_back(name, std::wstring(L"shell:AppsFolder\\") + id);
+        }
+        CoTaskMemFree(name);
+        CoTaskMemFree(id);
+    }
+}
+
+// The Settings pages search finds: the name Settings gives the page, other words people look for it by, its URI.
+struct SettingsPage {
+    const wchar_t* name;
+    const wchar_t* words;
+    const wchar_t* uri;
+};
+constexpr SettingsPage kSettingsPages[] = {
+    {L"Wi-Fi", L"wifi wireless internet network", L"ms-settings:network-wifi"},
+    {L"Ethernet", L"wired network cable", L"ms-settings:network-ethernet"},
+    {L"VPN", L"network", L"ms-settings:network-vpn"},
+    {L"Mobile hotspot", L"tethering share internet network", L"ms-settings:network-mobilehotspot"},
+    {L"Airplane mode", L"flight mode", L"ms-settings:network-airplanemode"},
+    {L"Proxy", L"network", L"ms-settings:network-proxy"},
+    {L"Bluetooth & devices", L"bluetooth pair headphones earbuds devices", L"ms-settings:bluetooth"},
+    {L"Printers & scanners", L"printer scanner print", L"ms-settings:printers"},
+    {L"Mouse", L"pointer cursor scroll", L"ms-settings:mousetouchpad"},
+    {L"Touchpad", L"trackpad gestures scroll", L"ms-settings:devices-touchpad"},
+    {L"Display", L"screen brightness resolution scale monitor", L"ms-settings:display"},
+    {L"Night light", L"blue light warm", L"ms-settings:nightlight"},
+    {L"Graphics", L"gpu", L"ms-settings:display-advancedgraphics"},
+    {L"Sound", L"audio volume speakers microphone output input", L"ms-settings:sound"},
+    {L"Notifications", L"do not disturb alerts", L"ms-settings:notifications"},
+    {L"Power & battery", L"battery sleep energy saver", L"ms-settings:powersleep"},
+    {L"Storage", L"disk space drive cleanup", L"ms-settings:storagesense"},
+    {L"Multitasking", L"snap windows alt tab", L"ms-settings:multitasking"},
+    {L"Clipboard", L"copy paste history", L"ms-settings:clipboard"},
+    {L"About", L"pc name specs system info windows version", L"ms-settings:about"},
+    {L"Recovery", L"reset this pc restore", L"ms-settings:recovery"},
+    {L"Activation", L"product key license", L"ms-settings:activation"},
+    {L"Background", L"wallpaper desktop picture", L"ms-settings:personalization-background"},
+    {L"Colors", L"dark mode light mode accent color theme", L"ms-settings:colors"},
+    {L"Themes", L"theme", L"ms-settings:themes"},
+    {L"Lock screen", L"lockscreen", L"ms-settings:lockscreen"},
+    {L"Fonts", L"font typeface", L"ms-settings:fonts"},
+    {L"Taskbar", L"tray", L"ms-settings:taskbar"},
+    {L"Installed apps", L"uninstall programs apps features remove", L"ms-settings:appsfeatures"},
+    {L"Default apps", L"open with browser default", L"ms-settings:defaultapps"},
+    {L"Startup apps", L"startup login programs", L"ms-settings:startupapps"},
+    {L"Optional features", L"features", L"ms-settings:optionalfeatures"},
+    {L"Your info", L"account profile picture", L"ms-settings:yourinfo"},
+    {L"Sign-in options", L"password pin windows hello fingerprint face", L"ms-settings:signinoptions"},
+    {L"Date & time", L"clock time zone timezone", L"ms-settings:dateandtime"},
+    {L"Language & region", L"language region locale", L"ms-settings:regionlanguage"},
+    {L"Typing", L"keyboard autocorrect", L"ms-settings:typing"},
+    {L"Gaming", L"game mode", L"ms-settings:gaming-gamemode"},
+    {L"Accessibility", L"ease of access", L"ms-settings:easeofaccess"},
+    {L"Text size", L"font size bigger text", L"ms-settings:easeofaccess-display"},
+    {L"Privacy & security", L"privacy permissions", L"ms-settings:privacy"},
+    {L"Camera privacy", L"webcam permissions", L"ms-settings:privacy-webcam"},
+    {L"Microphone privacy", L"mic permissions", L"ms-settings:privacy-microphone"},
+    {L"Location", L"gps location services privacy", L"ms-settings:privacy-location"},
+    {L"Windows Update", L"updates update upgrade", L"ms-settings:windowsupdate"},
+};
+// The Settings app: the icon of every Settings page in the results.
+constexpr wchar_t kSettingsApp[] =
+    L"shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+
 IReference<float3> Ref3(float3 v) { return v; }  // spring animations take IReference<float3>
 IReference<float2> Ref2(float2 v) { return v; }
 
@@ -425,30 +507,44 @@ void Launcher::LoadFiles() {
     m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min<size_t>(m_allFiles.size(), kMaxFiles));
 }
 
-// Every Start-menu shortcut (per user, then all users), once: what search looks through for apps.
+// Every app, once: the Start-menu shortcuts (per user, then all users) now, then what the Apps folder has that
+// they don't (Store apps such as Settings). What search and All apps look through.
 void Launcher::BuildIndex() {
     LARGE_INTEGER t0, t1, fq;
     QueryPerformanceCounter(&t0);
-    std::vector<std::pair<std::wstring, std::wstring>> found;
+    Found found;
     for (auto const& id : {FOLDERID_Programs, FOLDERID_CommonPrograms}) {
         wchar_t* dir = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &dir))) ScanLinks(dir, found, 0);
         CoTaskMemFree(dir);
     }
     m_index.clear();
-    std::vector<std::wstring> seen;
-    for (auto& [name, path] : found) {
-        auto lname = Lower(name);
-        if (lname.find(L"uninstall") != std::wstring::npos) continue;
-        if (std::find(seen.begin(), seen.end(), lname) != seen.end()) continue;  // the user's own entry wins
-        seen.push_back(lname);
-        m_index.push_back({name, lname, path});
-    }
+    AddToIndex(found);
     m_indexed = true;
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&fq);
     Log(L"app index: " + std::to_wstring(m_index.size()) + L" start-menu apps in " +
-        std::to_wstring((t1.QuadPart - t0.QuadPart) * 10000 / fq.QuadPart / 10.0) + L" ms");
+        std::to_wstring((t1.QuadPart - t0.QuadPart) * 10000 / fq.QuadPart / 10.0) + L" ms; reading the Apps folder");
+    // The Apps folder takes the best part of a second to list, so it is read on a thread of its own and merged
+    // when it posts back (kMsgAppsFolder).
+    std::thread([hwnd = m_hwnd] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        auto* more = new Found;
+        ScanAppsFolder(*more);
+        if (SUCCEEDED(co)) CoUninitialize();
+        if (!PostMessageW(hwnd, kMsgAppsFolder, 0, reinterpret_cast<LPARAM>(more))) delete more;
+    }).detach();
+}
+
+// Adds the apps whose name is not in the index yet (the first entry of a name wins), keeping it A to Z.
+void Launcher::AddToIndex(Found const& found) {
+    for (auto const& [name, path] : found) {
+        auto lname = Lower(name);
+        if (lname.find(L"uninstall") != std::wstring::npos) continue;
+        if (std::any_of(m_index.begin(), m_index.end(), [&](AppEntry const& e) { return e.lname == lname; })) continue;
+        m_index.push_back({name, lname, path});
+    }
+    std::sort(m_index.begin(), m_index.end(), [](AppEntry const& a, AppEntry const& b) { return a.lname < b.lname; });
 }
 
 // ---- Drawing --------------------------------------------------------------------------------
@@ -596,8 +692,9 @@ void Launcher::Build() {
     const float appsLabelY = searchBot + 16, appsTop = appsLabelY + kLabelH + 6;
     const float filesLabelY = m_showApps ? appsTop + kAppRowH + 14 : searchBot + 16, filesTop = filesLabelY + kLabelH + 6;
     const float fileRows = maxFiles > kFileCols ? 2.0f : 1.0f;
-    const float dividerY = m_showFiles ? filesTop + (fileRows - 1) * kFileRowPitch + kFileCellH + 12
-                                       : m_showApps ? appsTop + kAppRowH + 2 : searchBot + 12;
+    const float dividerY = std::max(m_showFiles ? filesTop + (fileRows - 1) * kFileRowPitch + kFileCellH + 12
+                                                : m_showApps ? appsTop + kAppRowH + 2 : searchBot + 12,
+                                    searchBot + 8 + 4 + kMaxResults * kResultRowH + 4);  // a page of results always fits
     const float bottomY = dividerY + 1;
     m_iconPx = kIconSize;
     m_h = std::round((bottomY + kBottomH) * s);
@@ -607,6 +704,8 @@ void Launcher::Build() {
     m_searchRect = R(kPad * s, kSearchTop * s, (kPad + innerW) * s, searchBot * s);
     m_appsLabel = R(kPad * s, appsLabelY * s, (kPad + innerW) * s, (appsLabelY + kLabelH) * s);
     m_filesLabel = R(kPad * s, filesLabelY * s, (kPad + innerW) * s, (filesLabelY + kLabelH) * s);
+    // "All apps" at the right end of the first label's line (its text, not its plate, on the margin).
+    m_allAppsRect = R((kPad + innerW + 8 - 104) * s, (appsLabelY - 6) * s, (kPad + innerW + 8) * s, (appsLabelY + kLabelH + 6) * s);
     m_divider = R(kPad * s, dividerY * s, (wl - kPad) * s, (dividerY + 1) * s);
     m_appCells.clear();
     m_fileCells.clear();
@@ -793,7 +892,7 @@ void Launcher::Build() {
 // Rebuilt on every keystroke; the glass, shadow and bars are not.
 void Launcher::BuildBody() {
     const float s = m_s;
-    const bool results = !m_query.empty();
+    const bool results = Listing();
     m_bodyIcons.Children().RemoveAll();
     m_appSprites.clear();
     m_fileSprites.clear();
@@ -819,12 +918,14 @@ void Launcher::BuildBody() {
 
     if (results) {
         for (size_t i = 0; i < m_results.size(); i++) {
-            float top = m_bodyTop + (4 + i * kResultRowH) * s;
+            float top = ListTop() + i * kResultRowH * s;
             auto row = R((kPad - 8) * s, top, m_w - (kPad - 8) * s, top + kResultRowH * s);
             m_resultRows.push_back(row);
             m_hits.push_back({row, Kind::Result, static_cast<int>(i)});
             auto const& r = m_results[i];
-            auto brush = r.app ? (m_host.appIcon ? m_host.appIcon(r.path) : nullptr) : FileBrush(r.path, kResultIcon);
+            auto brush = r.type == Result::Type::File ? FileBrush(r.path, kResultIcon)
+                         : m_host.appIcon ? m_host.appIcon(r.type == Result::Type::App ? r.path : kSettingsApp)
+                                          : nullptr;
             float ix = row.left + 12 * s, iy = row.top + (kResultRowH - kResultIcon) / 2 * s;
             sprite(brush, R(ix, iy, ix + kResultIcon * s, iy + kResultIcon * s));
         }
@@ -842,6 +943,7 @@ void Launcher::BuildBody() {
             m_fileSprites.push_back(sprite(FileBrush(m_files[i].path, kFileIcon), R(ix, iy, ix + kFileIcon * s, iy + kFileIcon * s)));
         }
     }
+    if (m_query.empty()) m_hits.push_back({m_allAppsRect, Kind::AllApps, 0});
     for (auto const& h : m_staticHits) m_hits.push_back(h);
     Redraw(m_bodySurface, &Launcher::DrawBody);
 
@@ -942,7 +1044,7 @@ void Launcher::DrawSearch(ID2D1DeviceContext* dc, float ox, float oy) {
     txt.Draw(dc, L"", fGlyph.get(), R(ox + 14 * s, oy, ox + 34 * s, oy + h), dim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
     const float left = 42 * s, area = w - left - 18 * s;
     if (m_query.empty()) {
-        txt.Draw(dc, L"Search apps and files", fText.get(), R(ox + left, oy, ox + left + area, oy + h), dim.get());
+        txt.Draw(dc, L"Search apps, settings and files", fText.get(), R(ox + left, oy, ox + left + area, oy + h), dim.get());
         return;
     }
     float tw = txt.Width(m_query, fText.get());
@@ -992,18 +1094,47 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
     auto fRow = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
     auto fName = txt.Format(L"Segoe UI Variable Text", 12 * s, DWRITE_FONT_WEIGHT_NORMAL);
 
-    if (!m_query.empty()) {
+    // "All apps ›" on the home view, "‹ Back" on the list.
+    if (m_query.empty()) {
+        auto fChevron = txt.Format(L"Segoe Fluent Icons", 9 * s, DWRITE_FONT_WEIGHT_NORMAL);
+        auto r = at(m_allAppsRect);
+        const float right = r.right - 8 * s;
+        if (m_allApps) {
+            float w = txt.Width(L"Back", fLabel.get());
+            txt.Draw(dc, L"Back", fLabel.get(), R(right - w - 2 * s, r.top, right, r.bottom), soft.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+            txt.Draw(dc, L"\uE76B", fChevron.get(), R(right - w - 18 * s, r.top, right - w - 6 * s, r.bottom), soft.get(),
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            txt.Draw(dc, L"\uE76C", fChevron.get(), R(right - 12 * s, r.top, right, r.bottom), soft.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            txt.Draw(dc, L"All apps", fLabel.get(), R(r.left, r.top, right - 16 * s, r.bottom), soft.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+    }
+
+    if (Listing()) {
+        if (ListHeader()) txt.Draw(dc, L"ALL APPS", fLabel.get(), at(m_appsLabel), dim.get());
         if (m_results.empty())
-            txt.Draw(dc, L"No results for \"" + m_query + L"\"", fRow.get(),
-                     R(ox + kPad * s, oy + 4 * s, ox + m_w - kPad * s, oy + (4 + kResultRowH) * s), dim.get(),
+            txt.Draw(dc, m_query.empty() ? std::wstring(L"No apps found") : L"No results for \"" + m_query + L"\"", fRow.get(),
+                     at(R(kPad * s, ListTop(), m_w - kPad * s, ListTop() + kResultRowH * s)), dim.get(),
                      DWRITE_TEXT_ALIGNMENT_LEADING, true);
         for (size_t i = 0; i < m_results.size(); i++) {
             auto const& row = m_resultRows[i];
             float textX = row.left + (12 + kResultIcon + 12) * s;
-            txt.Draw(dc, m_results[i].name, fRow.get(), at(R(textX, row.top, row.right - 64 * s, row.bottom)), white.get(),
+            txt.Draw(dc, m_results[i].name, fRow.get(), at(R(textX, row.top, row.right - 72 * s, row.bottom)), white.get(),
                      DWRITE_TEXT_ALIGNMENT_LEADING, true);
-            txt.Draw(dc, m_results[i].app ? L"App" : L"File", fName.get(), at(R(row.right - 60 * s, row.top, row.right - 14 * s, row.bottom)),
-                     dim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+            if (ListHeader()) continue;  // every row of All apps is an app
+            static constexpr const wchar_t* kTypeNames[] = {L"App", L"Setting", L"File"};
+            txt.Draw(dc, kTypeNames[static_cast<int>(m_results[i].type)], fName.get(),
+                     at(R(row.right - 68 * s, row.top, row.right - 14 * s, row.bottom)), dim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        // A thin thumb in the right margin when there is more than fits.
+        const int total = static_cast<int>(m_matches.size()), rows = ListRows();
+        if (total > rows) {
+            const float track = rows * kResultRowH * s, h = std::max(24 * s, track * rows / total);
+            const float y = ListTop() + (track - h) * m_scroll / (total - rows), x = m_w - (kPad - 8) * s + 3 * s;
+            winrt::com_ptr<ID2D1SolidColorBrush> thumb;
+            dc->CreateSolidColorBrush(pal.dim, thumb.put());
+            thumb->SetOpacity(0.5f);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(at(R(x, y, x + 3 * s, y + h)), 1.5f * s, 1.5f * s), thumb.get());
         }
         return;
     }
@@ -1053,8 +1184,11 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     m_anchor = anchor;
     m_s = anchor.scale;
     m_query.clear();
+    m_matches.clear();
     m_results.clear();
     m_sel = 0;
+    m_scroll = 0;
+    m_allApps = false;
     m_activated = false;
     ++m_gen;
 
@@ -1217,13 +1351,19 @@ void Launcher::Refresh() {
 
 // ---- Search -------------------------------------------------------------------------------------
 
-// Start-menu apps and recent files whose names match the query: names that start with it first, then names with
-// a word that does, then the rest; shorter names win ties, apps win over files.
+// Apps, Settings pages and recent files whose names match the query: names that start with it first, then names
+// with a word that does, then the rest (a Settings page also matches on the other words it is known by, never
+// first); shorter names win ties, then apps, Settings, files. With no query, All apps is every app, A to Z.
 void Launcher::RunSearch() {
-    m_results.clear();
+    m_matches.clear();
     std::wstring q = Lower(m_query);
     while (!q.empty() && q.back() == L' ') q.pop_back();
-    if (q.empty()) return;
+    if (q.empty()) {
+        if (m_allApps)
+            for (auto const& a : m_index) m_matches.push_back({Result::Type::App, a.name, a.path});
+        ShowMatches();
+        return;
+    }
     struct Scored {
         int rank;
         size_t len;
@@ -1231,21 +1371,58 @@ void Launcher::RunSearch() {
     };
     std::vector<Scored> hits;
     for (auto const& a : m_index)
-        if (int rk = MatchRank(a.lname, q); rk >= 0) hits.push_back({rk, a.name.size(), {true, a.name, a.path}});
+        if (int rk = MatchRank(a.lname, q); rk >= 0) hits.push_back({rk, a.name.size(), {Result::Type::App, a.name, a.path}});
+    for (auto const& p : kSettingsPages) {
+        int rk = MatchRank(Lower(p.name), q);
+        if (rk < 0) rk = MatchRank(L" " + std::wstring(p.words), q);  // the leading space: a word start ranks 1, never 0
+        if (rk >= 0) hits.push_back({rk, wcslen(p.name), {Result::Type::Setting, p.name, p.uri}});
+    }
     for (auto const& f : m_allFiles)
-        if (int rk = MatchRank(Lower(f.name), q); rk >= 0) hits.push_back({rk, f.name.size(), {false, f.name, f.path}});
+        if (int rk = MatchRank(Lower(f.name), q); rk >= 0) hits.push_back({rk, f.name.size(), {Result::Type::File, f.name, f.path}});
     std::stable_sort(hits.begin(), hits.end(), [](Scored const& a, Scored const& b) {
         if (a.rank != b.rank) return a.rank < b.rank;
         if (a.len != b.len) return a.len < b.len;
-        return a.r.app && !b.r.app;
+        return a.r.type < b.r.type;
     });
-    for (size_t i = 0; i < hits.size() && i < kMaxResults; i++) m_results.push_back(std::move(hits[i].r));
-    m_sel = std::clamp(m_sel, 0, std::max(0, static_cast<int>(m_results.size()) - 1));  // Refresh() re-runs this
+    for (auto& h : hits) m_matches.push_back(std::move(h.r));
+    ShowMatches();  // Refresh() re-runs this: the scroll and selection hold where they can
+}
+
+float Launcher::ListTop() const { return ListHeader() ? m_appsLabel.bottom + 6 * m_s : m_bodyTop + 4 * m_s; }
+
+int Launcher::ListRows() const {
+    return std::max(1, static_cast<int>(std::floor((m_bodyBottom - ListTop()) / (kResultRowH * m_s))));
+}
+
+void Launcher::ShowMatches() {
+    const int total = static_cast<int>(m_matches.size()), rows = ListRows();
+    m_scroll = std::clamp(m_scroll, 0, std::max(0, total - rows));
+    m_results.assign(m_matches.begin() + m_scroll, m_matches.begin() + std::min(total, m_scroll + rows));
+    m_sel = std::clamp(m_sel, 0, std::max(0, static_cast<int>(m_results.size()) - 1));
+}
+
+// Moves the list by whole rows; the selected item stays selected while it is on screen.
+void Launcher::Scroll(int rows) {
+    const int before = m_scroll;
+    m_scroll += rows;
+    ShowMatches();
+    if (m_scroll == before) return;
+    m_sel = std::clamp(m_sel - (m_scroll - before), 0, std::max(0, static_cast<int>(m_results.size()) - 1));
+    BuildBody();
+}
+
+void Launcher::ToggleAllApps() {
+    m_allApps = !m_allApps;
+    m_scroll = 0;
+    m_sel = 0;
+    RunSearch();
+    BuildBody();
 }
 
 void Launcher::QueryChanged() {
-    RunSearch();
+    m_scroll = 0;
     m_sel = 0;
+    RunSearch();
     SearchDraw();
     BuildBody();
 }
@@ -1263,7 +1440,7 @@ void Launcher::Activate(Kind kind, int index) {
         if (index < static_cast<int>(m_fileSprites.size())) BounceIcon(m_fileSprites[index]);
     } else if (kind == Kind::Result && index >= 0 && index < static_cast<int>(m_results.size())) {
         path = m_results[index].path;
-        app = m_results[index].app;
+        app = m_results[index].type == Result::Type::App;
     } else {
         return;
     }
@@ -1277,22 +1454,26 @@ void Launcher::Activate(Kind kind, int index) {
 
 void Launcher::OnKey(WPARAM vk) {
     switch (vk) {
-        case VK_ESCAPE:  // closes the Power menu first, then clears the query, then the panel
+        case VK_ESCAPE:  // closes the Power menu first, then clears the query, then leaves All apps, then the panel
             if (m_menuOpen) ToggleMenu(false);
             else if (!m_query.empty()) {
                 m_query.clear();
                 QueryChanged();
-            } else Hide();
+            } else if (m_allApps) ToggleAllApps();
+            else Hide();
             break;
         case VK_RETURN:
             if (!m_menuOpen && !m_results.empty()) Activate(Kind::Result, m_sel);
             break;
         case VK_UP:
-        case VK_DOWN:
+        case VK_DOWN: {  // past the first or last row, the list scrolls
             if (m_menuOpen || m_results.empty()) break;
-            m_sel = std::clamp(m_sel + (vk == VK_DOWN ? 1 : -1), 0, static_cast<int>(m_results.size()) - 1);
+            const int d = vk == VK_DOWN ? 1 : -1;
+            if (m_sel + d < 0 || m_sel + d >= static_cast<int>(m_results.size())) Scroll(d);
+            m_sel = std::clamp(m_sel + d, 0, static_cast<int>(m_results.size()) - 1);
             Highlight(&m_resultRows[m_sel], 12, false);
             break;
+        }
     }
 }
 
@@ -1395,7 +1576,7 @@ void Launcher::OnHover(float x, float y) {
         if (ic) SpringIcon(*ic, true);
         m_hoverIcon = ic;
     }
-    const bool results = !m_results.empty() && !m_query.empty();
+    const bool results = !m_results.empty() && Listing();
     if (!hit) {
         if (results) Highlight(&m_resultRows[m_sel], 12, false);  // the plate stays on the selection
         else Highlight(nullptr, 0, false);
@@ -1406,7 +1587,7 @@ void Launcher::OnHover(float x, float y) {
     } else {
         D2D1_RECT_F r = hit->r;
         if (hit->kind == Kind::Result) m_sel = hit->index;
-        Highlight(&r, hit->kind == Kind::App ? 14 : 12, false);
+        Highlight(&r, hit->kind == Kind::App ? 14 : hit->kind == Kind::AllApps ? 8 : 12, false);
         if (m_menuOpen) Highlight(nullptr, 0, true);
     }
 }
@@ -1444,6 +1625,7 @@ void Launcher::Click(Hit const& hit) {
             ShellExecuteW(nullptr, L"open", L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL);
             break;
         case Kind::Power: ToggleMenu(!m_menuOpen); break;
+        case Kind::AllApps: ToggleAllApps(); break;
         case Kind::MenuItem: {
             int item = hit.index;
             Hide();
@@ -1498,6 +1680,10 @@ void Launcher::TestCommand(WPARAM w) {
             v.Scale({kHoverScale, kHoverScale, 1.0f});
             v.Offset({v.Offset().x, m_hoverIcon->restY - kHoverLift * m_s, 0});
         }
+    } else if (w == 21) {
+        ToggleAllApps();
+    } else if (w == 22) {
+        Scroll(5);
     }
 }
 
@@ -1559,6 +1745,33 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 m_tracking = TrackMouseEvent(&tme);
             }
             if (m_open) OnHover(mx - m_shadowM, my);
+            return 0;
+        case kMsgAppsFolder: {
+            std::unique_ptr<Found> more(reinterpret_cast<Found*>(l));
+            const size_t before = m_index.size();
+            AddToIndex(*more);
+            Log(L"app index: " + std::to_wstring(m_index.size() - before) + L" more from the Apps folder, " +
+                std::to_wstring(m_index.size()) + L" apps");
+            if (m_open && Listing()) {  // what is on screen may have changed
+                RunSearch();
+                BuildBody();
+            }
+            return 0;
+        }
+        case WM_MOUSEWHEEL:  // three rows a notch; a touchpad's smaller steps add up
+            if (m_open && !m_menuOpen && Listing()) {
+                m_wheel -= GET_WHEEL_DELTA_WPARAM(w) * 3;
+                const int rows = m_wheel / WHEEL_DELTA;
+                m_wheel -= rows * WHEEL_DELTA;
+                if (rows) {
+                    Scroll(rows);
+                    POINT p;  // the list moved under a still pointer: hover what is there now
+                    if (GetCursorPos(&p) && ScreenToClient(m_hwnd, &p)) {
+                        m_hoverIndex = -2;
+                        OnHover(p.x - m_shadowM, static_cast<float>(p.y));
+                    }
+                }
+            }
             return 0;
         case WM_MOUSELEAVE:
             m_tracking = false;
