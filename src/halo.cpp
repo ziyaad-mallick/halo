@@ -154,7 +154,7 @@ private:
     wuc::ContainerVisual BuildPill(int noiseHeight = 0, float radius = 0.0f, halo::settings::Surface const* glass = nullptr);
     void ComputeMetrics();
     void ApplySettings(bool themeFlipped = false);
-    void RebuildDock();
+    void RebuildDock(bool keepIcons = false);
     wuc::SpriteVisual BuildPillShadow(wuc::ContainerVisual const& pill);
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
@@ -184,7 +184,7 @@ private:
     LRESULT DockIconForWindow(HWND win, LPARAM op);
     void StartHide();
     RECT GetPillRectScreen() const;
-    void MigrateToMonitor(HMONITOR mon);
+    void MigrateToMonitor(HMONITOR mon, bool reveal = true);
     wuc::CompositionDrawingSurface MakeSurface(Size size);
     wuc::CompositionBrush MakeIconBrush(IconImage const& icon, float size);
 
@@ -595,8 +595,8 @@ void Halo::ApplySettings(bool themeFlipped) {
 }
 
 // The pill, icons, cluster and label are rebuilt with the current settings; the window resizes if the icon
-// size or magnification moved its height.
-void Halo::RebuildDock() {
+// size or magnification moved its height. keepIcons: the icon surfaces are still the right size and look.
+void Halo::RebuildDock(bool keepIcons) {
     if (!m_dock) return;
     HidePreviews(true);
     if (m_menu && m_menu->IsOpen()) m_menu->Close();
@@ -608,7 +608,7 @@ void Halo::RebuildDock() {
     m_dock->Detach();
     m_dock.reset();
     m_cluster.reset();
-    m_brushes.clear();  // icon surfaces are sized for the old icon size
+    if (!keepIcons) m_brushes.clear();  // icon surfaces are sized for the old icon size
     ComputeMetrics();
     const int x = m_monitor.left, y = m_monitor.bottom - m_height;
     m_full = {x, y, x + m_width, y + m_height};
@@ -824,8 +824,11 @@ void Halo::ComputeMetrics() {
     m_metrics.centerX = m_width / 2.0f;
 }
 
-void Halo::MigrateToMonitor(HMONITOR mon) {
-    if (!mon || mon == m_currentMon) return;
+// Seats the dock on `mon`: the cursor reached its bottom edge, or (WM_DISPLAYCHANGE) the monitor it was on changed
+// resolution or scale, or went away. The Dock keeps its own copy of the metrics (centre, bottom, icon size), so a
+// different size or scale means a rebuild, not just moving the window.
+void Halo::MigrateToMonitor(HMONITOR mon, bool reveal) {
+    if (!mon) return;
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(mon, &mi)) return;
 
@@ -833,7 +836,9 @@ void Halo::MigrateToMonitor(HMONITOR mon) {
     GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     float newScale = dpiX / 96.0f;
     bool dpiChanged = std::abs(m_scale.v - newScale) > 0.001f;
+    if (mon == m_currentMon && !dpiChanged && EqualRect(&mi.rcMonitor, &m_monitor)) return;  // nothing moved
 
+    const float iconPx = std::ceil(m_metrics.restSize * m_metrics.maxScale);
     m_currentMon = mon;
     m_monitor = mi.rcMonitor;
     m_width = m_monitor.right - m_monitor.left;
@@ -847,15 +852,11 @@ void Halo::MigrateToMonitor(HMONITOR mon) {
     SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, m_width, m_height, SWP_NOACTIVATE);
 
     if (m_multimon) m_multimon->SetCurrentMonitor(mon);
-    if (m_label) m_label->SetScale(m_scale.v);
-    if (m_intellihide) {
-        m_intellihide->SetMonitor(mon, m_monitor);
-        m_intellihide->SetDockRect(GetPillRectScreen());
-    }
+    if (m_intellihide) m_intellihide->SetMonitor(mon, m_monitor);
 
-    UpdateRegion();
-    if (dpiChanged) RefreshDock();
-    Reveal();
+    if (m_dock) RebuildDock(std::ceil(m_metrics.restSize * m_metrics.maxScale) == iconPx);  // also sets the label's scale, the input region and the intellihide rect
+    else UpdateRegion();
+    if (reveal) Reveal();
 }
 
 // Limits the window's input to the dock (and the bar of it a hidden dock
@@ -1333,6 +1334,12 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_DISPLAYCHANGE:
             if (m_multimon) m_multimon->OnDisplayChange();
             halo::edge::OnDisplayChange();
+            {  // the dock's monitor may be gone (unplugged, laptop docked / undocked) or have a new size or scale
+                MONITORINFO mi{sizeof(mi)};
+                HMONITOR mon = m_currentMon;
+                if (!mon || !GetMonitorInfoW(mon, &mi)) mon = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+                MigrateToMonitor(mon, false);  // no reveal: nothing summoned it, and nothing would hide it again
+            }
             return 0;
         case kMsgEdge:
             Log(w == halo::edge::kBottom ? L"edge: bottom right" : w == halo::edge::kTop ? L"edge: top" : L"edge: right");
