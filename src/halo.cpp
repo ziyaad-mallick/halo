@@ -80,6 +80,7 @@ constexpr int kDockFadeMs = 180;          // the fade of the non-rise reveal eff
 constexpr float kDockTravel = 24;         // logical px a swipe / swoop reveal moves
 constexpr float kLabelRoom = 34;  // logical px above a magnified icon: a 6 px gap and the name label
 constexpr int kStripPx = 2;               // hit strip left on the screen edge while hidden
+constexpr size_t kMenuWindows = 10;       // windows listed in an icon's right-click menu; the rest are counted
 
 constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
 // Test hook (HALO_TEST=1): simulate the pointer without touching the real one.
@@ -933,12 +934,15 @@ void Halo::OpenMenuFor(int item) {
 
     std::vector<halo::MenuEntry> entries;
     if (running) {
+        size_t more = 0;
         for (HWND w : m_tracker->WindowsOf(it.key)) {
             if (!IsWindow(w)) continue;
+            if (entries.size() >= kMenuWindows) { more++; continue; }  // 30 windows of one app would run the menu off the screen
             wchar_t t[256] = {};
             GetWindowTextW(w, t, ARRAYSIZE(t));
             entries.push_back({t[0] ? t : L"Untitled", false, [this, w] { ActivateWindow(w); }});
         }
+        if (more) entries.push_back({std::to_wstring(more) + (more == 1 ? L" more window" : L" more windows"), false, nullptr});
         if (!entries.empty()) entries.push_back({L"", true, nullptr});
     }
     if (pinned) {
