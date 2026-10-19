@@ -253,6 +253,7 @@ std::wstring BestLogoFile(const std::wstring& logo, bool light) {
     const std::wstring dir = slash == std::wstring::npos ? L"" : logo.substr(0, slash + 1);
     const std::wstring file = logo.substr(dir.size());
     const auto dot = file.rfind(L'.');
+    if (dot == std::wstring::npos) return logo;  // no extension to build the variants' names from
     const std::wstring stem = file.substr(0, dot), ext = file.substr(dot);
     const std::wstring want = light ? L"lightunplated" : L"unplated";
 
@@ -263,6 +264,7 @@ std::wstring BestLogoFile(const std::wstring& logo, bool light) {
     if (find == INVALID_HANDLE_VALUE) return logo;
     do {
         std::wstring q = fd.cFileName;
+        if (q.size() < stem.size() + 1 + ext.size()) continue;  // a short (8.3) alias can match the pattern too
         q = q.substr(stem.size() + 1, q.size() - stem.size() - 1 - ext.size());
         std::wstring altform;
         int target = 0, scale = 0;
@@ -306,7 +308,9 @@ std::wstring ManifestLogo(const std::wstring& pkgDir, const std::wstring& appId)
                            OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return {};
     Owned<HANDLE, &CloseHandle> file(f);
-    std::string utf8(GetFileSize(f, nullptr), '\0');
+    const DWORD fileSize = GetFileSize(f, nullptr);
+    if (fileSize == INVALID_FILE_SIZE || fileSize > (8u << 20)) return {};  // a manifest is a few KB
+    std::string utf8(fileSize, '\0');
     DWORD got = 0;
     if (!ReadFile(f, utf8.data(), static_cast<DWORD>(utf8.size()), &got, nullptr)) return {};
     std::wstring xml(utf8.size(), L'\0');
