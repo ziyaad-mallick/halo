@@ -1275,6 +1275,15 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
         }
         return;
     }
+    // A spring left running by a close in mid-drawer would keep pulling these to the old height and win over
+    // the plain sets below, so the reopened frame would not match its content: stop them first.
+    pill.StopAnimation(L"Size");
+    inner.StopAnimation(L"Size");
+    clip.StopAnimation(L"Size");
+    rim.StopAnimation(L"Size");
+    if (shadowV) shadowV.StopAnimation(L"Size");
+    if (specGeo) specGeo.StopAnimation(L"Size");
+    if (ghost) { inner.Children().Remove(ghost); ghost = nullptr; }
     pill.Size({wPx, hPx});
     inner.Size({wPx, hPx});
     if (shadowV) shadowV.Size({wPx, hPx});
