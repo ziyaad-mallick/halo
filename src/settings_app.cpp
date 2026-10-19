@@ -621,11 +621,12 @@ void TagWindow(HWND h) {
     SendMessageTimeoutW(h, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(title), SMTO_ABORTIFHUNG, 500, nullptr);
 }
 
-// Edge's window belongs to another process and turns up when it likes: look for it for up to 15 s.
-std::thread TagWhenShown() {
-    return std::thread([] {
+// Edge's window belongs to another process and turns up when it likes: look for it for up to `tries` x 50 ms
+// (15 s for the first window; the relaunch path joins this thread, so it passes less).
+std::thread TagWhenShown(int tries = 300) {
+    return std::thread([tries] {
         HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        for (int i = 0; i < 300; i++, Sleep(50))
+        for (int i = 0; i < tries; i++, Sleep(50))
             if (HWND h = FindSettingsWindow()) {
                 TagWindow(h);
                 break;
@@ -684,7 +685,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             std::wstring edge = FindEdge();
             if (!url.empty() && !edge.empty()) {
                 CloseHandle(LaunchEdge(edge, Wide(url), uiDir));
-                TagWhenShown().join();
+                TagWhenShown(120).join();  // 6 s: this process only lingers for it, windowless
             }
             else if (!url.empty()) ShellExecuteW(nullptr, L"open", Wide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
@@ -696,14 +697,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     for (unsigned char b : rnd) { char h[3]; snprintf(h, sizeof h, "%02x", b); g_token += h; }
 
     SOCKET ls = StartServer();
-    if (ls == INVALID_SOCKET) return 2;
+    if (ls == INVALID_SOCKET) {  // a -mwindows exe has no console: without this, clicking Halo Settings would do nothing at all
+        MessageBoxW(nullptr, L"Halo Settings could not start its local server (127.0.0.1). Check that a firewall or security tool is not blocking it.",
+                    L"Halo Settings", MB_OK | MB_ICONWARNING);
+        return 2;
+    }
     g_lastRequest = GetTickCount64();
     std::thread(StatsThread).detach();
     std::thread([ls] {
         for (;;) {
             SOCKET c = accept(ls, nullptr, nullptr);
-            if (c == INVALID_SOCKET) { if (WSAGetLastError() == WSAEINTR) continue; break; }
-            std::thread(Handle, c).detach();
+            if (c == INVALID_SOCKET) {  // a reset or aborted connection must not end the server for good
+                int e = WSAGetLastError();
+                if (e == WSAENOTSOCK || e == WSAEINVAL || e == WSANOTINITIALISED) break;
+                if (e != WSAEINTR) Sleep(10);
+                continue;
+            }
+            try { std::thread(Handle, c).detach(); } catch (...) { closesocket(c); }  // out of threads: drop this one
         }
     }).detach();
 
@@ -723,7 +733,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         CloseHandle(proc);
         if (GetTickCount64() - t0 < 5000) {
             // Edge handed the window to an already-running process of the same profile: wait for the window itself.
-            for (int gone = 0; gone < 3; Sleep(1000)) gone = FindSettingsWindow() ? 0 : gone + 1;
+            // A slow machine can take a while to show the window: only count it gone once it has been seen, or after 20 s.
+            bool seen = false;
+            for (int gone = 0; gone < 3; Sleep(1000)) {
+                if (FindSettingsWindow()) { seen = true; gone = 0; }
+                else if (seen || GetTickCount64() - t0 > 20000) gone++;
+            }
         }
     } else {
         // No Edge: default browser, and leave once the page stops polling.

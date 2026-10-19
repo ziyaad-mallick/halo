@@ -135,7 +135,7 @@ Values Read() {
     if (!f) return out;
     std::string text;
     char buf[4096];
-    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    for (size_t n; text.size() < (1 << 20) && (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);  // ~1 KB in practice; a runaway file is not read whole
     fclose(f);
     if (text.rfind("\xEF\xBB\xBF", 0) == 0) text.erase(0, 3);
     std::string section;
@@ -236,7 +236,9 @@ bool Write(Values const& v) {
     if (!f) return false;
     bool ok = fwrite(out.data(), 1, out.size(), f) == out.size();
     ok = fclose(f) == 0 && ok;
-    return ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    ok = ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!ok) DeleteFileW(tmp.c_str());  // read-only target, full disk: do not leave the half-written copy behind
+    return ok;
 }
 
 const Settings& Get() {

@@ -6,7 +6,7 @@
 //                  Settings pages and recent files; Enter launches the selected result
 //   Recent apps  - up to 6, an MRU kept in %LOCALAPPDATA%\Halo\recent.txt; "All apps" lists every app, A to Z
 //   Recent files - 2 x 6 from the shell's Recent folder, newest first
-//   user · Settings · Power (Sleep, Restart, Shut down, Lock, Sign out)
+//   user · Settings · Power (Sleep, Restart, Shut down, Lock, Sign out, Use Windows taskbar)
 //
 // A top-level window of its own on the dock's compositor (the dock's window is only one pill tall).
 // Event-driven: it closes when it loses activation or on Esc; nothing polls (the caret blinks on the
@@ -70,7 +70,7 @@ public:
     // Remembers an app for "Recent apps" (a launch target as the host's `launch` takes it).
     void Note(std::wstring const& target);
 
-    // HALO_TEST: wParam 2 = toggle the Power menu, 3+n = run Power item n (dry run), 9 = pretend the panel
+    // HALO_TEST: wParam 2 = toggle the Power menu, 3+n = run Power item n (dry run, n 0-5), 9 = pretend the panel
     // lost activation (a click elsewhere), 20 = snap the hover plate and icon to where their animations end,
     // 21 = toggle All apps, 22 = scroll the list down 5 rows.
     void TestCommand(WPARAM w);
