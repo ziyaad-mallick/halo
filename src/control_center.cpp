@@ -305,7 +305,14 @@ LRESULT CALLBACK ControlCenter::Impl::HotThunk(HWND h, UINT m, WPARAM w, LPARAM 
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     if (self && m == kMsgMedia) { self->media.Pull(); return 0; }
-    if (self && (m == kMsgAudio || m == kMsgMic || m == kMsgRadios || m == kMsgBt)) return self->PanelProc(h, m, w, l);
+    if (self && (m == kMsgAudio || m == kMsgMic || m == kMsgRadios || m == kMsgBt)) {
+        try {
+            return self->PanelProc(h, m, w, l);
+        } catch (winrt::hresult_error const& e) {  // posted by foreign-thread events: nothing above us catches
+            svc::Log(L"hot message " + std::to_wstring(m) + L" failed: " + std::wstring(e.message().c_str()));
+            return 0;
+        }
+    }
     if (self && m == WM_TIMER && w == kTimerChord) {
         KillTimer(h, kTimerChord);
         svc::SendWinChord(self->chordKey, self->chordShift);

@@ -507,7 +507,11 @@ LRESULT CALLBACK NotificationCenter::Impl::MsgThunk(HWND h, UINT m, WPARAM w, LP
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     if (m == kMsgData) {
         std::unique_ptr<Snapshot> snap(reinterpret_cast<Snapshot*>(l));
-        if (self) self->OnSnapshot(*snap);
+        try {
+            if (self) self->OnSnapshot(*snap);
+        } catch (winrt::hresult_error const& e) {
+            svc::Log(L"notifications: update failed: " + std::wstring(e.message().c_str()));
+        }
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -617,7 +621,13 @@ void NotificationCenter::Impl::ShiftMonth(int d) {
 LRESULT CALLBACK NotificationCenter::Impl::Thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self ? self->Proc(h, m, w, l) : DefWindowProcW(h, m, w, l);
+    if (!self) return DefWindowProcW(h, m, w, l);
+    try {
+        return self->Proc(h, m, w, l);
+    } catch (winrt::hresult_error const& e) {  // a failed WinRT call (a card's visuals, say) must never take the dock down
+        svc::Log(L"notifications: message " + std::to_wstring(m) + L" failed: " + std::wstring(e.message().c_str()));
+        return DefWindowProcW(h, m, w, l);
+    }
 }
 
 // x, y in panel coordinates (logical). part: 0 body, 1 x, 2 Clear, 3 prev month, 4 next month, 5 month label, -1 inert.
