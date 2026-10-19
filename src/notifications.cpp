@@ -1211,9 +1211,11 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     // heights first, then keep the prefix that fits under the card limit
     struct Sized { Row r; float h; };
     std::vector<Sized> sized;
+    int counted = 0;
     for (auto& r : src) {
         float h;
         if (r.kind == K::Collapse) h = kCollapseH;
+        else if (++counted > (attached ? kMaxCardsAttached : kMaxCards) + 1) h = 0;  // past the card limit: only "N more" counts it, so skip the text layouts (hundreds of toasts)
         else {
             int lines = 0;
             std::wstring b = r.n.body;
