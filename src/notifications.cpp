@@ -463,12 +463,14 @@ void NotificationCenter::Impl::Worker() {
     HANDLE h[3] = {evStop, evReq, watch};
     for (;;) {
         DWORD r = WaitForMultipleObjects(watch ? 3 : 2, h, FALSE, INFINITE);
-        if (r == WAIT_OBJECT_0) break;
+        if (r == WAIT_OBJECT_0 || r == WAIT_FAILED) break;  // a failed wait (a dead handle) would otherwise spin this loop at full speed
         if (r == WAIT_OBJECT_0 + 2) {
             FindNextChangeNotification(watch);
             if (!visible) continue;  // the next Open asks for a fresh read anyway
-            // The database writes in bursts; settle first.
-            for (int i = 0; i < 10 && WaitForSingleObject(watch, 250) == WAIT_OBJECT_0; ++i) FindNextChangeNotification(watch);
+            // The database writes in bursts; settle first (and let a quit through: Stop() joins this thread).
+            const HANDLE burst[2] = {watch, evStop};
+            for (int i = 0; i < 10 && WaitForMultipleObjects(2, burst, FALSE, 250) == WAIT_OBJECT_0; ++i) FindNextChangeNotification(watch);
+            if (WaitForSingleObject(evStop, 0) == WAIT_OBJECT_0) break;
             svc::Log(L"notifications: database changed");
         }
         if (!visible) continue;
