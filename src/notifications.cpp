@@ -385,14 +385,18 @@ Snapshot NotificationCenter::Impl::Query(std::set<std::wstring>& iconDone) {
         for (auto const& un : list) {
             Notif n;
             n.id = un.Id();
-            auto info = un.AppInfo();
-            n.aumid = info.AppUserModelId().c_str();
-            n.app = info.DisplayInfo().DisplayName().c_str();
+            // A toast whose app was uninstalled can have no AppInfo; one such toast must not blank the whole list.
+            winrt::Windows::ApplicationModel::AppInfo info{nullptr};
+            try {
+                info = un.AppInfo();
+                n.aumid = info.AppUserModelId().c_str();
+                n.app = info.DisplayInfo().DisplayName().c_str();
+            } catch (...) { info = nullptr; }
             n.appKey = n.aumid.empty() ? n.app : n.aumid;
-            {
+            try {
                 FILETIME f = winrt::clock::to_file_time(un.CreationTime());
                 n.ft = (static_cast<LONGLONG>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
-            }
+            } catch (...) {}
             std::vector<std::wstring> texts;
             try {
                 auto vis = un.Notification().Visual();
@@ -416,7 +420,7 @@ Snapshot NotificationCenter::Impl::Query(std::set<std::wstring>& iconDone) {
             IconPx ic;
             const wchar_t* src = nullptr;
             try {
-                auto ref = info.DisplayInfo().GetLogo({72, 72});  // null for some apps (Windows Security)
+                auto ref = info ? info.DisplayInfo().GetLogo({72, 72}) : nullptr;  // null for some apps (Windows Security)
                 if (ref) {
                     auto stream = ref.OpenReadAsync().get();
                     winrt::Windows::Storage::Streams::DataReader rd(stream);
