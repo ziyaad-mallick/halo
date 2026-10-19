@@ -360,21 +360,23 @@ namespace wdr = winrt::Windows::Devices::Radios;
 
 void Radios::Start(HWND notify, UINT msg) {
     Stop();
-    Find(notify, msg, m_gen);
+    m_notify = notify;
+    m_msg = msg;
+    Find(notify, msg, m_gen, *m_gen);
 }
 
 void Radios::Stop() {
-    m_gen++;
+    ++*m_gen;
     m_wifiRev.revoke();
     m_btRev.revoke();
     m_wifi = nullptr;
     m_bt = nullptr;
 }
 
-winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, unsigned gen) {
+winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, std::shared_ptr<unsigned> live, unsigned gen) {
     try {
         auto radios = co_await wdr::Radio::GetRadiosAsync();  // resumes on the UI thread
-        if (gen != m_gen) co_return;
+        if (gen != *live) co_return;
         for (auto const& r : radios) {
             auto handler = [notify, msg](auto&&, auto&&) { PostMessageW(notify, msg, 0, 0); };
             if (r.Kind() == wdr::RadioKind::WiFi && !m_wifi) { m_wifi = r; m_wifiRev = r.StateChanged(winrt::auto_revoke, handler); }
@@ -384,17 +386,22 @@ winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, unsigned gen) {
     PostMessageW(notify, msg, 0, 0);
 }
 
-bool Radios::WifiOn() const { return m_wifi && m_wifi.State() == wdr::RadioState::On; }
-bool Radios::BluetoothOn() const { return m_bt && m_bt.State() == wdr::RadioState::On; }
+// An unplugged USB adapter leaves a closed Radio whose State() throws.
+static bool RadioIsOn(wdr::Radio const& r) {
+    try { return r && r.State() == wdr::RadioState::On; } catch (...) { return false; }
+}
+bool Radios::WifiOn() const { return RadioIsOn(m_wifi); }
+bool Radios::BluetoothOn() const { return RadioIsOn(m_bt); }
 
-winrt::fire_and_forget Radios::Set(wdr::Radio radio, bool on) {
+winrt::fire_and_forget Radios::Set(wdr::Radio radio, bool on, HWND notify, UINT msg) {
     if (!radio) co_return;
     if (DryRun()) { Log(std::wstring(L"DRYRUN radio ") + (radio.Kind() == wdr::RadioKind::WiFi ? L"wifi" : L"bluetooth") +
                         (on ? L" -> on" : L" -> off")); co_return; }
     try {
-        if (co_await wdr::Radio::RequestAccessAsync() != wdr::RadioAccessStatus::Allowed) co_return;
-        co_await radio.SetStateAsync(on ? wdr::RadioState::On : wdr::RadioState::Off);
+        if (co_await wdr::Radio::RequestAccessAsync() == wdr::RadioAccessStatus::Allowed)
+            co_await radio.SetStateAsync(on ? wdr::RadioState::On : wdr::RadioState::Off);
     } catch (...) {}
+    PostMessageW(notify, msg, 0, 0);  // the tile was flipped optimistically: if nothing changed, this puts the truth back
 }
 
 std::wstring ConnectedSsid() {
@@ -622,11 +629,11 @@ void Media::Start(HWND notify, UINT event, std::function<void()> changed) {
     m_notify = notify;
     m_event = event;
     m_changed = std::move(changed);
-    Init(m_gen);
+    Init(m_gen, *m_gen);
 }
 
 void Media::Stop() {
-    m_gen++;
+    ++*m_gen;
     m_mgrRev.revoke();
     m_pbRev.revoke();
     m_propRev.revoke();
@@ -636,10 +643,10 @@ void Media::Stop() {
     m_changed = nullptr;
 }
 
-winrt::fire_and_forget Media::Init(unsigned gen) {
+winrt::fire_and_forget Media::Init(std::shared_ptr<unsigned> live, unsigned gen) {
     try {
         auto mgr = co_await Manager::RequestAsync();
-        if (gen != m_gen) co_return;
+        if (gen != *live) co_return;
         m_mgr = mgr;
         HWND h = m_notify;
         UINT e = m_event;
@@ -681,7 +688,8 @@ void DecodeArt(std::vector<uint8_t> const& bytes, MediaState& out) {
 }  // namespace
 
 winrt::fire_and_forget Media::PullAsync() {
-    unsigned gen = m_gen;
+    auto live = m_gen, newest = m_seq;
+    const unsigned gen = *live, seq = ++*newest;
     if (!m_mgr) co_return;
     try {
         auto sess = m_mgr.GetCurrentSession();
@@ -706,7 +714,7 @@ winrt::fire_and_forget Media::PullAsync() {
             next.canPrev = c.IsPreviousEnabled();
             next.canNext = c.IsNextEnabled();
             auto props = co_await sess.TryGetMediaPropertiesAsync();
-            if (gen != m_gen) co_return;
+            if (gen != *live || seq != *newest) co_return;
             next.title = props.Title().c_str();
             next.artist = props.Artist().c_str();
             if (next.title == m_state.title && next.artist == m_state.artist) {
@@ -715,16 +723,19 @@ winrt::fire_and_forget Media::PullAsync() {
             } else if (auto thumb = props.Thumbnail()) {
                 try {
                     auto stream = co_await thumb.OpenReadAsync();
-                    winrt::Windows::Storage::Streams::DataReader reader(stream);
-                    co_await reader.LoadAsync(static_cast<uint32_t>(stream.Size()));
-                    std::vector<uint8_t> bytes(stream.Size());
-                    reader.ReadBytes(bytes);
-                    DecodeArt(bytes, next);
+                    const auto size = static_cast<uint32_t>(stream.Size());
+                    if (size && size < (8u << 20)) {  // a huge or empty thumbnail is not worth loading on the UI thread
+                        winrt::Windows::Storage::Streams::DataReader reader(stream);
+                        co_await reader.LoadAsync(size);
+                        std::vector<uint8_t> bytes(size);
+                        reader.ReadBytes(bytes);
+                        DecodeArt(bytes, next);
+                    }
                 } catch (...) {}
-                if (gen != m_gen) co_return;
+                if (gen != *live || seq != *newest) co_return;
             }
         }
-        if (gen != m_gen) co_return;
+        if (gen != *live || seq != *newest) co_return;
         m_state = std::move(next);
         if (m_changed) m_changed();
     } catch (...) {}
@@ -732,15 +743,15 @@ winrt::fire_and_forget Media::PullAsync() {
 
 void Media::PlayPause() {
     if (DryRun()) return Log(L"DRYRUN media play/pause");
-    if (m_sess) m_sess.TryTogglePlayPauseAsync();
+    try { if (m_sess) m_sess.TryTogglePlayPauseAsync(); } catch (...) {}  // the player may have just quit
 }
 void Media::Next() {
     if (DryRun()) return Log(L"DRYRUN media next");
-    if (m_sess) m_sess.TrySkipNextAsync();
+    try { if (m_sess) m_sess.TrySkipNextAsync(); } catch (...) {}
 }
 void Media::Prev() {
     if (DryRun()) return Log(L"DRYRUN media previous");
-    if (m_sess) m_sess.TrySkipPreviousAsync();
+    try { if (m_sess) m_sess.TrySkipPreviousAsync(); } catch (...) {}
 }
 
 }  // namespace halo::svc

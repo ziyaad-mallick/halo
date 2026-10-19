@@ -211,7 +211,7 @@ struct ControlCenter::Impl {
     size_t listCap = SIZE_MAX;  // the most list rows Layout() may show (it lowers this when the panel would not fit)
     float volume = 0;
     bool muted = false, micMuted = false, dnd = false, wifiOn = false, btOn = false, dark = false, energy = false, night = false;
-    bool hotspotAvail = false, hotspotOn = false, savedWifi = true, savedBt = true, btAsked = false;
+    bool hotspotAvail = false, hotspotOn = false, savedWifi = true, savedBt = true, btAsked = false, btDone = false;  // btDone: the paired-device read has answered
     int bright = -1;
     svc::Battery battery;
     svc::PowerMode mode = svc::PowerMode::Unknown;
@@ -305,7 +305,14 @@ LRESULT CALLBACK ControlCenter::Impl::HotThunk(HWND h, UINT m, WPARAM w, LPARAM 
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     if (self && m == kMsgMedia) { self->media.Pull(); return 0; }
-    if (self && (m == kMsgAudio || m == kMsgMic || m == kMsgRadios || m == kMsgBt)) return self->PanelProc(h, m, w, l);
+    if (self && (m == kMsgAudio || m == kMsgMic || m == kMsgRadios || m == kMsgBt)) {
+        try {
+            return self->PanelProc(h, m, w, l);
+        } catch (winrt::hresult_error const& e) {  // posted by foreign-thread events: nothing above us catches
+            svc::Log(L"hot message " + std::to_wstring(m) + L" failed: " + std::wstring(e.message().c_str()));
+            return 0;
+        }
+    }
     if (self && m == WM_TIMER && w == kTimerChord) {
         KillTimer(h, kTimerChord);
         svc::SendWinChord(self->chordKey, self->chordShift);
@@ -418,7 +425,8 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (svc::brightness::Supported()) bright = svc::brightness::Level();
             Render();
             return 0;
-        case kMsgWifi: case kMsgBt: Render(); return 0;
+        case kMsgBt: btDone = true; Render(); return 0;
+        case kMsgWifi: Render(); return 0;
         case kMsgLate: {
             std::unique_ptr<Late> r(reinterpret_cast<Late*>(l));
             if (st == St::Open && r) {
@@ -543,6 +551,7 @@ void ControlCenter::Impl::Close() {
     st = St::Closing;
     KillTimer(hwnd, kTimerLeave);
     KillTimer(hwnd, kTimerSettle);
+    KillTimer(hwnd, kTimerClock);  // the window is kept between opens: a live 15 s timer would wake the process forever
     // The scans stop; the radio and volume listeners stay, so the next open already shows the truth.
     svc::WifiStop();
     svc::BtStop();
@@ -598,10 +607,13 @@ void ControlCenter::Impl::Teardown() {
     hover = pressed = {};
     tracking = false;
     hvShown = false;
+    st = St::Closed;  // before DestroyWindow: its WM_ACTIVATE must not find the panel Open and Close() it again
     if (hwnd) { KillTimer(hwnd, kTimerClose); DestroyWindow(hwnd); }
     hwnd = nullptr;
-    if (surf) surf.Close();
-    for (auto& c : chips) if (c.surf) c.surf.Close();
+    try {  // Close() throws once the compositor is gone (exit); this also runs from the destructor
+        if (surf) surf.Close();
+        for (auto& c : chips) if (c.surf) c.surf.Close();
+    } catch (winrt::hresult_error const&) {}
     chips.clear();
     hotChip = -1;
     shownPx = 0;
@@ -610,7 +622,6 @@ void ControlCenter::Impl::Teardown() {
     surf = nullptr; content = nullptr; chipLayer = nullptr; ptr = nullptr; hv = nullptr; hvGeo = nullptr;
     pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr; specGeo = nullptr;
     items.clear();
-    st = St::Closed;
     rect = {};
     if (wasOpen && api->onHidden) api->onHidden();
 }
@@ -967,14 +978,17 @@ void ControlCenter::Impl::Click(Item const& it) {
             Pulse(it);
             break;
         case Id::WifiText:
+            if (!radios.HasWifi()) return;  // no adapter (an Ethernet-only desktop): nothing to list
             expand = expand == Expand::Wifi ? Expand::None : Expand::Wifi;
             if (expand == Expand::Wifi) svc::WifiRefresh(hwnd, kMsgWifi);
             break;
         case Id::BtText:
+            if (!radios.HasBluetooth()) return;
             expand = expand == Expand::Bluetooth ? Expand::None : Expand::Bluetooth;
-            if (expand == Expand::Bluetooth) svc::BtRefresh(hwnd, kMsgBt);
+            if (expand == Expand::Bluetooth) { btDone = false; svc::BtRefresh(hwnd, kMsgBt); }
             break;
         case Id::WifiNet:
+            if (static_cast<size_t>(it.arg) >= svc::WifiNets().size()) return;
             svc::WifiConnect(svc::WifiNets()[it.arg].ssid);
             expand = Expand::None;
             break;
@@ -1266,6 +1280,15 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
         }
         return;
     }
+    // A spring left running by a close in mid-drawer would keep pulling these to the old height and win over
+    // the plain sets below, so the reopened frame would not match its content: stop them first.
+    pill.StopAnimation(L"Size");
+    inner.StopAnimation(L"Size");
+    clip.StopAnimation(L"Size");
+    rim.StopAnimation(L"Size");
+    if (shadowV) shadowV.StopAnimation(L"Size");
+    if (specGeo) specGeo.StopAnimation(L"Size");
+    if (ghost) { inner.Children().Remove(ghost); ghost = nullptr; }
     pill.Size({wPx, hPx});
     inner.Size({wPx, hPx});
     if (shadowV) shadowV.Size({wPx, hPx});
@@ -1395,9 +1418,15 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 tile(r);
                 if (it.id == Id::DisplayTile && bright >= 0)
                     txt(L"Display", fTitle.get(), {r.left + kS4, r.top + kS4, r.right - kS4, r.top + kS4 + kTitleLine}, kText);
-                if (it.id == Id::ListTile)
-                    txt(expand == Expand::Wifi ? L"Wi-Fi networks" : L"Bluetooth devices", fTitle.get(),
+                if (it.id == Id::ListTile) {
+                    const bool wifi = expand == Expand::Wifi;
+                    txt(wifi ? L"Wi-Fi networks" : L"Bluetooth devices", fTitle.get(),
                         {r.left + kS4, r.top + kS4, r.right - kS4, r.top + kS4 + kTitleLine}, kText);
+                    if (wifi ? svc::WifiNets().empty() : btDone && svc::BtDevices().empty()) {  // the one row Layout() always reserves
+                        const float t = r.top + kS4 + kTitleLine + kS1;
+                        txt(wifi ? L"No saved networks" : L"No paired devices", fSub.get(), {r.left + kS4, t, r.right - kS4, t + kListRowH}, kDim);
+                    }
+                }
                 break;
             case Id::SoundTile:
                 txt(L"Sound", fTitle.get(), {r.left + kS4, r.top, r.left + 112, r.bottom}, theme::A(kText, speaker.Available() ? 1.0f : 0.5f));
@@ -1493,6 +1522,8 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             case Id::OutDev: case Id::WifiNet: case Id::BtDev: {
                 std::wstring name, sub;
                 bool mark = false;
+                const size_t have = it.id == Id::OutDev ? outs.size() : it.id == Id::WifiNet ? svc::WifiNets().size() : svc::BtDevices().size();
+                if (static_cast<size_t>(it.arg) >= have) break;  // a chip or list changed under a stale item: draw nothing, never index past the end
                 if (it.id == Id::OutDev) { name = outs[it.arg].name; mark = outs[it.arg].isDefault; }
                 else if (it.id == Id::WifiNet) {
                     auto const& n = svc::WifiNets()[it.arg];
@@ -1822,7 +1853,7 @@ ControlCenter::~ControlCenter() {
     m->radios.Stop();
     m->speaker.Unbind();
     m->mic.Unbind();
-    m->Teardown();
+    try { m->Teardown(); } catch (...) {}  // a destructor is noexcept: a WinRT failure here would terminate the exit
     if (m->hot) DestroyWindow(m->hot);
 }
 

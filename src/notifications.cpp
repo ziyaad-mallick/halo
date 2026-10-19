@@ -385,14 +385,18 @@ Snapshot NotificationCenter::Impl::Query(std::set<std::wstring>& iconDone) {
         for (auto const& un : list) {
             Notif n;
             n.id = un.Id();
-            auto info = un.AppInfo();
-            n.aumid = info.AppUserModelId().c_str();
-            n.app = info.DisplayInfo().DisplayName().c_str();
+            // A toast whose app was uninstalled can have no AppInfo; one such toast must not blank the whole list.
+            winrt::Windows::ApplicationModel::AppInfo info{nullptr};
+            try {
+                info = un.AppInfo();
+                n.aumid = info.AppUserModelId().c_str();
+                n.app = info.DisplayInfo().DisplayName().c_str();
+            } catch (...) { info = nullptr; }
             n.appKey = n.aumid.empty() ? n.app : n.aumid;
-            {
+            try {
                 FILETIME f = winrt::clock::to_file_time(un.CreationTime());
                 n.ft = (static_cast<LONGLONG>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
-            }
+            } catch (...) {}
             std::vector<std::wstring> texts;
             try {
                 auto vis = un.Notification().Visual();
@@ -416,7 +420,7 @@ Snapshot NotificationCenter::Impl::Query(std::set<std::wstring>& iconDone) {
             IconPx ic;
             const wchar_t* src = nullptr;
             try {
-                auto ref = info.DisplayInfo().GetLogo({72, 72});  // null for some apps (Windows Security)
+                auto ref = info ? info.DisplayInfo().GetLogo({72, 72}) : nullptr;  // null for some apps (Windows Security)
                 if (ref) {
                     auto stream = ref.OpenReadAsync().get();
                     winrt::Windows::Storage::Streams::DataReader rd(stream);
@@ -459,12 +463,14 @@ void NotificationCenter::Impl::Worker() {
     HANDLE h[3] = {evStop, evReq, watch};
     for (;;) {
         DWORD r = WaitForMultipleObjects(watch ? 3 : 2, h, FALSE, INFINITE);
-        if (r == WAIT_OBJECT_0) break;
+        if (r == WAIT_OBJECT_0 || r == WAIT_FAILED) break;  // a failed wait (a dead handle) would otherwise spin this loop at full speed
         if (r == WAIT_OBJECT_0 + 2) {
             FindNextChangeNotification(watch);
             if (!visible) continue;  // the next Open asks for a fresh read anyway
-            // The database writes in bursts; settle first.
-            for (int i = 0; i < 10 && WaitForSingleObject(watch, 250) == WAIT_OBJECT_0; ++i) FindNextChangeNotification(watch);
+            // The database writes in bursts; settle first (and let a quit through: Stop() joins this thread).
+            const HANDLE burst[2] = {watch, evStop};
+            for (int i = 0; i < 10 && WaitForMultipleObjects(2, burst, FALSE, 250) == WAIT_OBJECT_0; ++i) FindNextChangeNotification(watch);
+            if (WaitForSingleObject(evStop, 0) == WAIT_OBJECT_0) break;
             svc::Log(L"notifications: database changed");
         }
         if (!visible) continue;
@@ -507,14 +513,22 @@ LRESULT CALLBACK NotificationCenter::Impl::MsgThunk(HWND h, UINT m, WPARAM w, LP
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     if (m == kMsgData) {
         std::unique_ptr<Snapshot> snap(reinterpret_cast<Snapshot*>(l));
-        if (self) self->OnSnapshot(*snap);
+        try {
+            if (self) self->OnSnapshot(*snap);
+        } catch (winrt::hresult_error const& e) {
+            svc::Log(L"notifications: update failed: " + std::wstring(e.message().c_str()));
+        }
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
 
 void NotificationCenter::Impl::OnSnapshot(Snapshot& snap) {
-    if (!snap.ok) { svc::Log(L"notifications: read failed: " + snap.error); return; }
+    if (!snap.ok) {  // access denied or the listener failed: show the empty state rather than a bare header and calendar
+        svc::Log(L"notifications: read failed: " + snap.error);
+        if (!haveData) { haveData = true; if (st == St::Open) Update(false); }
+        return;
+    }
     for (auto& [k, ic] : snap.icons) icons[k] = std::move(ic);
     std::sort(snap.items.begin(), snap.items.end(), [](Notif const& a, Notif const& b) { return a.ft > b.ft; });
     all = std::move(snap.items);
@@ -617,7 +631,13 @@ void NotificationCenter::Impl::ShiftMonth(int d) {
 LRESULT CALLBACK NotificationCenter::Impl::Thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self ? self->Proc(h, m, w, l) : DefWindowProcW(h, m, w, l);
+    if (!self) return DefWindowProcW(h, m, w, l);
+    try {
+        return self->Proc(h, m, w, l);
+    } catch (winrt::hresult_error const& e) {  // a failed WinRT call (a card's visuals, say) must never take the dock down
+        svc::Log(L"notifications: message " + std::to_wstring(m) + L" failed: " + std::wstring(e.message().c_str()));
+        return DefWindowProcW(h, m, w, l);
+    }
 }
 
 // x, y in panel coordinates (logical). part: 0 body, 1 x, 2 Clear, 3 prev month, 4 next month, 5 month label, -1 inert.
@@ -745,7 +765,13 @@ void NotificationCenter::Impl::ClearAll() {
     for (auto const& n : all)
         if (!hidden.count(n.id)) r.ids.push_back(n.id);
     svc::Log(L"notifications: clear all (" + std::to_wstring(r.ids.size()) + L")");
-    Dismiss(r);
+    if (dry || r.ids.empty()) { Dismiss(r); return; }
+    // One call, not a RemoveNotification round trip per toast (each is a cross-process call: hundreds froze the panel).
+    for (UINT id : r.ids) hidden.insert(id);
+    try { wun::Management::UserNotificationListener::Current().ClearNotifications(); }
+    catch (winrt::hresult_error const& e) { svc::Log(L"notifications: ClearNotifications failed, hidden locally: " + std::wstring(e.message().c_str())); }
+    hoverCard = -1;
+    Update(false);
 }
 
 void NotificationCenter::Impl::Activate(Row const& r) {
@@ -1193,9 +1219,11 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     // heights first, then keep the prefix that fits under the card limit
     struct Sized { Row r; float h; };
     std::vector<Sized> sized;
+    int counted = 0;
     for (auto& r : src) {
         float h;
         if (r.kind == K::Collapse) h = kCollapseH;
+        else if (++counted > (attached ? kMaxCardsAttached : kMaxCards) + 1) h = 0;  // past the card limit: only "N more" counts it, so skip the text layouts (hundreds of toasts)
         else {
             int lines = 0;
             std::wstring b = r.n.body;
@@ -1405,11 +1433,11 @@ void NotificationCenter::Impl::Teardown() {
     root = nullptr;
     target = nullptr;
     noise = nullptr;
+    st = St::Closed;  // before DestroyWindow: its WM_ACTIVATE must not find the column Open and dismiss both panels
     if (hwnd) DestroyWindow(hwnd);
     hwnd = nullptr;
     hoverCard = -1;
     tracking = false;
-    st = St::Closed;
 }
 
 // ---------------------------------------------------------------------------------------------

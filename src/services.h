@@ -13,6 +13,7 @@
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Media.Control.h>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -85,15 +86,19 @@ public:
     bool HasBluetooth() const { return m_bt != nullptr; }
     bool WifiOn() const;
     bool BluetoothOn() const;
-    void SetWifi(bool on) { Set(m_wifi, on); }
-    void SetBluetooth(bool on) { Set(m_bt, on); }
+    void SetWifi(bool on) { Set(m_wifi, on, m_notify, m_msg); }
+    void SetBluetooth(bool on) { Set(m_bt, on, m_notify, m_msg); }
 
 private:
-    winrt::fire_and_forget Find(HWND notify, UINT msg, unsigned gen);
-    static winrt::fire_and_forget Set(winrt::Windows::Devices::Radios::Radio radio, bool on);
+    // The coroutines hold `live` (shared) and compare against it, never against a member, so one that resumes
+    // after the owner is gone returns before it touches `this`.
+    winrt::fire_and_forget Find(HWND notify, UINT msg, std::shared_ptr<unsigned> live, unsigned gen);
+    static winrt::fire_and_forget Set(winrt::Windows::Devices::Radios::Radio radio, bool on, HWND notify, UINT msg);
     winrt::Windows::Devices::Radios::Radio m_wifi{nullptr}, m_bt{nullptr};
     winrt::Windows::Devices::Radios::Radio::StateChanged_revoker m_wifiRev, m_btRev;
-    unsigned m_gen = 0;
+    HWND m_notify{};
+    UINT m_msg{};
+    std::shared_ptr<unsigned> m_gen = std::make_shared<unsigned>(0);
 };
 std::wstring ConnectedSsid();  // empty when not on Wi-Fi
 
@@ -150,7 +155,9 @@ public:
 private:
     using Session = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession;
     using Manager = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
-    winrt::fire_and_forget Init(unsigned gen);
+    // As in Radios, the coroutines compare against shared counters, never members: a pull that resumes after
+    // the owner is gone returns before touching `this`. m_seq drops a pull that a newer one has overtaken.
+    winrt::fire_and_forget Init(std::shared_ptr<unsigned> live, unsigned gen);
     winrt::fire_and_forget PullAsync();
     HWND m_notify{};
     UINT m_event{};
@@ -161,7 +168,7 @@ private:
     Session::PlaybackInfoChanged_revoker m_pbRev;
     Session::MediaPropertiesChanged_revoker m_propRev;
     MediaState m_state;
-    unsigned m_gen = 0;
+    std::shared_ptr<unsigned> m_gen = std::make_shared<unsigned>(0), m_seq = std::make_shared<unsigned>(0);
 };
 
 }  // namespace halo::svc
