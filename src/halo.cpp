@@ -43,6 +43,7 @@
 #include "previews.h"
 #include "menu.h"
 #include "pins.h"
+#include "taskbar.h"
 #include "winkey.h"
 #include "edge.h"
 
@@ -92,6 +93,7 @@ constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
 constexpr UINT kMsgSettings = WM_APP + 50;  // halo::settings::Watch: settings.ini changed
+constexpr UINT kMsgGuardianGone = WM_APP + 60;  // the guardian that started us exited
 constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Control Center) / kRight (notifications)
 constexpr UINT kMsgTestNotifCenter = WM_APP + 21;  // HALO_TEST=1: toggle the Notification Center
 constexpr UINT kMsgTestMenu = WM_APP + 31;    // HALO_TEST=1: wParam = dock item; lParam 0 = open its menu, 1 = close, 100+r = hover row r, 200+r = choose row r
@@ -141,11 +143,63 @@ struct Scale {
     float f(float logical) const { return logical * v; }
 };
 
+// guardian.exe starts us with "--guardian <its pid>" and is what puts the taskbar back whenever we go away.
+// If it dies while we run (killed, crashed) nobody would. The thread pool waits on its process handle (no
+// timer, no polling) and posts kMsgGuardianGone; Halo then starts a new guardian with "--adopt <our pid>".
+HWND g_guardianNotify = nullptr;
+bool g_unguarded = false;  // the guardian is gone and no replacement started: restore the taskbar on exit
+
+void CALLBACK GuardianGoneCb(PVOID, BOOLEAN) {
+    if (g_guardianNotify) PostMessageW(g_guardianNotify, kMsgGuardianGone, 0, 0);
+}
+
+void WatchGuardian(DWORD pid, HWND hwnd) {
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) {
+        Log(L"guardian " + std::to_wstring(pid) + L" already gone");
+        PostMessageW(hwnd, kMsgGuardianGone, 0, 0);
+        return;
+    }
+    g_guardianNotify = hwnd;
+    HANDLE wait = nullptr;
+    if (!RegisterWaitForSingleObject(&wait, h, GuardianGoneCb, nullptr, INFINITE, WT_EXECUTEONLYONCE))
+        Log(L"RegisterWait on the guardian failed " + std::to_wstring(GetLastError()));
+    // h and wait stay open for the life of the process.
+}
+
+void StartAdopter() {
+    static int tries = 0;
+    if (++tries > 3) {  // adopters that keep exiting at once (another guardian owns the mutex): stop respawning
+        g_unguarded = true;
+        Log(L"giving up on a replacement guardian");
+        return;
+    }
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH * 2);
+    std::wstring dir(buf, n);
+    dir.resize(dir.find_last_of(L"\\/") + 1);
+    std::wstring exe = dir + L"guardian.exe";
+    std::wstring cmd = L"\"" + exe + L"\" --adopt " + std::to_wstring(GetCurrentProcessId());
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        Log(L"guardian gone; started a new one to adopt us");
+        WatchGuardian(pi.dwProcessId, g_guardianNotify);  // and keep watching: the new one can die too
+    } else {
+        g_unguarded = true;
+        Log(L"guardian gone and guardian.exe would not start " + std::to_wstring(GetLastError()));
+    }
+}
+
 class Halo {
 public:
     ~Halo();
     bool Create(HINSTANCE inst);
     int Run();
+    HWND Hwnd() const { return m_hwnd; }
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -249,7 +303,10 @@ Halo::~Halo() {
 }
 
 bool Halo::Create(HINSTANCE inst) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    // user32 has it from Windows 10 1703; older builds keep the manifest default (a failed call is harmless).
+    if (auto setDpi = reinterpret_cast<BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT)>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext")))
+        setDpi(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     halo::theme::Refresh();
     m_cfg = halo::settings::Get();
     m_autoHide = !_wgetenv(L"HALO_TEST") && m_cfg.taskbar.autohide;
@@ -1385,6 +1442,9 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_TIMECHANGE:
             if (m_dock) m_dock->OnTimeChange();
             return 0;
+        case kMsgGuardianGone:
+            StartAdopter();
+            return 0;
         case kMsgSettings:
             if (halo::settings::Reload()) ApplySettings();
             return 0;
@@ -1460,7 +1520,25 @@ int Halo::Run() {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     winrt::init_apartment(winrt::apartment_type::single_threaded);
-    Halo app;
-    if (!app.Create(inst)) Log(L"startup incomplete");
-    return app.Run();
+    DWORD guardianPid = 0;
+    int argc = 0;
+    if (wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc)) {
+        for (int i = 1; i + 1 < argc; ++i)
+            if (_wcsicmp(argv[i], L"--guardian") == 0) guardianPid = static_cast<DWORD>(_wtoi(argv[i + 1]));
+        LocalFree(argv);
+    }
+    int code;
+    {
+        Halo app;
+        if (!app.Create(inst)) {
+            // A window with no dock must not look like a running shell: the guardian hides the taskbar
+            // once the dock window is visible, and a non-zero exit makes it restore and retry.
+            Log(L"startup incomplete; exiting");
+            return 2;
+        }
+        if (guardianPid) WatchGuardian(guardianPid, app.Hwnd());
+        code = app.Run();
+    }
+    if (g_unguarded) halo::taskbar::RestoreAll();
+    return code;
 }
