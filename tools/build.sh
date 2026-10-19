@@ -2,10 +2,19 @@
 # Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|all]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-CXX="${HALO_CXX:-$HOME/Windhawk/Compiler/bin/clang++.exe}"
+# Compiler: HALO_CXX (any LLVM-MinGW clang++ with C++/WinRT headers, or add them with HALO_INCLUDE),
+# else the one tools/setup-toolchain.sh downloads into toolchain/ on first build.
+if [ -z "${HALO_CXX:-}" ]; then
+  [ -x toolchain/llvm-mingw/bin/clang++.exe ] && [ -f toolchain/winrt/winrt/base.h ] || tools/setup-toolchain.sh
+  HALO_CXX=toolchain/llvm-mingw/bin/clang++.exe
+  HALO_INCLUDE="${HALO_INCLUDE:-toolchain/winrt}"
+fi
+CXX="$HALO_CXX"
 mkdir -p build
 
-COMMON=(-std=c++23 -O2 -target x86_64-w64-mingw32 -municode -DUNICODE -D_UNICODE
+# -include exception and the IReference<boolean> define: stock mingw-w64 / C++/WinRT headers need them
+# (boolean and BYTE are the same type there, and base.h leaves out <exception>); harmless otherwise.
+COMMON=(${HALO_INCLUDE:+-I"$HALO_INCLUDE"} -include exception -D____FIReference_1_boolean_INTERFACE_DEFINED__ -std=c++23 -O2 -target x86_64-w64-mingw32 -municode -DUNICODE -D_UNICODE
         -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000008 -static -Wall)
 WINLIBS=(-lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldwrite -ldcomp -ldwmapi
          -lole32 -luuid -loleaut32 -lpowrprof -ldxva2 -luser32 -lgdi32 -lshell32 -lshcore -lcomctl32 -lwindowscodecs -lsecur32 -ladvapi32)
