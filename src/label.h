@@ -257,8 +257,8 @@ public:
 
         // Text or dimensions changed: re-render surface
         if (text != m_currentText) {
-            m_currentText = text;
             UpdateSurface(text);
+            m_currentText = text;  // after: a draw that threw must be retried, not remembered as done
         }
 
         // Target placement 6px above icon top

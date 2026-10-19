@@ -82,10 +82,20 @@ void DockCluster::InitDirectWrite() {
         m_typography->AddFontFeature(feat);
     }
 
-    // Segoe Fluent Icons for Wi-Fi and Battery
+    // Segoe Fluent Icons for Wi-Fi and Battery. Windows 10 doesn't ship it (CreateTextFormat succeeds anyway
+    // and draws the glyph codes as boxes in a fallback font); its predecessor Segoe MDL2 Assets does.
     const float iconSize = 14.0f * m_scale;
+    wchar_t const* iconFont = L"Segoe Fluent Icons";
+    {
+        winrt::com_ptr<IDWriteFontCollection> fonts;
+        UINT32 at = 0;
+        BOOL found = TRUE;
+        if (SUCCEEDED(m_dwriteFactory->GetSystemFontCollection(fonts.put())) &&
+            SUCCEEDED(fonts->FindFamilyName(iconFont, &at, &found)) && !found)
+            iconFont = L"Segoe MDL2 Assets";
+    }
     winrt::check_hresult(m_dwriteFactory->CreateTextFormat(
-        L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+        iconFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, iconSize,
         L"en-us", m_tfIcons.put()));
 
