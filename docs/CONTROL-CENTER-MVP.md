@@ -18,7 +18,7 @@
 
 In the Halo desktop shell, the bottom dock replaces the traditional Windows taskbar (`Shell_TrayWnd`), hiding the system tray, notification center, and Quick Settings flyout. 
 
-Per the design decisions recorded in [`docs/DESIGN.md`](file:///c:/Users/testi/Desktop/Mallick/30-work/oss/halo/docs/DESIGN.md) (which supersedes the top menu-bar proposal in [`docs/CONTROL-CENTER.md`](file:///c:/Users/testi/Desktop/Mallick/30-work/oss/halo/docs/CONTROL-CENTER.md)):
+Per the design decisions recorded in [`docs/DESIGN.md`](../docs/DESIGN.md) (which supersedes the top menu-bar proposal in [`docs/CONTROL-CENTER.md`](../docs/CONTROL-CENTER.md)):
 1. **No permanent top menu bar:** Screen real estate is preserved at 100% full height for applications.
 2. **Dock Status Cluster:** Passive status indicators (clock, Wi-Fi connection glyph, battery percentage + icon, Start button) reside on the left flank of the dock pill.
 3. **Floating Control Center:** All active controls and toggles live inside an on-demand, floating frosted-glass panel in the top-right corner of the screen.
@@ -97,7 +97,7 @@ On standard Windows 11, `Win+A` invokes the Quick Settings flyout via `ShellExpe
 To intercept `Win+A` cleanly while Halo is running:
 
 1. **Dedicated Hook Thread:**
-   Halo runs a low-level keyboard hook (`WH_KEYBOARD_LL`) on its own thread (see [`src/winkey.cpp`](file:///c:/Users/testi/Desktop/Mallick/30-work/oss/halo/src/winkey.cpp)), isolating hook execution from any UI thread stalls.
+   Halo runs a low-level keyboard hook (`WH_KEYBOARD_LL`) on its own thread (see [`src/winkey.cpp`](../src/winkey.cpp)), isolating hook execution from any UI thread stalls.
 2. **Interception & Suppression Logic:**
    - The hook tracks whether `VK_LWIN` or `VK_RWIN` is currently held (`winDown == true`).
    - When a key event arrives with `vkCode == 'A'` (or `0x41`) while `winDown` is true:
@@ -378,7 +378,7 @@ case halo::control_center::kMsgHotCornerTrigger:
 
 ## 9. Verification & Build Confirmation
 
-Both [`src/services.h`](file:///c:/Users/testi/Desktop/Mallick/30-work/oss/halo/src/services.h) and [`src/control_center.h`](file:///c:/Users/testi/Desktop/Mallick/30-work/oss/halo/src/control_center.h) were compiled and linked with the project's LLVM-MinGW clang++ compiler toolchain (`-std=c++23 -O2 -target x86_64-w64-mingw32 -municode -DUNICODE -D_UNICODE`). 
+Both [`src/services.h`](../src/services.h) and [`src/control_center.h`](../src/control_center.h) were compiled and linked with the project's LLVM-MinGW clang++ compiler toolchain (`-std=c++23 -O2 -target x86_64-w64-mingw32 -municode -DUNICODE -D_UNICODE`). 
 
 - Output verification: **0 warnings, 0 compilation errors, 0 undefined symbols.**
 - Confirmed compatibility with Windows.UI.Composition, WinRT projections, Core Audio, and WMI/DDC-CI APIs.

@@ -2,57 +2,166 @@
 
 A native, macOS-style dock for Windows 11, written in C++/WinRT on
 Windows.UI.Composition. It replaces the taskbar with a frosted-glass dock
-whose icons magnify under the cursor, all animated by the compositor.
+whose icons magnify under the cursor, and adds a Start panel and a Control
+Center in the same style. Animations run on the compositor, so the dock costs
+next to nothing when idle.
 
-Status: **daily driver on one machine** (the author's login shell since 2026-10-18); not packaged or signed yet. See [docs/DESIGN.md](docs/DESIGN.md).
+> **Status:** early. It has been the author's daily login shell since
+> 2026-10-18, on one machine. Builds are unsigned and there is no installer
+> package yet, so you build it from source (about a minute). Taking the
+> Windows taskbar back is always one hotkey away (see
+> [Going back to the Windows taskbar](#going-back-to-the-windows-taskbar)).
 
-## What works
+## What you get
 
-- Frosted pill (host backdrop blur), 256px icons for pinned apps, click to launch
-- Magnification and a pill that grows with it, driven by compositor expressions
-- Auto-hide with a spring reveal
-- Follows the Windows light/dark app mode (`HALO_THEME=light|dark` overrides); all colours in `src/theme.h`
-- Halo's own pin list (`%LOCALAPPDATA%\Halo\pins.txt`, seeded once from the taskbar pins) and a right-click menu: open windows, Keep in Dock / Remove from Dock, Show in Explorer, Quit
-- Left status cluster (time, Wi-Fi, battery, Start), hover labels, live window previews, click-to-minimize, bounce on launch
-- Start panel (Win key): search bar (Start-menu apps + recent files), one row of recent apps, 12 recent files, avatar / Settings / Power
-- Control Center (Win+A, or resting on the right fifth of the top edge / top fifth of the right edge; auto-hides when the pointer leaves): Wi-Fi/Bluetooth, toggles, brightness and volume, notifications and a calendar
-- `guardian.exe` hides the Windows taskbar, runs the dock, and always gives the
-  taskbar back: on exit, on a crash loop (3 crashes in 2 minutes), and after
-  an explorer restart it hides the new taskbar again
+- **Dock**: frosted pill, 256px icons, magnification under the cursor, auto-hide with a spring reveal,
+  bounce on launch, dots under running apps, hover labels, live window previews, click a running app's
+  icon to minimize it
+- **Your own pins**: right-click an icon for its windows, *Keep in Dock* / *Remove from Dock*,
+  *Show in Explorer* and *Quit*. The first run copies your current taskbar pins.
+- **Status cluster** at the dock's left: time, Wi-Fi, battery and a Start button
+- **Start panel** (Windows key): search across Start-menu apps and recent files, a row of recent apps,
+  recent files, and Settings / Power
+- **Control Center** (Win+A): Wi-Fi, Bluetooth, toggles, brightness and volume, Now Playing,
+  notifications and a calendar. Win+N opens the Notification Center.
+- **Light and dark**: follows the Windows app mode, or force one in settings
+- **Halo Settings**: a dashboard to change everything live, with Halo's own CPU, RAM and GPU usage
+- **Safety net**: `guardian.exe` hides the taskbar only once the dock is up, and gives it back on exit,
+  on a crash loop (3 crashes in 2 minutes), and on request
 
-Measured on a Core Ultra 7 258V, live login copy with the full feature set
-(2026-10-18, process counters over 30 s idle, two runs): **0–16 ms CPU, 29.9–35.2 MB private
-memory (35.2 MB with the pin store and right-click menu), 62–65 MB working set**; guardian 1.4 MB private.
-Earlier M0 spike (2026-10-17, `tools/smoke.ps1`): 17.5 MB
-private memory, 0 ms CPU over 10 s idle in 3 of 4 runs (250 ms in the first
-run after an explorer restart, unexplained).
+Measured on a Core Ultra 7 258V (2026-10-18, process counters over 30 s idle, two runs):
+**0–16 ms CPU, 29.9–35.2 MB private memory**; the guardian uses 1.4 MB.
 
-## Build
+## Requirements
 
-Needs only the LLVM-MinGW clang that ships with Windhawk (no Windows SDK):
+- Windows 11 (x64)
+- [Git for Windows](https://git-scm.com/download/win), for Git Bash
+- The LLVM-MinGW `clang++` that ships with [Windhawk](https://windhawk.net). Halo needs no Visual Studio
+  and no Windows SDK. Install Windhawk in portable mode to `%USERPROFILE%\Windhawk`, or point
+  `HALO_CXX` at any LLVM-MinGW `clang++.exe`:
+
+  ```sh
+  export HALO_CXX="/c/path/to/llvm-mingw/bin/clang++.exe"
+  ```
+
+## Install
+
+In Git Bash:
 
 ```sh
-tools/build.sh all      # build/halo.exe, build/guardian.exe
-build/guardian.exe      # start ON: dock running, taskbar hidden
-build/guardian.exe --restore   # get the taskbar back if anything goes wrong
+git clone https://github.com/ziyaad-mallick/halo.git
+cd halo
+tools/build.sh all          # build/halo.exe, build/guardian.exe, build/halo-settings.exe
 ```
 
-`guardian.exe` stays alive as an always-on switch (zero CPU while OFF):
+Then, in PowerShell from the repo folder:
 
-- **Win+Alt+T** toggles ON (dock, taskbar hidden) and OFF (dock closed, taskbar restored).
-  If Windows refuses the hotkey (error 1409 happens on some builds) the guardian falls back
-  to a low-level keyboard hook; `%LOCALAPPDATA%\Halo\guardian.log` says which one it used.
-- Halo exiting by itself (Ctrl+Win+Esc, closed) means OFF, not exit. A crash loop (3 in
-  2 minutes) also ends in OFF; Win+Alt+T tries again.
-- A second `guardian.exe` talks to the running one: no flags = turn ON, `--off` (or
-  `--restore`) = turn OFF, `--quit` = turn OFF and exit. With none running, `--off`/`--restore`
-  just restore the taskbar.
-- `guardian.exe --autostart on|off` adds/removes the `Halo` value under
-  `HKCU\...\CurrentVersion\Run`.
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\install.ps1
+```
 
-While Halo runs, tapping the Windows key alone opens Halo's Start panel
-and reveals the dock instead of opening Start. Win+<key> combos are
-untouched; Ctrl+Esc still opens Start. Set `HALO_TEST_WINKEY=1` to let injected Win presses
-count (for tests).
+`install.ps1` copies the three programs to `%LOCALAPPDATA%\Halo\app`, adds **Halo Settings** to the
+Start menu and starts Halo. The taskbar disappears and the dock takes its place.
 
-Unsigned builds can be blocked by Smart App Control.
+**Start Halo at sign-in** (optional):
+
+```powershell
+& "$env:LOCALAPPDATA\Halo\app\guardian.exe" --autostart on    # off removes it
+```
+
+**Update** later with `git pull`, `tools/build.sh all`, then `tools\install.ps1` again.
+
+**Just try it** without installing: run `build/guardian.exe` straight from the build folder.
+
+> **Smart App Control** may block unsigned builds at random (Windows says the app was blocked to
+> protect your PC). If it does, run the build again or check *Windows Security → App & browser control →
+> Smart App Control*. Code signing is planned.
+
+## How to use it
+
+| Do this | To get |
+|---|---|
+| Move the pointer to the bottom edge | the dock slides up |
+| Click an icon | launch the app, or bring its window forward |
+| Click a running app's icon while it's in front | minimize it |
+| Hover a running app's icon | live window previews |
+| Right-click an icon | its windows, Keep in Dock / Remove from Dock, Show in Explorer, Quit |
+| Tap the **Windows** key | Halo's Start panel; just start typing to search |
+| **Ctrl+Esc** | the real Windows Start menu |
+| **Win+A**, or rest the pointer on the right fifth of the bottom edge | Control Center |
+| **Win+N** | Notification Center |
+| **Win+Alt+T** | turn Halo off (taskbar back) and on again |
+| **Ctrl+Win+Esc** | close the dock (the guardian treats that as *off*) |
+
+Every other Win+key shortcut works as usual.
+
+**Optional: the genie minimize.** `mods/halo-genie.wh.cpp` is a [Windhawk](https://windhawk.net) mod that
+makes minimized windows shrink into their dock icon and restore from it. Add it in Windhawk as a new
+mod, paste the file in, and compile. Apps it can't reach (Chrome, Edge, Spotify) get a Halo-drawn swoop
+instead.
+
+## Settings
+
+Open **Halo Settings** from the Start menu (or run `%LOCALAPPDATA%\Halo\app\halo-settings.exe`). Every
+change applies live, without restarting Halo.
+
+You can change:
+
+- **General**: theme (system / dark / light), accent colour, reduce motion
+- **Dock**: icon size, magnification, auto-hide and hide delay, bounce on launch, running dots, glass
+  tint and opacity, and the reveal effect
+- **Control Center**: hot corner on/off, its width and delay, close when the pointer leaves, Now Playing
+  and slider tiles, glass and effect
+- **Start**: how many recent apps and files to show, dim the desktop behind it, glass and effect
+
+Effects are `rise`, `bounce`, `swipe`, `fade`, `swoop` or `none`, each with its own speed and amount of
+motion.
+
+Halo Settings writes everything to `%LOCALAPPDATA%\Halo\settings.ini`, which you can also edit by hand.
+Every key, its default and its range is listed in [docs/SETTINGS.md](docs/SETTINGS.md). A bad value
+falls back to its default, so a typo can't break the shell.
+
+Other files in `%LOCALAPPDATA%\Halo`: `pins.txt` (your dock pins, one per line), `guardian.log` (start
+here when something goes wrong).
+
+## Going back to the Windows taskbar
+
+**For a moment:** press **Win+Alt+T**. Halo closes and the taskbar comes back. Press it again to
+return to Halo. (If another app owns that shortcut, `guardian.log` says so; use the commands below.)
+
+**From a command line:**
+
+```powershell
+& "$env:LOCALAPPDATA\Halo\app\guardian.exe" --off     # taskbar back, guardian keeps running
+& "$env:LOCALAPPDATA\Halo\app\guardian.exe"           # Halo back on
+& "$env:LOCALAPPDATA\Halo\app\guardian.exe" --quit    # taskbar back and the guardian exits
+```
+
+**For good** (uninstall):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1             # keeps settings and logs
+powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1 -RemoveData # deletes those too
+```
+
+This stops Halo, restores the taskbar, removes the sign-in entry, the Start-menu shortcut and
+`%LOCALAPPDATA%\Halo\app`. If you installed the genie mod, remove it in Windhawk.
+
+**If the taskbar is still missing** (for example after a hard crash):
+
+```powershell
+& "$env:LOCALAPPDATA\Halo\app\guardian.exe" --restore
+```
+
+or, if the exe is gone, restart Explorer from Task Manager (Ctrl+Shift+Esc → *Windows Explorer* →
+*Restart*), or sign out and back in.
+
+## Build targets
+
+`tools/build.sh [halo|guardian|settings|icons_test|pins_test|cluster_test|swoop_test|all]`.
+Design notes and decisions are in [docs/DESIGN.md](docs/DESIGN.md); ideas not built yet are in
+[docs/IDEAS.md](docs/IDEAS.md).
+
+## License
+
+[MIT](LICENSE). The genie mod is a fork of *MacOS Minimize Animation* by Abdullah Masood (MIT).

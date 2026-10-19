@@ -1,7 +1,7 @@
 # Halo Control Center: research and design
 
 *2026-10-17. Design document, no product code. Companion to [DESIGN.md](DESIGN.md) (roadmap M2/M3).
-`S:` below = the AGPL Seelen UI clone at `C:\Users\testi\Desktop\Mallick\30-work\oss\research\Seelen-UI`.
+`S:` below = a local clone of the AGPL [Seelen UI](https://github.com/eythaann/Seelen-UI).
 Studied, never copied.*
 
 Labels: **VERIFIED** = read in Seelen code or on Microsoft Learn (URL/path given); **KNOWN** = standard

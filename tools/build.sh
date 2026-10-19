@@ -2,7 +2,7 @@
 # Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|all]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-CXX="${HALO_CXX:-/c/Users/testi/Windhawk/Compiler/bin/clang++.exe}"
+CXX="${HALO_CXX:-$HOME/Windhawk/Compiler/bin/clang++.exe}"
 mkdir -p build
 
 COMMON=(-std=c++23 -O2 -target x86_64-w64-mingw32 -municode -DUNICODE -D_UNICODE
