@@ -265,7 +265,10 @@ void Dock::SetItems(std::vector<Item> const& items) {
     std::vector<unsigned> leaving;
     for (auto const& e : m_entries) if (e.leaving) leaving.push_back(e.id);
     if (!leaving.empty()) {
-        batch.Completed([this, leaving](auto&&, auto&&) { Prune(leaving); });
+        // The dock can be rebuilt (settings, theme) before the shrink finishes; the callback must not touch it then.
+        batch.Completed([this, alive = std::weak_ptr<bool>(m_alive), leaving](auto&&, auto&&) {
+            if (!alive.expired()) Prune(leaving);
+        });
     }
     BuildExpressions();
 }
