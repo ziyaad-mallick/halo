@@ -19,7 +19,7 @@ build_halo() {
 
 build_guardian() {
   echo "== guardian.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/guardian.cpp src/taskbar.cpp -o build/guardian.exe \
+  "$CXX" "${COMMON[@]}" -mwindows src/guardian.cpp src/taskbar.cpp -o "${GUARDIAN_OUT:-build/guardian.exe}" \
     -lshell32 -luser32 -lole32 -ladvapi32
 }
 
