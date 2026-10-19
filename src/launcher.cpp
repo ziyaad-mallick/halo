@@ -88,7 +88,7 @@ constexpr float kResultRowH = 34, kResultIcon = 24;
 constexpr float kBottomH = 56;
 constexpr float kButtonH = 32;
 constexpr float kAvatar = 32;
-constexpr float kMenuW = 168;
+constexpr float kMenuW = 240;  // wide enough for "Use Windows taskbar" and its hint
 constexpr float kMenuRowH = 32;
 constexpr float kMenuPad = 8;
 constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 24;
@@ -108,7 +108,10 @@ inline winrt::Windows::UI::Color Col(D2D1_COLOR_F c) {
     return winrt::Windows::UI::ColorHelper::FromArgb(b(c.a), b(c.r), b(c.g), b(c.b));
 }
 
-constexpr wchar_t kMenuItems[5][10] = {L"Sleep", L"Restart", L"Shut down", L"Lock", L"Sign out"};
+constexpr wchar_t const* kMenuItems[] = {L"Sleep", L"Restart", L"Shut down", L"Lock", L"Sign out", L"Use Windows taskbar"};
+constexpr int kMenuCount = 6;
+constexpr int kMenuTaskbar = 5;                      // not a power action: hands the screen back to Windows' own taskbar
+constexpr wchar_t kMenuTaskbarHint[] = L"Win+Alt+T";  // the guardian's toggle
 
 void Log(std::wstring const& msg) {
     auto line = L"[halo] launcher: " + msg + L"\n";
@@ -735,12 +738,12 @@ void Launcher::Build() {
 
     // The Power menu opens above the Power button, right-aligned with it.
     m_menuW = std::round(kMenuW * s);
-    m_menuH = std::round((5 * kMenuRowH + 2 * kMenuPad) * s);
+    m_menuH = std::round((kMenuCount * kMenuRowH + 2 * kMenuPad) * s);
     m_menuX = std::round(m_powerRect.right - m_menuW);
     m_menuY = std::round(m_powerRect.top - 6 * s - m_menuH);
     m_menuRows.clear();
     m_menuHits.clear();
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < kMenuCount; i++) {
         float top = (kMenuPad + i * kMenuRowH) * s;
         m_menuRows.push_back(R(kMenuPad * s, top, m_menuW - kMenuPad * s, top + kMenuRowH * s));
         m_menuHits.push_back({R(m_menuX + kMenuPad * s, m_menuY + top, m_menuX + m_menuW - kMenuPad * s,
@@ -1189,9 +1192,15 @@ void Launcher::DrawMenu(ID2D1DeviceContext* dc, float ox, float oy) {
     winrt::com_ptr<ID2D1SolidColorBrush> white;
     dc->CreateSolidColorBrush(theme::P().text, white.put());
     auto fRow = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
-    for (int i = 0; i < 5; i++) {
+    winrt::com_ptr<ID2D1SolidColorBrush> dim;
+    dc->CreateSolidColorBrush(theme::P().dim, dim.put());
+    auto fHint = txt.Format(L"Segoe UI Variable Text", 11 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    for (int i = 0; i < kMenuCount; i++) {
         auto r = m_menuRows[i];
         txt.Draw(dc, kMenuItems[i], fRow.get(), R(r.left + 12 * s + ox, r.top + oy, r.right + ox, r.bottom + oy), white.get());
+        if (i == kMenuTaskbar)  // the shortcut, so the way back is learnt at the one place that offers it
+            txt.Draw(dc, kMenuTaskbarHint, fHint.get(), R(r.left + ox, r.top + oy, r.right - 12 * s + ox, r.bottom + oy), dim.get(),
+                     DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 }
 
@@ -1711,9 +1720,9 @@ void Launcher::Click(Hit const& hit) {
     }
 }
 
-// Sleep, Restart, Shut down, Lock, Sign out. Under HALO_TEST (or HALO_TEST_POWER_DRYRUN=1) only logs.
+// Sleep, Restart, Shut down, Lock, Sign out, then "Use Windows taskbar". Under HALO_TEST (or HALO_TEST_POWER_DRYRUN=1) only logs.
 void Launcher::RunPower(int item) {
-    if (item < 0 || item > 4) return;
+    if (item < 0 || item >= kMenuCount) return;
     if (m_dryRun) {
         Log(std::wstring(L"power: DRY RUN, would run ") + kMenuItems[item]);
         return;
@@ -1732,13 +1741,29 @@ void Launcher::RunPower(int item) {
             break;
         case 3: LockWorkStation(); break;
         case 4: ExitWindowsEx(EWX_LOGOFF, kReason); break;
+        case kMenuTaskbar: {  // guardian.exe --off turns Halo off and brings the Windows taskbar back; it sits next to halo.exe
+            wchar_t exe[MAX_PATH];
+            DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            if (!n || n >= MAX_PATH) break;
+            std::wstring dir(exe, n);
+            dir.resize(dir.find_last_of(L'\\') + 1);
+            std::wstring guardian = dir + L"guardian.exe";
+            SHELLEXECUTEINFOW sei{sizeof(sei)};
+            sei.fMask = SEE_MASK_FLAG_NO_UI;  // missing file: fail quietly, no dialog
+            sei.lpFile = guardian.c_str();
+            sei.lpParameters = L"--off";
+            sei.lpDirectory = dir.c_str();
+            sei.nShow = SW_HIDE;
+            if (!ShellExecuteExW(&sei)) Log(L"guardian --off failed (" + std::to_wstring(GetLastError()) + L")");
+            break;
+        }
     }
 }
 
 void Launcher::TestCommand(WPARAM w) {
     if (!m_open) return;
     if (w == 2) ToggleMenu(!m_menuOpen);
-    else if (w >= 3 && w < 8) RunPower(static_cast<int>(w) - 3);
+    else if (w >= 3 && w < 3 + kMenuCount) RunPower(static_cast<int>(w) - 3);
     else if (w == 9) {  // a click elsewhere
         Log(L"lost activation");
         Hide();
