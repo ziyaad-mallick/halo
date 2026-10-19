@@ -360,21 +360,23 @@ namespace wdr = winrt::Windows::Devices::Radios;
 
 void Radios::Start(HWND notify, UINT msg) {
     Stop();
-    Find(notify, msg, m_gen);
+    m_notify = notify;
+    m_msg = msg;
+    Find(notify, msg, m_gen, *m_gen);
 }
 
 void Radios::Stop() {
-    m_gen++;
+    ++*m_gen;
     m_wifiRev.revoke();
     m_btRev.revoke();
     m_wifi = nullptr;
     m_bt = nullptr;
 }
 
-winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, unsigned gen) {
+winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, std::shared_ptr<unsigned> live, unsigned gen) {
     try {
         auto radios = co_await wdr::Radio::GetRadiosAsync();  // resumes on the UI thread
-        if (gen != m_gen) co_return;
+        if (gen != *live) co_return;
         for (auto const& r : radios) {
             auto handler = [notify, msg](auto&&, auto&&) { PostMessageW(notify, msg, 0, 0); };
             if (r.Kind() == wdr::RadioKind::WiFi && !m_wifi) { m_wifi = r; m_wifiRev = r.StateChanged(winrt::auto_revoke, handler); }
@@ -384,17 +386,22 @@ winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, unsigned gen) {
     PostMessageW(notify, msg, 0, 0);
 }
 
-bool Radios::WifiOn() const { return m_wifi && m_wifi.State() == wdr::RadioState::On; }
-bool Radios::BluetoothOn() const { return m_bt && m_bt.State() == wdr::RadioState::On; }
+// An unplugged USB adapter leaves a closed Radio whose State() throws.
+static bool RadioIsOn(wdr::Radio const& r) {
+    try { return r && r.State() == wdr::RadioState::On; } catch (...) { return false; }
+}
+bool Radios::WifiOn() const { return RadioIsOn(m_wifi); }
+bool Radios::BluetoothOn() const { return RadioIsOn(m_bt); }
 
-winrt::fire_and_forget Radios::Set(wdr::Radio radio, bool on) {
+winrt::fire_and_forget Radios::Set(wdr::Radio radio, bool on, HWND notify, UINT msg) {
     if (!radio) co_return;
     if (DryRun()) { Log(std::wstring(L"DRYRUN radio ") + (radio.Kind() == wdr::RadioKind::WiFi ? L"wifi" : L"bluetooth") +
                         (on ? L" -> on" : L" -> off")); co_return; }
     try {
-        if (co_await wdr::Radio::RequestAccessAsync() != wdr::RadioAccessStatus::Allowed) co_return;
-        co_await radio.SetStateAsync(on ? wdr::RadioState::On : wdr::RadioState::Off);
+        if (co_await wdr::Radio::RequestAccessAsync() == wdr::RadioAccessStatus::Allowed)
+            co_await radio.SetStateAsync(on ? wdr::RadioState::On : wdr::RadioState::Off);
     } catch (...) {}
+    PostMessageW(notify, msg, 0, 0);  // the tile was flipped optimistically: if nothing changed, this puts the truth back
 }
 
 std::wstring ConnectedSsid() {
