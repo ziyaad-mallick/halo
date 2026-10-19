@@ -26,12 +26,16 @@ public:
     std::vector<RunningApp> Apps() const;       // in the order the apps first appeared
     std::vector<HWND> WindowsOf(std::wstring const& key) const;  // the app's windows, most recently active first
     HWND Front(std::wstring const& key) const;  // the app's most recently active window, or null
+    std::vector<HWND> Windows() const;          // every tracked window
     std::wstring KeyOf(HWND hwnd) const;        // the app a tracked window belongs to, or empty
 
     void OnEvent(DWORD event, HWND hwnd);  // WinEvent callback target
 
     // Called with the app of each tracked window that comes to the front.
     std::function<void(RunningApp const&)> onForeground;
+    // Called when a window starts or stops being tracked (not for the ones found while the tracker is built:
+    // read those from Windows()).
+    std::function<void(HWND, bool added)> onWindow;
 
 private:
     struct Win {
