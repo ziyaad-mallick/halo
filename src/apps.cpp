@@ -184,7 +184,14 @@ void WindowTracker::Update(HWND hwnd) {
     auto it = std::find_if(m_wins.begin(), m_wins.end(), [&](Win const& w) { return w.hwnd == hwnd; });
     bool is = IsAppWindow(hwnd);
     if (it != m_wins.end()) {
-        if (!is) Remove(hwnd);  // a tracked window keeps its identity
+        if (!is) return Remove(hwnd);
+        // A tracked window keeps its identity, unless it is given an app ID of its own after it appeared (Halo
+        // Settings does this to its Edge window).
+        std::wstring aumid = AumidOfWindow(hwnd);
+        if (!aumid.empty() && aumid != it->app.aumid) {
+            it->app.aumid = it->app.key = aumid;
+            Changed();
+        }
         return;
     }
     Win w{hwnd, {}};

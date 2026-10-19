@@ -8,6 +8,7 @@
 // Every request must carry the token and a Host of exactly 127.0.0.1:<port> (DNS-rebinding guard).
 // Flags (for testing): --serve            run the server only, no window, never exit on idle
 //                      --url-file <path>  where to write the page URL (default %LOCALAPPDATA%\Halo\settings-ui\url.txt)
+//                      --register         (re)write the Start-menu shortcut and exit (tools/install.ps1 runs this)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -16,6 +17,8 @@
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <propvarutil.h>
 
 #include <atomic>
 #include <cctype>
@@ -555,6 +558,82 @@ void Focus(HWND h) {
     SetForegroundWindow(h);
 }
 
+// The app ID Halo Settings goes by. Its Start shortcut carries it and so does its Edge window, so Halo's dock shows
+// the window as Halo Settings, with this exe's icon, rather than as an Edge page.
+constexpr wchar_t kAumid[] = L"Halo.Settings";
+constexpr GUID kAppUserModel = {0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}};
+const PROPERTYKEY kPkeyRelaunchCommand = {kAppUserModel, 2}, kPkeyRelaunchIcon = {kAppUserModel, 3},
+                  kPkeyRelaunchName = {kAppUserModel, 4}, kPkeyAumid = {kAppUserModel, 5};
+
+std::wstring SelfPath() {
+    wchar_t b[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameW(nullptr, b, ARRAYSIZE(b));
+    return {b, n};
+}
+
+bool SetProps(IPropertyStore* ps, std::vector<std::pair<PROPERTYKEY, std::wstring>> const& props) {
+    bool ok = true;
+    for (auto const& [key, value] : props) {  // the callers put the ID last, as the shell asks
+        PROPVARIANT v;
+        if (FAILED(InitPropVariantFromString(value.c_str(), &v))) return false;
+        ok = SUCCEEDED(ps->SetValue(key, v)) && ok;
+        PropVariantClear(&v);
+    }
+    return SUCCEEDED(ps->Commit()) && ok;
+}
+
+// "Halo Settings" in Start (and in Halo's search): a shortcut to this exe that carries kAumid.
+void EnsureShortcut() {
+    PWSTR programs = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs))) return;
+    std::wstring lnk = std::wstring(programs) + L"\\Halo Settings.lnk";
+    CoTaskMemFree(programs);
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) return;
+    std::wstring exe = SelfPath();
+    link->SetPath(exe.c_str());
+    link->SetWorkingDirectory(exe.substr(0, exe.find_last_of(L'\\')).c_str());
+    link->SetDescription(L"Customise Halo");
+    IPropertyStore* ps = nullptr;
+    IPersistFile* file = nullptr;
+    if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&ps)))) {
+        SetProps(ps, {{kPkeyAumid, kAumid}});
+        ps->Release();
+    }
+    if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file)))) {
+        file->Save(lnk.c_str(), TRUE);
+        file->Release();
+    }
+    link->Release();
+}
+
+// Gives the Edge window our ID and relaunch details, then sets its title again so window watchers (Halo's dock)
+// look at it again: setting a property raises no event of its own.
+void TagWindow(HWND h) {
+    IPropertyStore* ps = nullptr;
+    if (FAILED(SHGetPropertyStoreForWindow(h, IID_PPV_ARGS(&ps)))) return;
+    std::wstring exe = SelfPath();
+    SetProps(ps, {{kPkeyRelaunchCommand, L"\"" + exe + L"\""}, {kPkeyRelaunchIcon, exe + L",0"},
+                  {kPkeyRelaunchName, L"Halo Settings"}, {kPkeyAumid, kAumid}});
+    ps->Release();
+    wchar_t title[128] = {};
+    GetWindowTextW(h, title, 128);
+    SendMessageTimeoutW(h, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(title), SMTO_ABORTIFHUNG, 500, nullptr);
+}
+
+// Edge's window belongs to another process and turns up when it likes: look for it for up to 15 s.
+std::thread TagWhenShown() {
+    return std::thread([] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        for (int i = 0; i < 300; i++, Sleep(50))
+            if (HWND h = FindSettingsWindow()) {
+                TagWindow(h);
+                break;
+            }
+        if (SUCCEEDED(co)) CoUninitialize();
+    });
+}
+
 HANDLE LaunchEdge(std::wstring const& edge, std::wstring const& url, std::wstring const& profile) {
     std::wstring cmd = L"\"" + edge + L"\" --app=" + url + L" --user-data-dir=\"" + profile + L"\" --window-size=1080,760 --no-first-run --no-default-browser-check";
     STARTUPINFOW si{sizeof si};
@@ -585,6 +664,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (!wcscmp(argv[i], L"--serve")) serveOnly = true;
         else if (!wcscmp(argv[i], L"--url-file") && i + 1 < argc) urlFile = argv[++i];
     }
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    for (int i = 1; i < argc; i++)
+        if (!wcscmp(argv[i], L"--register")) {
+            EnsureShortcut();
+            return 0;
+        }
 
     std::wstring uiDir = st::Dir() + L"\\settings-ui";
     if (urlFile.empty()) urlFile = uiDir + L"\\url.txt";
@@ -597,7 +682,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             if (HWND h = FindSettingsWindow()) { Focus(h); return 0; }
             std::string url = ReadFileText(urlFile);
             std::wstring edge = FindEdge();
-            if (!url.empty() && !edge.empty()) CloseHandle(LaunchEdge(edge, Wide(url), uiDir));
+            if (!url.empty() && !edge.empty()) {
+                CloseHandle(LaunchEdge(edge, Wide(url), uiDir));
+                TagWhenShown().join();
+            }
             else if (!url.empty()) ShellExecuteW(nullptr, L"open", Wide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
         }
@@ -628,6 +716,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     std::wstring edge = FindEdge();
     HANDLE proc = edge.empty() ? nullptr : LaunchEdge(edge, Wide(url), uiDir);
+    if (proc) TagWhenShown().detach();
     if (proc) {
         ULONGLONG t0 = GetTickCount64();
         WaitForSingleObject(proc, INFINITE);

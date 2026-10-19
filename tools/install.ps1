@@ -28,14 +28,9 @@ foreach ($pair in @(@($Halo, 'halo.exe'), @($Guardian, 'guardian.exe'), @($Setti
         catch { if ($i -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
     }
 }
-# Halo Settings: a Start-menu shortcut (skipped if the exe wasn't built).
+# Halo Settings: its Start-menu shortcut, which carries its app ID (skipped if the exe wasn't built).
 if (Test-Path (Join-Path $app 'halo-settings.exe')) {
-    $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Halo Settings.lnk'
-    $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-    $sc.TargetPath = Join-Path $app 'halo-settings.exe'
-    $sc.WorkingDirectory = $app
-    $sc.Description = 'Customise Halo'
-    $sc.Save()
+    Start-Process (Join-Path $app 'halo-settings.exe') -ArgumentList '--register' -Wait
 }
 Start-Process $running
 Start-Sleep 3

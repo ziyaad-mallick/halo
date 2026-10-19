@@ -109,6 +109,7 @@ private:
     void DrawStatic(ID2D1DeviceContext* dc, float ox, float oy);
     void DrawSearch(ID2D1DeviceContext* dc, float ox, float oy);
     void DrawBody(ID2D1DeviceContext* dc, float ox, float oy);
+    void DrawList(ID2D1DeviceContext* dc, float ox, float oy);
     void DrawMenu(ID2D1DeviceContext* dc, float ox, float oy);
     void Redraw(wuc::CompositionDrawingSurface const& s, void (Launcher::*draw)(ID2D1DeviceContext*, float, float));
     wuc::CompositionDrawingSurface MakeSurface(float w, float h);
@@ -164,6 +165,14 @@ private:
     wuc::CompositionDrawingSurface m_searchSurface{nullptr}, m_bodySurface{nullptr};
     wuc::SpriteVisual m_caret{nullptr};
     wuc::ContainerVisual m_bodyIcons{nullptr};  // the body's icon sprites, swapped with the body
+    // The result rows: their own surface and icons, drawn a few rows past each end of what shows, in a holder that
+    // a scroll slides from where the rows were to where they are now (m_listClip cuts it to the list).
+    wuc::CompositionDrawingSurface m_listSurface{nullptr};
+    wuc::ContainerVisual m_listClip{nullptr}, m_listHold{nullptr}, m_listIcons{nullptr};
+    wuc::InsetClip m_listInset{nullptr};
+    float m_scrollFrom = 0;           // the slide's start offset (px)
+    LARGE_INTEGER m_scrollAt{};       // QPC when it started
+    float ScrollLeft() const;         // how far the running slide still has to go (px)
     wuc::ShapeVisual m_hover{nullptr};
     wuc::CompositionRoundedRectangleGeometry m_hoverShape{nullptr};
     wuc::ContainerVisual m_menu{nullptr};

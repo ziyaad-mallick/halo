@@ -25,7 +25,7 @@ build_guardian() {
 
 build_settings() {
   echo "== halo-settings.exe"
-  "$CXX" "${COMMON[@]}" -Wno-c23-extensions -mwindows src/settings_app.cpp src/settings.cpp res/halo-settings.res -o "${HALO_SETTINGS_OUT:-build/halo-settings.exe}" -lws2_32 -lpdh -lpsapi -lshell32 -luser32 -lole32 -ladvapi32 -lshlwapi
+  "$CXX" "${COMMON[@]}" -Wno-c23-extensions -mwindows src/settings_app.cpp src/settings.cpp res/halo-settings.res -o "${HALO_SETTINGS_OUT:-build/halo-settings.exe}" -lws2_32 -lpdh -lpsapi -lshell32 -luser32 -lole32 -luuid -ladvapi32 -lshlwapi
 }
 
 build_icons_test() {

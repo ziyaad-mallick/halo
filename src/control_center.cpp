@@ -172,8 +172,13 @@ struct ControlCenter::Impl {
     wuc::ShapeVisual hv{nullptr};
     wuc::CompositionDrawingSurface surf{nullptr};
     // Height changes: the window keeps the panel's tallest size and never moves; the frame springs to the new
-    // height (growing upward) while the old drawing (ghost) fades out where it was and the new one fades in.
-    wuc::SpriteVisual ghost{nullptr};
+    // height, growing upward from the fixed bottom edge. The drawing is shown in two parts split where the layout
+    // changed: `content` above the split rides the top edge, `lower` below it rides the bottom edge, and what opens
+    // between them (a list, the Power row) is uncovered like a drawer; what closes is the old drawing (ghost),
+    // covered the same way.
+    wuc::SpriteVisual lower{nullptr}, ghost{nullptr};
+    wuc::InsetClip upperClip{nullptr}, lowerClip{nullptr};
+    float split = 0;    // logical y in the new layout where it changed: what is above kept its place from the top
     float shownPx = 0;  // the panel height (px) the frame is at or springing to
     struct Chip {
         Item it;
@@ -203,6 +208,7 @@ struct ControlCenter::Impl {
     std::vector<svc::Device> outs;
     bool outsOpen = false;
     Expand expand = Expand::None;
+    size_t listCap = SIZE_MAX;  // the most list rows Layout() may show (it lowers this when the panel would not fit)
     float volume = 0;
     bool muted = false, micMuted = false, dnd = false, wifiOn = false, btOn = false, dark = false, energy = false, night = false;
     bool hotspotAvail = false, hotspotOn = false, savedWifi = true, savedBt = true, btAsked = false;
@@ -563,7 +569,6 @@ void ControlCenter::Impl::Park() {
     if (hv) { hv.StopAnimation(L"Opacity"); hv.Opacity(0); }
     hvShown = false;
     if (ghost) { inner.Children().Remove(ghost); ghost = nullptr; }
-    if (content) { content.StopAnimation(L"Opacity"); content.Opacity(1); }
     for (auto& c : chips) {  // back to rest, so the next open does not start with a lifted chip
         c.v.StopAnimation(L"Scale");
         c.v.StopAnimation(L"Offset");
@@ -600,7 +605,8 @@ void ControlCenter::Impl::Teardown() {
     chips.clear();
     hotChip = -1;
     shownPx = 0;
-    ghost = nullptr;
+    ghost = lower = nullptr;
+    upperClip = lowerClip = nullptr;
     surf = nullptr; content = nullptr; chipLayer = nullptr; ptr = nullptr; hv = nullptr; hvGeo = nullptr;
     pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr; specGeo = nullptr;
     items.clear();
@@ -1088,9 +1094,11 @@ void ControlCenter::Impl::Layout() {
     y += kPillH + kGap;
 
     // The Wi-Fi / Bluetooth list, when one is open.
+    size_t listed = 0;
     if (expand != Expand::None) {
         bool wifi = expand == Expand::Wifi;
-        size_t n = wifi ? svc::WifiNets().size() : svc::BtDevices().size();
+        size_t n = std::min(wifi ? svc::WifiNets().size() : svc::BtDevices().size(), listCap);
+        listed = n;
         float h = kS4 + kTitleLine + kS1 + std::max<size_t>(1, n) * kListRowH + kS2;
         add(Id::ListTile, {x0, y, x1, y + h}, 0, kRadiusLarge);
         for (size_t i = 0; i < n; i++) {
@@ -1158,6 +1166,12 @@ void ControlCenter::Impl::Layout() {
         y += kPowH + kGap;
     }
     y += kInset - kGap;
+    if (y > MaxH() && listed > 1) {  // a long list would push the panel off the screen: list only what fits
+        listCap = listed - std::min<size_t>(listed - 1, static_cast<size_t>(std::ceil((y - MaxH()) / kListRowH)));
+        Layout();
+        listCap = SIZE_MAX;
+        return;
+    }
     height = std::min({y, MaxH()});
 }
 
@@ -1191,13 +1205,13 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
         auto spring = [&] {
             auto a = comp.CreateSpringVector2Animation();
             a.DampingRatio(0.86f);
-            a.Period(std::chrono::milliseconds(48));
+            a.Period(std::chrono::milliseconds(60));
             return a;
         };
         auto move = comp.CreateSpringVector3Animation();
         move.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(at));
         move.DampingRatio(0.86f);
-        move.Period(std::chrono::milliseconds(48));
+        move.Period(std::chrono::milliseconds(60));
         pill.StartAnimation(L"Offset", move);
         auto size = [&](wuc::CompositionObject const& o, wfn::float2 to) {
             auto a = spring();
@@ -1210,36 +1224,45 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
         size(clip, {wPx, hPx});
         size(rim, {wPx - s, hPx - s});
         if (specGeo) size(specGeo, {wPx - 3 * s, hPx - 3 * s});
-        // The old drawing stays where it was on screen (it rides the pill, so it moves against it) and fades.
         if (ghost) { inner.Children().Remove(ghost); ghost = nullptr; }
-        if (oldPx > 0) {
+        const float S = std::round(split * s), maxPx = MaxPx();
+        // `inner` is springing to hPx: `lower` keeps its drawing on the bottom edge and starts where `content` ends.
+        auto follow = [&](wuc::CompositionObject const& o, wchar_t const* prop, wchar_t const* expr, float h) {
+            auto e = comp.CreateExpressionAnimation(expr);
+            e.SetReferenceParameter(L"inner", inner);
+            e.SetScalarParameter(L"H", h);
+            e.SetScalarParameter(L"S", S);
+            o.StartAnimation(prop, e);
+        };
+        upperClip.BottomInset(maxPx - S);
+        follow(lower, L"Offset.Y", L"inner.Size.Y - H", hPx);
+        follow(lowerClip, L"TopInset", L"S + Max(0, H - inner.Size.Y)", hPx);
+        if (oldPx > hPx) {
+            // Closing: the old drawing of what went away stays put on the bottom edge and is covered from the top.
             auto old = comp.CreateSpriteVisual();
             old.Size(content.Size());
             old.Brush(content.Brush());  // the old drawing keeps its surface; the new layout gets a fresh one
-            surf = gdev.CreateDrawingSurface({wPx, MaxPx()}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            auto oc = comp.CreateInsetClip();
+            oc.BottomInset(maxPx - (S + oldPx - hPx));
+            old.Clip(oc);
+            follow(old, L"Offset.Y", L"inner.Size.Y - H", oldPx);
+            follow(oc, L"TopInset", L"S + Max(0, H - inner.Size.Y)", oldPx);
+            auto fade = comp.CreateScalarKeyFrameAnimation();
+            fade.InsertKeyFrame(1.0f, 0.0f, comp.CreateCubicBezierEasingFunction({0.4f, 0.0f}, {1.0f, 1.0f}));
+            fade.Duration(std::chrono::milliseconds(ui::kSlowMs));
+            old.StartAnimation(L"Opacity", fade);
+            inner.Children().InsertBelow(old, content);
+            ghost = old;
+        }
+        if (oldPx > 0) {
+            surf = gdev.CreateDrawingSurface({wPx, maxPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                                              winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
             auto sb = comp.CreateSurfaceBrush(surf);
             sb.Stretch(wuc::CompositionStretch::None);
             sb.HorizontalAlignmentRatio(0);
             sb.VerticalAlignmentRatio(0);
             content.Brush(sb);
-            inner.Children().InsertAbove(old, content);
-            auto stay = comp.CreateSpringVector3Animation();
-            stay.InitialValue(winrt::Windows::Foundation::IReference<wfn::float3>(wfn::float3{0, 0, 0}));
-            stay.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(wfn::float3{0, hPx - oldPx, 0}));
-            stay.DampingRatio(0.86f);
-            stay.Period(std::chrono::milliseconds(48));
-            old.StartAnimation(L"Offset", stay);
-            auto fade = comp.CreateScalarKeyFrameAnimation();
-            fade.InsertKeyFrame(1.0f, 0.0f, comp.CreateCubicBezierEasingFunction({0.4f, 0.0f}, {1.0f, 1.0f}));
-            fade.Duration(std::chrono::milliseconds(ui::kFastMs));
-            old.StartAnimation(L"Opacity", fade);
-            ghost = old;
-            auto in = comp.CreateScalarKeyFrameAnimation();
-            in.InsertKeyFrame(0.0f, 0.0f);
-            in.InsertKeyFrame(1.0f, 1.0f, comp.CreateCubicBezierEasingFunction({0.0f, 0.0f}, {0.2f, 1.0f}));
-            in.Duration(std::chrono::milliseconds(ui::kFastMs + 40));
-            content.StartAnimation(L"Opacity", in);
+            lower.Brush(sb);
         }
         return;
     }
@@ -1249,6 +1272,13 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
     clip.Size({wPx, hPx});
     rim.Size({wPx - s, hPx - s});
     if (specGeo) specGeo.Size({wPx - 3 * s, hPx - 3 * s});
+    if (upperClip) upperClip.BottomInset(0);
+    if (lower) {
+        lower.StopAnimation(L"Offset.Y");
+        lower.Offset({0, 0, 0});
+        lowerClip.StopAnimation(L"TopInset");
+        lowerClip.TopInset(MaxPx());
+    }
 }
 
 void ControlCenter::Impl::Settle() {
@@ -1263,7 +1293,12 @@ void ControlCenter::Impl::Settle() {
 void ControlCenter::Impl::Render() {
     if (!surf || st != St::Open) return;
     if (settling) { held = true; return; }
+    const auto before = items;
     Layout();
+    split = 0;  // the lowest edge of what kept its place from the top (what changed is under it)
+    for (auto const& it : items)
+        for (auto const& b : before)
+            if (Same(b, it) && b.r.top == it.r.top && b.r.bottom == it.r.bottom) split = std::max(split, it.r.bottom);
     ApplySize();
     auto interop = surf.as<ICompositionDrawingSurfaceInterop>();
     winrt::com_ptr<ID2D1DeviceContext> dc;
@@ -1683,6 +1718,15 @@ void ControlCenter::Impl::BuildVisuals() {
     sb.Stretch(wuc::CompositionStretch::None);
     content.Brush(sb);
     inner.Children().InsertAtTop(content);
+    upperClip = comp.CreateInsetClip();
+    content.Clip(upperClip);
+    lower = comp.CreateSpriteVisual();
+    lower.Size({wPx, MaxPx()});
+    lower.Brush(sb);
+    lowerClip = comp.CreateInsetClip();
+    lowerClip.TopInset(MaxPx());  // nothing until a height change splits the drawing
+    lower.Clip(lowerClip);
+    inner.Children().InsertAbove(lower, content);
 
     // The hover highlight: one rounded rect that fades and glides between controls.
     hv = comp.CreateShapeVisual();

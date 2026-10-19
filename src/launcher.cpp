@@ -95,6 +95,7 @@ constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
 constexpr int kMaxApps = 6, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
 constexpr UINT_PTR kRefreshTimer = 1;
+constexpr int kListBuffer = 4, kScrollMs = 180;  // rows drawn past each end of the list; the scroll slide
 constexpr UINT kMsgAppsFolder = WM_APP + 1;  // lParam: a Launcher::Found* from the Apps folder thread, owned by the panel
 constexpr float kPanelRadius = 28;  // local: theme.h has no panel-radius token
 // Icon motion, matched to the dock: hover swells and lifts on a spring, a press squashes, a click bounces.
@@ -851,6 +852,22 @@ void Launcher::Build() {
         m_bodyIcons.Size({m_w, m_h});
         m_content.Children().InsertAtTop(m_bodyIcons);
     }
+    {   // the result rows
+        const float h = (std::ceil((m_bodyBottom - m_bodyTop) / (kResultRowH * s)) + 2 * kListBuffer) * kResultRowH * s;
+        m_listSurface = MakeSurface(m_w, h);
+        m_listClip = m_comp.CreateContainerVisual();
+        m_listClip.Size({m_w, m_h});
+        m_listInset = m_comp.CreateInsetClip();
+        m_listClip.Clip(m_listInset);
+        m_listHold = m_comp.CreateContainerVisual();
+        m_listHold.Size({m_w, h});
+        m_listHold.Children().InsertAtTop(MakeSurfaceVisual(m_listSurface, m_w, h));
+        m_listIcons = m_comp.CreateContainerVisual();
+        m_listIcons.Size({m_w, h});
+        m_listHold.Children().InsertAtTop(m_listIcons);
+        m_listClip.Children().InsertAtTop(m_listHold);
+        m_content.Children().InsertAtTop(m_listClip);
+    }
 
     // The menu: its own glass, dimming the panel behind it while it is open.
     m_menu = m_comp.CreateContainerVisual();
@@ -916,19 +933,38 @@ void Launcher::BuildBody() {
         return ic;
     };
 
+    m_listIcons.Children().RemoveAll();
+    m_listHold.StopAnimation(L"Offset.Y");
+    m_scrollFrom = 0;
+    m_listClip.IsVisible(results);
     if (results) {
+        const float rowPx = kResultRowH * s;
         for (size_t i = 0; i < m_results.size(); i++) {
-            float top = ListTop() + i * kResultRowH * s;
-            auto row = R((kPad - 8) * s, top, m_w - (kPad - 8) * s, top + kResultRowH * s);
+            float top = ListTop() + i * rowPx;
+            auto row = R((kPad - 8) * s, top, m_w - (kPad - 8) * s, top + rowPx);
             m_resultRows.push_back(row);
             m_hits.push_back({row, Kind::Result, static_cast<int>(i)});
-            auto const& r = m_results[i];
+        }
+        // The rows on screen and kListBuffer past each end, so a scroll slides real rows in.
+        const int total = static_cast<int>(m_matches.size()), rows = ListRows();
+        m_listInset.TopInset(ListTop());
+        m_listInset.BottomInset(m_h - (ListTop() + rows * rowPx));  // whole rows only: a cut-off one could not be clicked
+        m_listHold.Offset({0, ListTop() - kListBuffer * rowPx, 0});
+        for (int j = -kListBuffer; j < rows + kListBuffer; j++) {
+            const int k = m_scroll + j;
+            if (k < 0 || k >= total) continue;
+            auto const& r = m_matches[k];
             auto brush = r.type == Result::Type::File ? FileBrush(r.path, kResultIcon)
                          : m_host.appIcon ? m_host.appIcon(r.type == Result::Type::App ? r.path : kSettingsApp)
                                           : nullptr;
-            float ix = row.left + 12 * s, iy = row.top + (kResultRowH - kResultIcon) / 2 * s;
-            sprite(brush, R(ix, iy, ix + kResultIcon * s, iy + kResultIcon * s));
+            if (!brush) continue;
+            auto v = m_comp.CreateSpriteVisual();
+            v.Size({kResultIcon * s, kResultIcon * s});
+            v.Offset({(kPad - 8 + 12) * s, (j + kListBuffer) * rowPx + (kResultRowH - kResultIcon) / 2 * s, 0});
+            v.Brush(brush);
+            m_listIcons.Children().InsertAtTop(v);
         }
+        Redraw(m_listSurface, &Launcher::DrawList);
     } else {
         for (size_t i = 0; i < m_apps.size(); i++) {
             auto const& c = m_appCells[i];
@@ -1116,16 +1152,6 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
             txt.Draw(dc, m_query.empty() ? std::wstring(L"No apps found") : L"No results for \"" + m_query + L"\"", fRow.get(),
                      at(R(kPad * s, ListTop(), m_w - kPad * s, ListTop() + kResultRowH * s)), dim.get(),
                      DWRITE_TEXT_ALIGNMENT_LEADING, true);
-        for (size_t i = 0; i < m_results.size(); i++) {
-            auto const& row = m_resultRows[i];
-            float textX = row.left + (12 + kResultIcon + 12) * s;
-            txt.Draw(dc, m_results[i].name, fRow.get(), at(R(textX, row.top, row.right - 72 * s, row.bottom)), white.get(),
-                     DWRITE_TEXT_ALIGNMENT_LEADING, true);
-            if (ListHeader()) continue;  // every row of All apps is an app
-            static constexpr const wchar_t* kTypeNames[] = {L"App", L"Setting", L"File"};
-            txt.Draw(dc, kTypeNames[static_cast<int>(m_results[i].type)], fName.get(),
-                     at(R(row.right - 68 * s, row.top, row.right - 14 * s, row.bottom)), dim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
-        }
         // A thin thumb in the right margin when there is more than fits.
         const int total = static_cast<int>(m_matches.size()), rows = ListRows();
         if (total > rows) {
@@ -1408,7 +1434,57 @@ void Launcher::Scroll(int rows) {
     ShowMatches();
     if (m_scroll == before) return;
     m_sel = std::clamp(m_sel - (m_scroll - before), 0, std::max(0, static_cast<int>(m_results.size()) - 1));
+    // The rows start where they were (plus what is left of a slide still running) and glide to their new place.
+    const float rowPx = kResultRowH * m_s, limit = kListBuffer * rowPx;
+    const float from = std::clamp(ScrollLeft() + (m_scroll - before) * rowPx, -limit, limit);
     BuildBody();
+    const float y = ListTop() - limit;
+    auto slide = m_comp.CreateScalarKeyFrameAnimation();
+    auto linear = m_comp.CreateLinearEasingFunction();
+    for (int k = 0; k <= 8; k++) {  // an ease-out cubic, in steps ScrollLeft() can follow
+        const float t = k / 8.0f;
+        slide.InsertKeyFrame(t, y + from * std::pow(1 - t, 3.0f), linear);
+    }
+    slide.Duration(std::chrono::milliseconds(kScrollMs));
+    m_listHold.StartAnimation(L"Offset.Y", slide);
+    m_scrollFrom = from;
+    QueryPerformanceCounter(&m_scrollAt);
+}
+
+float Launcher::ScrollLeft() const {
+    if (!m_scrollFrom) return 0;
+    LARGE_INTEGER now, fq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&fq);
+    const float t = (now.QuadPart - m_scrollAt.QuadPart) * 1000.0f / fq.QuadPart / kScrollMs;
+    return t >= 1 ? 0 : m_scrollFrom * std::pow(1 - t, 3.0f);
+}
+
+// The result rows, kListBuffer past each end of what shows: name, and what it is (except in All apps).
+void Launcher::DrawList(ID2D1DeviceContext* dc, float ox, float oy) {
+    const float s = m_s, rowPx = kResultRowH * s;
+    Text txt{m_dwrite};
+    dc->Clear(D2D1::ColorF(0, 0.0f));
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    auto const& pal = theme::P();
+    winrt::com_ptr<ID2D1SolidColorBrush> white, dim;
+    dc->CreateSolidColorBrush(pal.text, white.put());
+    dc->CreateSolidColorBrush(pal.dim, dim.put());
+    auto fRow = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    auto fName = txt.Format(L"Segoe UI Variable Text", 12 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    static constexpr const wchar_t* kTypeNames[] = {L"App", L"Setting", L"File"};
+    const int total = static_cast<int>(m_matches.size()), rows = ListRows();
+    const float left = ox + (kPad - 8) * s, right = ox + m_w - (kPad - 8) * s;
+    for (int j = -kListBuffer; j < rows + kListBuffer; j++) {
+        const int k = m_scroll + j;
+        if (k < 0 || k >= total) continue;
+        const float top = oy + (j + kListBuffer) * rowPx;
+        txt.Draw(dc, m_matches[k].name, fRow.get(), R(left + (12 + kResultIcon + 12) * s, top, right - 72 * s, top + rowPx), white.get(),
+                 DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        if (!ListHeader())  // every row of All apps is an app
+            txt.Draw(dc, kTypeNames[static_cast<int>(m_matches[k].type)], fName.get(), R(right - 68 * s, top, right - 14 * s, top + rowPx),
+                     dim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
 }
 
 void Launcher::ToggleAllApps() {
