@@ -24,6 +24,7 @@ constexpr DWORD kHideAfterAliveMs = 3000;
 constexpr DWORD kCrashWindowMs = 120000;
 constexpr size_t kMaxCrashes = 3;
 constexpr UINT_PTR kRehideTimer = 1;
+constexpr DWORD kStartupGraceMs = 20000;  // halo gets this long to show its dock before the taskbar stays put
 constexpr DWORD kCloseWaitMs = 3000;  // how long halo gets to close itself before TerminateProcess
 constexpr int kHotkeyToggle = 1;      // Win+Alt+T
 enum Cmd : WPARAM { kCmdOn = 1, kCmdOff = 2, kCmdQuit = 3 };  // second instance -> first instance
@@ -86,6 +87,7 @@ void SafeRestore() {
 class Guardian {
 public:
     bool noUi = false;
+    DWORD adoptPid = 0;  // --adopt: a running halo.exe whose guardian died
 
     int Run() {
         WNDCLASSW wc{};
@@ -119,7 +121,10 @@ public:
 
         Log(L"guardian started");
         WatchTaskbar();
-        TurnOn(L"startup");
+        if (adoptPid) Adopt(adoptPid); else TurnOn(L"startup");
+        if (hookThread_)
+            foregroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+                                              &Guardian::OnForeground, 0, 0, WINEVENT_OUTOFCONTEXT);
 
         while (!quit_) {
             DWORD timeout = INFINITE;
@@ -144,10 +149,20 @@ public:
             }
             now = GetTickCount();
             if (proc_ && pendingHide_ && Remaining(hideAt_, now) == 0) {
-                pendingHide_ = false;
-                SafeHide();
-                hidden_ = true;
-                Log(L"halo alive %lu ms, taskbar hidden", kHideAfterAliveMs);
+                if (HaloWindowUp()) {
+                    pendingHide_ = false;
+                    SafeHide();
+                    hidden_ = true;
+                    Log(L"halo alive with its dock up, taskbar hidden");
+                } else if (now - launchedAt_ < kStartupGraceMs) {
+                    hideAt_ = now + 500;  // slow machine: keep waiting for the dock window
+                } else {
+                    // Alive but never drew a dock (hung in startup): hiding the taskbar would strand the user.
+                    Log(L"halo showed no dock in %lu ms; killing it", kStartupGraceMs);
+                    TerminateProcess(proc_.get(), 0xDEAD);
+                    WaitForSingleObject(proc_.get(), 2000);
+                    OnHaloExit();
+                }
             }
             if (!proc_ && relaunchPending_ && !quit_ && Remaining(relaunchAt_, now) == 0) {
                 relaunchPending_ = false;
@@ -169,7 +184,7 @@ private:
     HWND hwnd_ = nullptr;
     HANDLE hookThread_ = nullptr;
     DWORD hookThreadId_ = 0;
-    static inline bool hookOk_ = false;
+    static inline volatile bool hookOk_ = false;
     UINT taskbarCreated_ = 0, cmdMsg_ = 0;
     Handle proc_;
     bool on_ = false, hidden_ = false, pendingHide_ = false, relaunchPending_ = false, quit_ = false, down_ = false;
@@ -177,7 +192,8 @@ private:
     std::vector<DWORD> crashes_;
     int exitCode_ = 0;
 
-    HWINEVENTHOOK showHook_ = nullptr;
+    HWINEVENTHOOK showHook_ = nullptr, foregroundHook_ = nullptr;
+    DWORD launchedAt_ = 0;
 
     // Explorer shows the hidden taskbar again on its own (Win+A / Win+N flyouts, an edge swipe, a
     // fullscreen app exiting). Watch explorer's window-show events and hide it again a moment later.
@@ -216,7 +232,8 @@ private:
 
     void Launch() {
         std::wstring path = HaloPath();
-        std::wstring cmd = L"\"" + path + L"\"";
+        // halo watches this pid and, if we die while it runs, starts a guardian that adopts it.
+        std::wstring cmd = L"\"" + path + L"\" --guardian " + std::to_wstring(GetCurrentProcessId());
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
@@ -231,8 +248,11 @@ private:
         CloseHandle(pi.hThread);
         proc_.reset(pi.hProcess);
         Log(L"halo launched, pid %lu", pi.dwProcessId);
-        pendingHide_ = !hidden_;  // relaunch: hide again once alive for 3 s
-        hideAt_ = GetTickCount() + kHideAfterAliveMs;
+        // Hide only once halo has put its dock on screen (HaloWindowUp): never before, so a halo that
+        // cannot start leaves the taskbar alone.
+        pendingHide_ = !hidden_;
+        launchedAt_ = GetTickCount();
+        hideAt_ = launchedAt_ + kHideAfterAliveMs;
     }
 
     void OnHaloExit() {
@@ -285,10 +305,45 @@ private:
         Log(L"ON (%ls): hiding taskbar, launching halo", why);
         on_ = true;
         crashes_.clear();
-        SafeHide();
-        hidden_ = true;
         Launch();
     }
+
+    // A previous guardian died with halo still running (halo started us with --adopt <its pid>).
+    void Adopt(DWORD pid) {
+        HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        wchar_t img[MAX_PATH * 2] = {};
+        DWORD n = MAX_PATH * 2;
+        std::wstring want = HaloPath();
+        if (!h || !QueryFullProcessImageNameW(h, 0, img, &n) || _wcsicmp(img, want.c_str()) != 0) {
+            Log(L"--adopt %lu: not a halo.exe of ours (error %lu); restoring taskbar", pid, GetLastError());
+            if (h) CloseHandle(h);
+            SafeRestore();
+            quit_ = true;  // nothing to guard; never relaunch on a failed adoption
+            return;
+        }
+        proc_.reset(h);
+        on_ = true;
+        SafeHide();  // it is hidden already; this also re-arms the state file
+        hidden_ = true;
+        Log(L"adopted halo, pid %lu", pid);
+    }
+
+    static bool HaloWindowUp(DWORD pid) {
+        struct Ctx { DWORD pid; bool up; } c{pid, false};
+        EnumWindows(
+            [](HWND w, LPARAM l) -> BOOL {
+                auto* c = reinterpret_cast<Ctx*>(l);
+                wchar_t cls[64] = {};
+                GetClassNameW(w, cls, 63);
+                DWORD p = 0;
+                GetWindowThreadProcessId(w, &p);
+                if (p == c->pid && wcscmp(cls, L"HaloDockWindow") == 0 && IsWindowVisible(w)) c->up = true;
+                return !c->up;
+            },
+            reinterpret_cast<LPARAM>(&c));
+        return c.up;
+    }
+    bool HaloWindowUp() const { return proc_ && HaloWindowUp(GetProcessId(proc_.get())); }
 
     // Ask halo to close (WM_CLOSE to its dock window), kill it after a timeout.
     void CloseHalo() {
@@ -327,6 +382,8 @@ private:
         if (down_) return;
         down_ = true;
         Log(L"shutdown requested (%ls)", why);
+        if (foregroundHook_) UnhookWinEvent(foregroundHook_);
+        foregroundHook_ = nullptr;
         if (proc_) {
             TerminateProcess(proc_.get(), 0xDEAD);
             WaitForSingleObject(proc_.get(), 3000);
@@ -338,30 +395,76 @@ private:
     }
 
     // Fallback for Win+Alt+T when RegisterHotKey is refused: swallow the T and post WM_HOTKEY.
+    // Windows silently drops a low-level hook whose thread is too slow to answer (LowLevelHooksTimeout),
+    // which a starved weak machine can cause. So the thread only pumps and runs above normal priority,
+    // the hook proc is a tick store plus two key-state reads, and the hook is reinstalled when it looks dead.
+    static inline HHOOK hook_ = nullptr;
+    static inline volatile DWORD lastKeyTick_ = 0, lastReinstall_ = 0;
+    static constexpr UINT kMsgReinstall = WM_APP + 1;
+
     static DWORD WINAPI HookThread(LPVOID ready) {
-        HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, &Guardian::KeyHook, GetModuleHandleW(nullptr), 0);
-        hookOk_ = hook != nullptr;
-        SetEvent(static_cast<HANDLE>(ready));
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         MSG m;
-        while (GetMessageW(&m, nullptr, 0, 0) > 0) DispatchMessageW(&m);
-        if (hook) UnhookWindowsHookEx(hook);
+        PeekMessageW(&m, nullptr, WM_USER, WM_USER, PM_NOREMOVE);  // the queue must exist before anyone posts to it
+        InstallHook();
+        SetEvent(static_cast<HANDLE>(ready));
+        while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+            if (m.message == kMsgReinstall && m.hwnd == nullptr) {
+                if (hook_) UnhookWindowsHookEx(hook_);
+                InstallHook();
+            } else {
+                DispatchMessageW(&m);
+            }
+        }
+        if (hook_) UnhookWindowsHookEx(hook_);
+        hook_ = nullptr;
         return 0;
     }
 
+    static void InstallHook() {
+        hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &Guardian::KeyHook, GetModuleHandleW(nullptr), 0);
+        hookOk_ = hook_ != nullptr;
+        const DWORD now = GetTickCount();
+        lastKeyTick_ = now;
+        lastReinstall_ = now;
+    }
+
+    // Ask the hook thread to reinstall, at most every 5 s.
+    void ReinstallHook(bool force) {
+        if (!hookThread_) return;
+        DWORD now = GetTickCount();
+        if (!force && now - lastReinstall_ < 5000) return;
+        lastReinstall_ = now;
+        PostThreadMessageW(hookThreadId_, kMsgReinstall, 0, 0);
+    }
+
+    // No polling: the check rides on foreground changes, which only happen while the user is active.
+    // A dead hook shows as input newer than the last key it saw (mouse input counts too, so a false
+    // alarm just costs one reinstall).
+    static void CALLBACK OnForeground(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+        LASTINPUTINFO li{sizeof(li)};
+        if (g_self && GetLastInputInfo(&li) && static_cast<LONG>(li.dwTime - lastKeyTick_) > 2000)
+            g_self->ReinstallHook(false);
+    }
+
     static LRESULT CALLBACK KeyHook(int code, WPARAM w, LPARAM l) {
-        static bool win = false, alt = false, swallowed = false;
+        static bool swallowed = false;
         if (code == HC_ACTION && g_self) {
             auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(l);
-            const bool down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
-            if (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN) win = down;
-            else if (k->vkCode == VK_LMENU || k->vkCode == VK_RMENU || k->vkCode == VK_MENU) alt = down;
-            else if (k->vkCode == 'T') {
-                if (down && win && alt) {
-                    if (!swallowed) PostMessageW(g_self->hwnd_, WM_HOTKEY, kHotkeyToggle, 0);
-                    swallowed = true;
-                    return 1;
-                }
-                if (!down && swallowed) {
+            lastKeyTick_ = GetTickCount();
+            if (k->vkCode == 'T') {
+                if (w == WM_KEYDOWN || w == WM_SYSKEYDOWN) {
+                    // Live key state, not tracked Win/Alt presses: a Win+L lock or a secure desktop eats the
+                    // release events and a tracked flag would stay stuck on.
+                    const bool win = (GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000;
+                    const bool alt = GetAsyncKeyState(VK_MENU) & 0x8000;
+                    if (win && alt) {
+                        if (!swallowed) PostMessageW(g_self->hwnd_, WM_HOTKEY, kHotkeyToggle, 0);
+                        swallowed = true;
+                        return 1;
+                    }
+                    swallowed = false;
+                } else if (swallowed) {
                     swallowed = false;
                     return 1;
                 }
@@ -422,6 +525,9 @@ private:
                     return 0;
                 }
                 break;
+            case WM_POWERBROADCAST:
+                if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) ReinstallHook(true);
+                return TRUE;
             case WM_QUERYENDSESSION:
                 return TRUE;
             case WM_ENDSESSION:
@@ -490,6 +596,33 @@ bool SendCommand(WPARAM cmd) {
     return false;
 }
 
+// --off / --restore with no guardian to do it: close any halo.exe ourselves, or its Win-key and
+// Win+A hooks would keep running after the taskbar is back. Ask first, kill after kCloseWaitMs.
+void CloseStrayHalos() {
+    std::vector<DWORD> pids;
+    EnumWindows(
+        [](HWND w, LPARAM l) -> BOOL {
+            wchar_t cls[64] = {};
+            GetClassNameW(w, cls, 63);
+            if (wcscmp(cls, L"HaloDockWindow") != 0) return TRUE;
+            DWORD p = 0;
+            GetWindowThreadProcessId(w, &p);
+            if (p) reinterpret_cast<std::vector<DWORD>*>(l)->push_back(p);
+            PostMessageW(w, WM_CLOSE, 0, 0);
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&pids));
+    for (DWORD p : pids) {
+        Handle h(OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, p));
+        if (!h) continue;
+        if (WaitForSingleObject(h.get(), kCloseWaitMs) != WAIT_OBJECT_0) {
+            Log(L"stray halo %lu ignored WM_CLOSE; TerminateProcess", p);
+            TerminateProcess(h.get(), 0xDEAD);
+            WaitForSingleObject(h.get(), 2000);
+        }
+    }
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
@@ -500,7 +633,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     const bool quit = argv && HasFlag(argc, argv, L"--quit");
     const bool noUi = argv && HasFlag(argc, argv, L"--no-ui");
     int autostart = -1;
+    DWORD adopt = 0;
     if (argv) {
+        for (int i = 1; i + 1 < argc; ++i)
+            if (_wcsicmp(argv[i], L"--adopt") == 0) adopt = static_cast<DWORD>(_wtoi(argv[i + 1]));
         for (int i = 1; i < argc; ++i)
             if (_wcsicmp(argv[i], L"--autostart") == 0) {
                 autostart = Autostart(i + 1 < argc ? argv[i + 1] : nullptr);
@@ -516,24 +652,30 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (adopt) return 0;  // another guardian came up first; it owns the taskbar
         const wchar_t* what = quit ? L"quit" : (off || restore) ? L"off" : L"on";
         if (SendCommand(quit ? kCmdQuit : (off || restore) ? kCmdOff : kCmdOn)) {
             Log(L"told the running guardian: %ls", what);
             return 0;
         }
         Log(L"running guardian did not answer");
-        if (restore || off) SafeRestore();  // the emergency path must work even with a wedged guardian
+        if (restore || off) {  // the emergency path must work even with a wedged guardian
+            CloseStrayHalos();
+            SafeRestore();
+        }
         return 1;
     }
     if (quit) return 0;
     if (restore || off) {
-        Log(L"%ls: restoring native taskbar", restore ? L"--restore" : L"--off");
+        Log(L"%ls: no guardian running; closing halo, restoring native taskbar", restore ? L"--restore" : L"--off");
+        CloseStrayHalos();
         SafeRestore();
         return 0;
     }
     try {
         Guardian g;
         g.noUi = noUi;
+        g.adoptPid = adopt;
         return g.Run();
     } catch (...) {
         Log(L"fatal exception; restoring taskbar");
