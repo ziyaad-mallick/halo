@@ -605,10 +605,13 @@ void ControlCenter::Impl::Teardown() {
     hover = pressed = {};
     tracking = false;
     hvShown = false;
+    st = St::Closed;  // before DestroyWindow: its WM_ACTIVATE must not find the panel Open and Close() it again
     if (hwnd) { KillTimer(hwnd, kTimerClose); DestroyWindow(hwnd); }
     hwnd = nullptr;
-    if (surf) surf.Close();
-    for (auto& c : chips) if (c.surf) c.surf.Close();
+    try {  // Close() throws once the compositor is gone (exit); this also runs from the destructor
+        if (surf) surf.Close();
+        for (auto& c : chips) if (c.surf) c.surf.Close();
+    } catch (winrt::hresult_error const&) {}
     chips.clear();
     hotChip = -1;
     shownPx = 0;
@@ -617,7 +620,6 @@ void ControlCenter::Impl::Teardown() {
     surf = nullptr; content = nullptr; chipLayer = nullptr; ptr = nullptr; hv = nullptr; hvGeo = nullptr;
     pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr; specGeo = nullptr;
     items.clear();
-    st = St::Closed;
     rect = {};
     if (wasOpen && api->onHidden) api->onHidden();
 }
@@ -1829,7 +1831,7 @@ ControlCenter::~ControlCenter() {
     m->radios.Stop();
     m->speaker.Unbind();
     m->mic.Unbind();
-    m->Teardown();
+    try { m->Teardown(); } catch (...) {}  // a destructor is noexcept: a WinRT failure here would terminate the exit
     if (m->hot) DestroyWindow(m->hot);
 }
 

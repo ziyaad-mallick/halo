@@ -1415,11 +1415,11 @@ void NotificationCenter::Impl::Teardown() {
     root = nullptr;
     target = nullptr;
     noise = nullptr;
+    st = St::Closed;  // before DestroyWindow: its WM_ACTIVATE must not find the column Open and dismiss both panels
     if (hwnd) DestroyWindow(hwnd);
     hwnd = nullptr;
     hoverCard = -1;
     tracking = false;
-    st = St::Closed;
 }
 
 // ---------------------------------------------------------------------------------------------
