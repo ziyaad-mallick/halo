@@ -1255,15 +1255,19 @@ LRESULT Halo::DockIconForWindow(HWND win, LPARAM op) {
     return 0;
 }
 
-// Where Halo's own swoop lands: the window's dock icon, if the dock is up on the window's monitor. Not when it
-// is hidden (the mod reveals it; here the window simply goes) or under reduce_motion.
+// Where Halo's own swoop lands: the window's dock icon, on the window's monitor. A hidden dock is revealed and
+// held for the swoop, as for the mod (DockIconForWindow); under reduce_motion there is none.
 bool Halo::SwoopTarget(HWND win, RECT const& from, RECT& icon) {
-    if (!m_dock || !m_tracker || m_state != State::Shown || m_cfg.reduceMotion) return false;
+    if (!m_dock || !m_tracker || m_cfg.reduceMotion) return false;
     if (MonitorFromRect(&from, MONITOR_DEFAULTTONEAREST) != m_currentMon) return false;
     std::wstring key = m_tracker->KeyOf(win);
     if (key.empty()) return false;
     for (size_t i = 0; i < m_items.size(); i++) {
         if (m_items[i].key != key) continue;
+        if (m_state != State::Shown) {
+            Reveal();
+            if (!m_trackingMouse) SetTimer(m_hwnd, kHideTimer, kGenieHoldMs, nullptr);
+        }
         auto [x, y] = m_dock->RestIconCenter(i);
         float half = m_metrics.restSize / 2;
         icon = {static_cast<LONG>(std::lround(x + m_full.left - half)), static_cast<LONG>(std::lround(y + m_full.top - half)),
