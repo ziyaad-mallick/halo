@@ -578,15 +578,9 @@ bool LoadExtractedIcon(const std::wstring& path, IconImage& out) {
     return HIconToBgra(large, out) && !SmallInFrame(out);
 }
 
-bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
-    out = {};
-    if (path.starts_with(kAppsFolder)) return LoadAppsFolderIcon(path, out, taskbarLogo);
-
-    SHFILEINFOW sfi = {};
-    if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof sfi, SHGFI_SYSICONINDEX) == 0) {
-        return false;
-    }
-
+// System image list entry `index` as a jumbo (else extra-large) icon. `path` is the file it came from, if any: a small
+// icon in a big frame is re-extracted from it.
+static bool ImageListIcon(int index, const std::wstring& path, IconImage& out) {
     static const int kLists[] = {SHIL_JUMBO, SHIL_EXTRALARGE};
     for (const int listSize : kLists) {
         ComRef<IImageList> list;
@@ -595,16 +589,37 @@ bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
             continue;
         }
         HICON hicon = nullptr;
-        if (FAILED(list->GetIcon(sfi.iIcon, ILD_TRANSPARENT, &hicon)) || !hicon) {
+        if (FAILED(list->GetIcon(index, ILD_TRANSPARENT, &hicon)) || !hicon) {
             continue;
         }
         Owned<HICON, &DestroyIcon> icon(hicon);
         if (HIconToBgra(hicon, out)) {
-            if (!SmallInFrame(out)) return true;
+            if (path.empty() || !SmallInFrame(out)) return true;
             IconImage large;
             if (LoadExtractedIcon(path, large)) out = std::move(large);
             return true;  // the small one is still better than nothing
         }
     }
     return false;
+}
+
+bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
+    out = {};
+    if (path.starts_with(kAppsFolder)) return LoadAppsFolderIcon(path, out, taskbarLogo);
+
+    SHFILEINFOW sfi = {};
+    if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof sfi, SHGFI_SYSICONINDEX) == 0) {
+        return false;
+    }
+    return ImageListIcon(sfi.iIcon, path, out);
+}
+
+bool LoadGenericIcon(IconImage& out) {
+    out = {};
+    SHFILEINFOW sfi = {};
+    // The shell's icon for an .exe, taken from the extension alone: no file has to exist.
+    if (SHGetFileInfoW(L"app.exe", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof sfi, SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX) == 0) {
+        return false;
+    }
+    return ImageListIcon(sfi.iIcon, {}, out);
 }

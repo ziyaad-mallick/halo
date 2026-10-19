@@ -161,6 +161,7 @@ private:
     void RefreshDock();
     void UpdateRegion();
     wuc::CompositionBrush IconBrushFor(std::wstring const& path);
+    wuc::CompositionBrush FallbackIconBrush();
     void Activate(size_t item);
     void ActivateWindow(HWND w);
     void ShowPreviewsFor(int item);
@@ -685,12 +686,37 @@ wuc::CompositionBrush Halo::IconBrushFor(std::wstring const& path) {
     auto it = m_brushes.find(path);
     if (it != m_brushes.end()) return it->second;
     wuc::CompositionBrush brush{nullptr};
-    IconImage icon;
-    if (LoadJumboIcon(path, icon) && icon.width != 0)
-        brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
-    else
-        Log(L"no icon for " + path);
+    try {
+        IconImage icon;
+        if (LoadJumboIcon(path, icon) && icon.width != 0)
+            brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
+        else
+            Log(L"no icon for " + path);
+    } catch (winrt::hresult_error const& e) {  // a lost device must not take the whole dock refresh with it
+        Log(L"icon for " + path + L" failed " + Hex(e.code()));
+    } catch (std::exception const&) {
+        Log(L"icon for " + path + L" failed (std::exception)");
+    }
     m_brushes.insert_or_assign(path, brush);
+    return brush;
+}
+
+// The shell's plain application icon, for a pin or running app whose own icon can't be loaded, so it
+// still has a slot to click (and to Remove from Dock) instead of vanishing. Loaded once.
+wuc::CompositionBrush Halo::FallbackIconBrush() {
+    static const std::wstring kKey = L"\x01generic";  // can't be a path
+    auto it = m_brushes.find(kKey);
+    if (it != m_brushes.end()) return it->second;
+    wuc::CompositionBrush brush{nullptr};
+    try {
+        IconImage icon;
+        if (LoadGenericIcon(icon) && icon.width != 0) brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
+    } catch (winrt::hresult_error const& e) {
+        Log(L"generic icon failed " + Hex(e.code()));
+    } catch (std::exception const&) {
+        Log(L"generic icon failed (std::exception)");
+    }
+    m_brushes.insert_or_assign(kKey, brush);
     return brush;
 }
 
@@ -708,6 +734,7 @@ void Halo::RefreshDock() {
     m_appNames.clear();
     for (auto const& pin : m_apps) {
         auto brush = IconBrushFor(pin.linkPath);
+        if (!brush) brush = FallbackIconBrush();  // uninstalled or unreadable: shown plain, removable from its menu
         if (!brush) continue;
         Item item{pin.linkPath, {}};
         if (!pin.targetPath.empty()) item.file = pin.targetPath;
@@ -731,6 +758,7 @@ void Halo::RefreshDock() {
         wuc::CompositionBrush brush{nullptr};
         if (!running[i].aumid.empty()) brush = IconBrushFor(L"shell:AppsFolder\\" + running[i].aumid);
         if (!brush) brush = IconBrushFor(running[i].exe);
+        if (!brush) brush = FallbackIconBrush();
         if (!brush) continue;
         items.push_back({L"u:" + running[i].key, brush, true, true});
         m_items.push_back({{}, running[i].key,
