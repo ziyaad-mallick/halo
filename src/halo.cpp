@@ -45,6 +45,7 @@
 #include "pins.h"
 #include "winkey.h"
 #include "edge.h"
+#include "safety.h"
 
 // Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
 struct ICompositorDesktopInterop : IUnknown {
@@ -1400,8 +1401,18 @@ int Halo::Run() {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+    halo::safety::Install();  // before anything can fail: the taskbar must come back however we end
     winrt::init_apartment(winrt::apartment_type::single_threaded);
     Halo app;
-    if (!app.Create(inst)) Log(L"startup incomplete");
-    return app.Run();
+    int rc = 3;
+    try {
+        // A dock that did not come up (no window, no compositor) must not stay running: the guardian
+        // has hidden the taskbar for it. A non-zero exit makes the guardian restore it and retry.
+        if (app.Create(inst)) rc = app.Run();
+        else { Log(L"startup incomplete: exiting so the taskbar comes back"); rc = 2; }
+    } catch (...) {
+        Log(L"fatal exception");
+    }
+    halo::safety::Leave(rc != 0);
+    ExitProcess(static_cast<UINT>(rc));  // hooks are already off; skips the destructors that threw on every exit
 }

@@ -2,7 +2,15 @@
 # Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|all]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-CXX="${HALO_CXX:-/c/Users/testi/Windhawk/Compiler/bin/clang++.exe}"
+# Compiler: $HALO_CXX, else the LLVM-MinGW that portable Windhawk ships under %USERPROFILE%. Any
+# clang++ targeting x86_64-w64-mingw32 works, so a machine without Windhawk sets HALO_CXX.
+if [ -n "${HALO_CXX:-}" ]; then CXX="$HALO_CXX"
+else
+  UP="${USERPROFILE:-$HOME}"
+  command -v cygpath >/dev/null 2>&1 && UP="$(cygpath -u "$UP")"
+  CXX="$UP/Windhawk/Compiler/bin/clang++.exe"
+fi
+if [ ! -x "$CXX" ]; then echo "compiler not found: $CXX (set HALO_CXX to a clang++ for x86_64-w64-mingw32)" >&2; exit 1; fi
 mkdir -p build
 
 COMMON=(-std=c++23 -O2 -target x86_64-w64-mingw32 -municode -DUNICODE -D_UNICODE
@@ -12,14 +20,14 @@ WINLIBS=(-lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldw
 
 build_halo() {
   echo "== halo.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/cluster.cpp src/icons.cpp src/apps.cpp src/winkey.cpp src/edge.cpp src/launcher.cpp src/previews.cpp src/menu.cpp src/pins.cpp \
+  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/cluster.cpp src/icons.cpp src/apps.cpp src/winkey.cpp src/edge.cpp src/safety.cpp src/taskbar.cpp src/launcher.cpp src/previews.cpp src/menu.cpp src/pins.cpp \
     src/control_center.cpp src/notifications.cpp src/services.cpp src/settings.cpp -lwbemuuid -lwlanapi \
     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}"
 }
 
 build_guardian() {
   echo "== guardian.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/guardian.cpp src/taskbar.cpp -o build/guardian.exe \
+  "$CXX" "${COMMON[@]}" -mwindows src/guardian.cpp src/taskbar.cpp -o "${GUARDIAN_OUT:-build/guardian.exe}" \
     -lshell32 -luser32 -lole32 -ladvapi32
 }
 
