@@ -550,6 +550,7 @@ void ControlCenter::Impl::Close() {
     st = St::Closing;
     KillTimer(hwnd, kTimerLeave);
     KillTimer(hwnd, kTimerSettle);
+    KillTimer(hwnd, kTimerClock);  // the window is kept between opens: a live 15 s timer would wake the process forever
     // The scans stop; the radio and volume listeners stay, so the next open already shows the truth.
     svc::WifiStop();
     svc::BtStop();
