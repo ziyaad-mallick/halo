@@ -161,6 +161,12 @@ std::vector<HWND> WindowTracker::WindowsOf(std::wstring const& key) const {
     return out;
 }
 
+std::vector<HWND> WindowTracker::Windows() const {
+    std::vector<HWND> out;
+    for (auto const& w : m_wins) out.push_back(w.hwnd);
+    return out;
+}
+
 std::wstring WindowTracker::KeyOf(HWND hwnd) const {
     for (auto const& w : m_wins)
         if (w.hwnd == hwnd) return w.app.key;
@@ -197,6 +203,7 @@ void WindowTracker::Update(HWND hwnd) {
     Win w{hwnd, {}};
     if (is && Identify(hwnd, w.app)) {
         m_wins.push_back(w);
+        if (onWindow) onWindow(hwnd, true);
         Changed();
     }
 }
@@ -205,6 +212,7 @@ void WindowTracker::Remove(HWND hwnd) {
     auto it = std::find_if(m_wins.begin(), m_wins.end(), [&](Win const& w) { return w.hwnd == hwnd; });
     if (it == m_wins.end()) return;
     m_wins.erase(it);
+    if (onWindow) onWindow(hwnd, false);
     Changed();
 }
 
