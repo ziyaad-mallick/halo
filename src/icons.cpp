@@ -253,6 +253,7 @@ std::wstring BestLogoFile(const std::wstring& logo, bool light) {
     const std::wstring dir = slash == std::wstring::npos ? L"" : logo.substr(0, slash + 1);
     const std::wstring file = logo.substr(dir.size());
     const auto dot = file.rfind(L'.');
+    if (dot == std::wstring::npos) return logo;  // no extension to build the variants' names from
     const std::wstring stem = file.substr(0, dot), ext = file.substr(dot);
     const std::wstring want = light ? L"lightunplated" : L"unplated";
 
@@ -263,6 +264,7 @@ std::wstring BestLogoFile(const std::wstring& logo, bool light) {
     if (find == INVALID_HANDLE_VALUE) return logo;
     do {
         std::wstring q = fd.cFileName;
+        if (q.size() < stem.size() + 1 + ext.size()) continue;  // a short (8.3) alias can match the pattern too
         q = q.substr(stem.size() + 1, q.size() - stem.size() - 1 - ext.size());
         std::wstring altform;
         int target = 0, scale = 0;
@@ -306,7 +308,9 @@ std::wstring ManifestLogo(const std::wstring& pkgDir, const std::wstring& appId)
                            OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return {};
     Owned<HANDLE, &CloseHandle> file(f);
-    std::string utf8(GetFileSize(f, nullptr), '\0');
+    const DWORD fileSize = GetFileSize(f, nullptr);
+    if (fileSize == INVALID_FILE_SIZE || fileSize > (8u << 20)) return {};  // a manifest is a few KB
+    std::string utf8(fileSize, '\0');
     DWORD got = 0;
     if (!ReadFile(f, utf8.data(), static_cast<DWORD>(utf8.size()), &got, nullptr)) return {};
     std::wstring xml(utf8.size(), L'\0');
@@ -574,15 +578,9 @@ bool LoadExtractedIcon(const std::wstring& path, IconImage& out) {
     return HIconToBgra(large, out) && !SmallInFrame(out);
 }
 
-bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
-    out = {};
-    if (path.starts_with(kAppsFolder)) return LoadAppsFolderIcon(path, out, taskbarLogo);
-
-    SHFILEINFOW sfi = {};
-    if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof sfi, SHGFI_SYSICONINDEX) == 0) {
-        return false;
-    }
-
+// System image list entry `index` as a jumbo (else extra-large) icon. `path` is the file it came from, if any: a small
+// icon in a big frame is re-extracted from it.
+static bool ImageListIcon(int index, const std::wstring& path, IconImage& out) {
     static const int kLists[] = {SHIL_JUMBO, SHIL_EXTRALARGE};
     for (const int listSize : kLists) {
         ComRef<IImageList> list;
@@ -591,16 +589,37 @@ bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
             continue;
         }
         HICON hicon = nullptr;
-        if (FAILED(list->GetIcon(sfi.iIcon, ILD_TRANSPARENT, &hicon)) || !hicon) {
+        if (FAILED(list->GetIcon(index, ILD_TRANSPARENT, &hicon)) || !hicon) {
             continue;
         }
         Owned<HICON, &DestroyIcon> icon(hicon);
         if (HIconToBgra(hicon, out)) {
-            if (!SmallInFrame(out)) return true;
+            if (path.empty() || !SmallInFrame(out)) return true;
             IconImage large;
             if (LoadExtractedIcon(path, large)) out = std::move(large);
             return true;  // the small one is still better than nothing
         }
     }
     return false;
+}
+
+bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo) {
+    out = {};
+    if (path.starts_with(kAppsFolder)) return LoadAppsFolderIcon(path, out, taskbarLogo);
+
+    SHFILEINFOW sfi = {};
+    if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof sfi, SHGFI_SYSICONINDEX) == 0) {
+        return false;
+    }
+    return ImageListIcon(sfi.iIcon, path, out);
+}
+
+bool LoadGenericIcon(IconImage& out) {
+    out = {};
+    SHFILEINFOW sfi = {};
+    // The shell's icon for an .exe, taken from the extension alone: no file has to exist.
+    if (SHGetFileInfoW(L"app.exe", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof sfi, SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX) == 0) {
+        return false;
+    }
+    return ImageListIcon(sfi.iIcon, {}, out);
 }

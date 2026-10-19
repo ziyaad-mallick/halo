@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 
 namespace halo::pins {
@@ -36,7 +37,13 @@ bool ReadPaths(std::vector<std::wstring>& out) {
     HANDLE f = CreateFileW(FilePath().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
-    std::string data(GetFileSize(f, nullptr), '\0');
+    DWORD size = GetFileSize(f, nullptr);
+    if (size == INVALID_FILE_SIZE || size > (1u << 20)) {  // not a pin list (a few KB at most): don't allocate for it
+        CloseHandle(f);
+        Log(L"ignoring " + FilePath() + L": unreadable or implausibly large");
+        return false;
+    }
+    std::string data(size, '\0');
     DWORD got = 0;
     ReadFile(f, data.data(), static_cast<DWORD>(data.size()), &got, nullptr);
     CloseHandle(f);
@@ -101,6 +108,8 @@ std::vector<PinnedApp> Load() {
     }
     std::vector<PinnedApp> apps;
     for (auto const& p : paths) {
+        // A path listed twice (hand-edited file) would be two icons with one key.
+        if (std::any_of(apps.begin(), apps.end(), [&](PinnedApp const& a) { return !_wcsicmp(a.linkPath.c_str(), p.c_str()); })) continue;
         PinnedApp a;
         if (MakePinnedApp(p, a)) apps.push_back(std::move(a));
     }

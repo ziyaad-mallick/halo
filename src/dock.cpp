@@ -58,6 +58,16 @@ float WidthAtRest(DockMetrics const& m, size_t count, bool divider) {
     return static_cast<float>(count) * (m.restSize + m.gap) - m.gap + 2 * m.padding + (divider ? m.gap : 0.0f);
 }
 
+// What the wave adds to the pill at full magnification, in icon pitches (the icon under the cursor counts one more).
+float WaveGrowth(DockMetrics const& m) {
+    float pitch = m.restSize + m.gap;
+    float growth = 0.0f;
+    for (float d = -m.radius; d <= m.radius; d += pitch) {
+        growth += (m.maxScale - 1) * (std::cos(std::abs(d) / m.radius * kPi) + 1) / 2;
+    }
+    return growth + 1;
+}
+
 }  // namespace
 
 Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
@@ -138,12 +148,14 @@ float Dock::RestWidth() const {
 
 float Dock::MaxWidth() const {
     // The wave adds at most about 2 * radius / pitch icons' worth of growth.
+    return m_clusterOffset + WidthAtRest(m_m, m_entries.size(), true) + WaveGrowth(m_m) * (m_m.restSize + m_m.gap);
+}
+
+size_t Dock::MaxItems(float availWidth) const {
+    // MaxWidth solved for the icon count: any more and the magnified pill would run off the screen.
     float pitch = m_m.restSize + m_m.gap;
-    float growth = 0.0f;
-    for (float d = -m_m.radius; d <= m_m.radius; d += pitch) {
-        growth += (m_m.maxScale - 1) * (std::cos(std::abs(d) / m_m.radius * kPi) + 1) / 2;
-    }
-    return m_clusterOffset + WidthAtRest(m_m, m_entries.size(), true) + (growth + 1) * pitch;
+    float room = availWidth - m_clusterOffset - WidthAtRest(m_m, 0, true) - WaveGrowth(m_m) * pitch;
+    return room < pitch ? 1 : static_cast<size_t>(room / pitch);
 }
 
 void Dock::AnimateTo(CompositionObject const& target, wchar_t const* property, float to, int ms) {
@@ -265,7 +277,10 @@ void Dock::SetItems(std::vector<Item> const& items) {
     std::vector<unsigned> leaving;
     for (auto const& e : m_entries) if (e.leaving) leaving.push_back(e.id);
     if (!leaving.empty()) {
-        batch.Completed([this, leaving](auto&&, auto&&) { Prune(leaving); });
+        // The dock can be rebuilt (settings, theme) before the shrink finishes; the callback must not touch it then.
+        batch.Completed([this, alive = std::weak_ptr<bool>(m_alive), leaving](auto&&, auto&&) {
+            if (!alive.expired()) Prune(leaving);
+        });
     }
     BuildExpressions();
 }

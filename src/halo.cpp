@@ -80,6 +80,7 @@ constexpr int kDockFadeMs = 180;          // the fade of the non-rise reveal eff
 constexpr float kDockTravel = 24;         // logical px a swipe / swoop reveal moves
 constexpr float kLabelRoom = 34;  // logical px above a magnified icon: a 6 px gap and the name label
 constexpr int kStripPx = 2;               // hit strip left on the screen edge while hidden
+constexpr size_t kMenuWindows = 10;       // windows listed in an icon's right-click menu; the rest are counted
 
 constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
 // Test hook (HALO_TEST=1): simulate the pointer without touching the real one.
@@ -154,13 +155,14 @@ private:
     wuc::ContainerVisual BuildPill(int noiseHeight = 0, float radius = 0.0f, halo::settings::Surface const* glass = nullptr);
     void ComputeMetrics();
     void ApplySettings(bool themeFlipped = false);
-    void RebuildDock();
+    void RebuildDock(bool keepIcons = false);
     wuc::SpriteVisual BuildPillShadow(wuc::ContainerVisual const& pill);
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
     void RefreshDock();
     void UpdateRegion();
     wuc::CompositionBrush IconBrushFor(std::wstring const& path);
+    wuc::CompositionBrush FallbackIconBrush();
     void Activate(size_t item);
     void ActivateWindow(HWND w);
     void ShowPreviewsFor(int item);
@@ -183,7 +185,7 @@ private:
     LRESULT DockIconForWindow(HWND win, LPARAM op);
     void StartHide();
     RECT GetPillRectScreen() const;
-    void MigrateToMonitor(HMONITOR mon);
+    void MigrateToMonitor(HMONITOR mon, bool reveal = true);
     wuc::CompositionDrawingSurface MakeSurface(Size size);
     wuc::CompositionBrush MakeIconBrush(IconImage const& icon, float size);
 
@@ -594,8 +596,8 @@ void Halo::ApplySettings(bool themeFlipped) {
 }
 
 // The pill, icons, cluster and label are rebuilt with the current settings; the window resizes if the icon
-// size or magnification moved its height.
-void Halo::RebuildDock() {
+// size or magnification moved its height. keepIcons: the icon surfaces are still the right size and look.
+void Halo::RebuildDock(bool keepIcons) {
     if (!m_dock) return;
     HidePreviews(true);
     if (m_menu && m_menu->IsOpen()) m_menu->Close();
@@ -607,7 +609,7 @@ void Halo::RebuildDock() {
     m_dock->Detach();
     m_dock.reset();
     m_cluster.reset();
-    m_brushes.clear();  // icon surfaces are sized for the old icon size
+    if (!keepIcons) m_brushes.clear();  // icon surfaces are sized for the old icon size
     ComputeMetrics();
     const int x = m_monitor.left, y = m_monitor.bottom - m_height;
     m_full = {x, y, x + m_width, y + m_height};
@@ -685,12 +687,37 @@ wuc::CompositionBrush Halo::IconBrushFor(std::wstring const& path) {
     auto it = m_brushes.find(path);
     if (it != m_brushes.end()) return it->second;
     wuc::CompositionBrush brush{nullptr};
-    IconImage icon;
-    if (LoadJumboIcon(path, icon) && icon.width != 0)
-        brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
-    else
-        Log(L"no icon for " + path);
+    try {
+        IconImage icon;
+        if (LoadJumboIcon(path, icon) && icon.width != 0)
+            brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
+        else
+            Log(L"no icon for " + path);
+    } catch (winrt::hresult_error const& e) {  // a lost device must not take the whole dock refresh with it
+        Log(L"icon for " + path + L" failed " + Hex(e.code()));
+    } catch (std::exception const&) {
+        Log(L"icon for " + path + L" failed (std::exception)");
+    }
     m_brushes.insert_or_assign(path, brush);
+    return brush;
+}
+
+// The shell's plain application icon, for a pin or running app whose own icon can't be loaded, so it
+// still has a slot to click (and to Remove from Dock) instead of vanishing. Loaded once.
+wuc::CompositionBrush Halo::FallbackIconBrush() {
+    static const std::wstring kKey = L"\x01generic";  // can't be a path
+    auto it = m_brushes.find(kKey);
+    if (it != m_brushes.end()) return it->second;
+    wuc::CompositionBrush brush{nullptr};
+    try {
+        IconImage icon;
+        if (LoadGenericIcon(icon) && icon.width != 0) brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
+    } catch (winrt::hresult_error const& e) {
+        Log(L"generic icon failed " + Hex(e.code()));
+    } catch (std::exception const&) {
+        Log(L"generic icon failed (std::exception)");
+    }
+    m_brushes.insert_or_assign(kKey, brush);
     return brush;
 }
 
@@ -706,8 +733,13 @@ void Halo::RefreshDock() {
     std::vector<Dock::Item> items;
     m_items.clear();
     m_appNames.clear();
+    // The pill can't grow past the screen: pinned apps take the room first, then running ones in the order they
+    // appeared; the rest stay reachable from Alt+Tab and the Start panel's recents.
+    const size_t cap = m_dock->MaxItems(static_cast<float>(m_width - m_scale.px(16)));
     for (auto const& pin : m_apps) {
+        if (items.size() >= cap) break;
         auto brush = IconBrushFor(pin.linkPath);
+        if (!brush) brush = FallbackIconBrush();  // uninstalled or unreadable: shown plain, removable from its menu
         if (!brush) continue;
         Item item{pin.linkPath, {}};
         if (!pin.targetPath.empty()) item.file = pin.targetPath;
@@ -727,10 +759,15 @@ void Halo::RefreshDock() {
     }
     for (size_t i = 0; i < running.size(); i++) {
         if (pinned[i] || running[i].exe.empty()) continue;
+        if (items.size() >= cap) {
+            Log(L"dock full (" + std::to_wstring(cap) + L" icons fit): " + running[i].key + L" and later apps not shown");
+            break;
+        }
         // Packaged apps' exes often carry no icon; their Start entry has the logo.
         wuc::CompositionBrush brush{nullptr};
         if (!running[i].aumid.empty()) brush = IconBrushFor(L"shell:AppsFolder\\" + running[i].aumid);
         if (!brush) brush = IconBrushFor(running[i].exe);
+        if (!brush) brush = FallbackIconBrush();
         if (!brush) continue;
         items.push_back({L"u:" + running[i].key, brush, true, true});
         m_items.push_back({{}, running[i].key,
@@ -788,8 +825,11 @@ void Halo::ComputeMetrics() {
     m_metrics.centerX = m_width / 2.0f;
 }
 
-void Halo::MigrateToMonitor(HMONITOR mon) {
-    if (!mon || mon == m_currentMon) return;
+// Seats the dock on `mon`: the cursor reached its bottom edge, or (WM_DISPLAYCHANGE) the monitor it was on changed
+// resolution or scale, or went away. The Dock keeps its own copy of the metrics (centre, bottom, icon size), so a
+// different size or scale means a rebuild, not just moving the window.
+void Halo::MigrateToMonitor(HMONITOR mon, bool reveal) {
+    if (!mon) return;
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(mon, &mi)) return;
 
@@ -797,7 +837,9 @@ void Halo::MigrateToMonitor(HMONITOR mon) {
     GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     float newScale = dpiX / 96.0f;
     bool dpiChanged = std::abs(m_scale.v - newScale) > 0.001f;
+    if (mon == m_currentMon && !dpiChanged && EqualRect(&mi.rcMonitor, &m_monitor)) return;  // nothing moved
 
+    const float iconPx = std::ceil(m_metrics.restSize * m_metrics.maxScale);
     m_currentMon = mon;
     m_monitor = mi.rcMonitor;
     m_width = m_monitor.right - m_monitor.left;
@@ -811,15 +853,11 @@ void Halo::MigrateToMonitor(HMONITOR mon) {
     SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, m_width, m_height, SWP_NOACTIVATE);
 
     if (m_multimon) m_multimon->SetCurrentMonitor(mon);
-    if (m_label) m_label->SetScale(m_scale.v);
-    if (m_intellihide) {
-        m_intellihide->SetMonitor(mon, m_monitor);
-        m_intellihide->SetDockRect(GetPillRectScreen());
-    }
+    if (m_intellihide) m_intellihide->SetMonitor(mon, m_monitor);
 
-    UpdateRegion();
-    if (dpiChanged) RefreshDock();
-    Reveal();
+    if (m_dock) RebuildDock(std::ceil(m_metrics.restSize * m_metrics.maxScale) == iconPx);  // also sets the label's scale, the input region and the intellihide rect
+    else UpdateRegion();
+    if (reveal) Reveal();
 }
 
 // Limits the window's input to the dock (and the bar of it a hidden dock
@@ -896,12 +934,15 @@ void Halo::OpenMenuFor(int item) {
 
     std::vector<halo::MenuEntry> entries;
     if (running) {
+        size_t more = 0;
         for (HWND w : m_tracker->WindowsOf(it.key)) {
             if (!IsWindow(w)) continue;
+            if (entries.size() >= kMenuWindows) { more++; continue; }  // 30 windows of one app would run the menu off the screen
             wchar_t t[256] = {};
             GetWindowTextW(w, t, ARRAYSIZE(t));
             entries.push_back({t[0] ? t : L"Untitled", false, [this, w] { ActivateWindow(w); }});
         }
+        if (more) entries.push_back({std::to_wstring(more) + (more == 1 ? L" more window" : L" more windows"), false, nullptr});
         if (!entries.empty()) entries.push_back({L"", true, nullptr});
     }
     if (pinned) {
@@ -1202,7 +1243,17 @@ LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
     auto* self = reinterpret_cast<Halo*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self ? self->OnMessage(m, w, l) : DefWindowProcW(h, m, w, l);
+    if (!self) return DefWindowProcW(h, m, w, l);
+    // A throw out of a handler (a failed icon surface, a rejected expression, a dead device) would unwind
+    // through user32 and take the whole shell with it. Log it and carry on: the next event retries.
+    try {
+        return self->OnMessage(m, w, l);
+    } catch (winrt::hresult_error const& e) {
+        Log(L"message " + std::to_wstring(m) + L" threw " + Hex(e.code()) + L" " + e.message().c_str());
+    } catch (std::exception const&) {
+        Log(L"message " + std::to_wstring(m) + L" threw std::exception");
+    }
+    return DefWindowProcW(h, m, w, l);
 }
 
 // withNotifs: the notification column comes too, stacked above it (Win+A / Win+N, touch); the bottom-right
@@ -1287,6 +1338,12 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_DISPLAYCHANGE:
             if (m_multimon) m_multimon->OnDisplayChange();
             halo::edge::OnDisplayChange();
+            {  // the dock's monitor may be gone (unplugged, laptop docked / undocked) or have a new size or scale
+                MONITORINFO mi{sizeof(mi)};
+                HMONITOR mon = m_currentMon;
+                if (!mon || !GetMonitorInfoW(mon, &mi)) mon = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+                MigrateToMonitor(mon, false);  // no reveal: nothing summoned it, and nothing would hide it again
+            }
             return 0;
         case kMsgEdge:
             Log(w == halo::edge::kBottom ? L"edge: bottom right" : w == halo::edge::kTop ? L"edge: top" : L"edge: right");
@@ -1302,7 +1359,9 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == kHideTimer) {
                 KillTimer(m_hwnd, kHideTimer);
-                StartHide();
+                // Only a window over the dock, or a fullscreen app, takes it away (PointerLeave arms the timer on
+                // that condition too). The genie hold arms it regardless: with nothing in the way the dock stays up.
+                if (!m_intellihide || m_intellihide->HasOverlap() || m_intellihide->IsFullscreen()) StartHide();
             } else if (w == kPanelStagger) {
                 KillTimer(m_hwnd, kPanelStagger);
                 if (m_cc && m_cc->IsOpen() && m_notif) {

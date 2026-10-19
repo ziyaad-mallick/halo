@@ -35,3 +35,7 @@ bool MakePinnedApp(const std::wstring& path, PinnedApp& out);
 // the package; if that fails, or taskbarLogo is false, the Start tile from the shell.
 // Returns false on failure.
 bool LoadJumboIcon(const std::wstring& path, IconImage& out, bool taskbarLogo = true);
+
+// The shell's plain application icon, for an app whose own icon can't be loaded (uninstalled, still being
+// written, access denied). Same format as LoadJumboIcon; false only if the shell has no icon at all.
+bool LoadGenericIcon(IconImage& out);

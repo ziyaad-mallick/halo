@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <chrono>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -94,6 +95,9 @@ public:
     float RestWidth() const;
     float MaxWidth() const;
 
+    // How many icons fit in `availWidth` px with the wave at full magnification (at least 1).
+    size_t MaxItems(float availWidth) const;
+
 private:
     struct Entry {
         std::wstring key;
@@ -125,6 +129,7 @@ private:
     int m_dividerAt = -1;          // index in m_entries of the first unpinned icon, or -1
     bool m_dividerShown = false;
     unsigned m_nextId = 1;
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);  // batch callbacks hold it weakly: they outlive a rebuilt dock
     DockMetrics m_m;
     bool m_hovering = false;
     float m_pointerX = 0.0f;
