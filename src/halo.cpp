@@ -1202,7 +1202,17 @@ LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
     auto* self = reinterpret_cast<Halo*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self ? self->OnMessage(m, w, l) : DefWindowProcW(h, m, w, l);
+    if (!self) return DefWindowProcW(h, m, w, l);
+    // A throw out of a handler (a failed icon surface, a rejected expression, a dead device) would unwind
+    // through user32 and take the whole shell with it. Log it and carry on: the next event retries.
+    try {
+        return self->OnMessage(m, w, l);
+    } catch (winrt::hresult_error const& e) {
+        Log(L"message " + std::to_wstring(m) + L" threw " + Hex(e.code()) + L" " + e.message().c_str());
+    } catch (std::exception const&) {
+        Log(L"message " + std::to_wstring(m) + L" threw std::exception");
+    }
+    return DefWindowProcW(h, m, w, l);
 }
 
 // withNotifs: the notification column comes too, stacked above it (Win+A / Win+N, touch); the bottom-right
