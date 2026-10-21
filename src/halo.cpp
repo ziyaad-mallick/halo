@@ -917,8 +917,8 @@ void Halo::RefreshDock() {
 RECT Halo::GetPillRectScreen() const {
     if (!m_dock) return m_full;
     float half = m_dock->RestWidth() / 2.0f;
-    int pillLeft = m_full.left + static_cast<int>(m_metrics.centerX - half);
-    int pillRight = m_full.left + static_cast<int>(std::ceil(m_metrics.centerX + half));
+    int pillLeft = m_full.left + static_cast<int>(m_metrics.centerX - m_dock->CapsuleExtent() / 2 - half);
+    int pillRight = m_full.left + static_cast<int>(std::ceil(m_metrics.centerX - m_dock->CapsuleExtent() / 2 + half));
     int pillTop = m_full.bottom - static_cast<int>(m_metrics.pillHeight + m_scale.px(6));
     int pillBottom = m_full.bottom;
     return RECT{pillLeft, pillTop, pillRight, pillBottom};
@@ -987,8 +987,8 @@ void Halo::UpdateRegion() {
     if (!m_dock || !m_hwnd) return;
     bool hidden = m_state == State::Hidden;
     float half = (hidden ? m_dock->RestWidth() : m_dock->MaxWidth()) / 2;
-    int left = std::max(0, static_cast<int>(m_metrics.centerX - half));
-    int right = std::min(m_width, static_cast<int>(std::ceil(m_metrics.centerX + half + m_dock->CapsuleExtent())));
+    int left = std::max(0, static_cast<int>(m_metrics.centerX - m_dock->CapsuleExtent() / 2 - half));
+    int right = std::min(m_width, static_cast<int>(std::ceil(m_metrics.centerX + half + m_dock->CapsuleExtent() / 2)));
     SetWindowRgn(m_hwnd, CreateRectRgn(left, hidden ? m_height - kStripPx : 0, right, m_height), TRUE);
     if (m_intellihide) m_intellihide->SetDockRect(GetPillRectScreen());
     Log(L"input region x " + std::to_wstring(left) + L".." + std::to_wstring(right) + (hidden ? L" (strip)" : L""));
@@ -1604,11 +1604,12 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_CAPTURECHANGED:
             if (std::exchange(m_pressedStart, false) && m == WM_LBUTTONUP && m_dock && m_dock->HitStart(mx, my))
                 OpenLauncher();
-            if (m_widgets && MediaPart(m_pressedWidget) != DockWidgets::Part::None) {
+            const Dock::Kind releasedWidget = std::exchange(m_pressedWidget, Dock::Kind::None);
+            if (m_widgets && MediaPart(releasedWidget) != DockWidgets::Part::None) {
                 m_widgets->SetPressed(DockWidgets::Part::None);
                 if (m_pressed < 0 && m == WM_LBUTTONUP) ReleaseCapture();
             }
-            if (const Dock::Kind widget = std::exchange(m_pressedWidget, Dock::Kind::None);
+            if (const Dock::Kind widget = releasedWidget;
                 widget != Dock::Kind::None && m == WM_LBUTTONUP && m_dock && m_dock->HitTarget(mx, my).kind == widget) {
                 if (widget == Dock::Kind::MediaPlay && m_dockMedia.State().has) {
                     m_dockMedia.PlayPause();

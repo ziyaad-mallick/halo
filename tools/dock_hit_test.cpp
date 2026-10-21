@@ -139,18 +139,25 @@ int wmain(int argc, wchar_t** argv) {
         st.canNext = true;
         st.title = L"Title";
         st.artist = L"Artist";
+        const float originalIconX = dock.RestIconCenter(0).first;
         widgets.SetMedia(st);
-        const float capL = pillR + widgets.CapsuleGap();
+        const float extent = widgets.CapsuleGap() + widgets.CapsuleWidth();
+        const float capL = pillR - extent / 2 + widgets.CapsuleGap();
+        CHECK(std::abs(dock.RestIconCenter(0).first - (originalIconX - extent / 2)) < 0.01f);
         CHECK(widgets.CapsuleWidth() > 0.0f && dock.CapsuleExtent() == widgets.CapsuleGap() + widgets.CapsuleWidth());
         using Part = DockWidgets::Part;
         CHECK(dock.HitTarget(capL + 10.0f, midY).kind == Dock::Kind::Media);
         CHECK(dock.HitTarget(capL + (widgets.PartLeft(Part::Play) + widgets.PartRight(Part::Play)) / 2, midY).kind == Dock::Kind::MediaPlay);
         CHECK(dock.HitTarget(capL + (widgets.PartLeft(Part::Next) + widgets.PartRight(Part::Next)) / 2, midY).kind == Dock::Kind::MediaNext);
         for (float x = capL; x < capL + widgets.CapsuleWidth(); x += 2.0f) CHECK(dock.HitTarget(x, midY).kind != Dock::Kind::None);  // no dead spots
-        CHECK(dock.HitTarget(pillR + widgets.CapsuleGap() / 2, midY).kind != Dock::Kind::None);  // the gap between them snaps to a side
+        CHECK(dock.HitTarget(pillR - extent / 2 + widgets.CapsuleGap() / 2, midY).kind != Dock::Kind::None);
+        st.playing = false;
+        widgets.SetMedia(st);
+        CHECK(!widgets.CapsuleShown() && dock.CapsuleExtent() == 0.0f);
+        CHECK(std::abs(dock.RestIconCenter(0).first - originalIconX) < 0.01f);
         st.has = false;
         widgets.SetMedia(st);
-        CHECK(dock.CapsuleExtent() == 0.0f && dock.HitTarget(capL + 10.0f, midY).kind == Dock::Kind::None);  // gone again
+        CHECK(dock.CapsuleExtent() == 0.0f && dock.HitTarget(pillR + widgets.CapsuleGap() + 30.0f, midY).kind == Dock::Kind::None);  // gone again
     }
 
     // Magnification moves slots under the pointer: hit-testing follows what is drawn.

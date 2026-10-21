@@ -92,6 +92,14 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
     m_props.InsertScalar(L"Gap", m_m.gap);
     m_props.InsertScalar(L"Padding", m_m.padding);
     m_props.InsertScalar(L"Center", m_m.centerX);
+    m_props.InsertScalar(L"ContentCenter", m_m.centerX);
+    if (m_widgets) {
+        auto center = m_compositor.CreateExpressionAnimation(L"p.Center - mc.Show * " +
+            std::to_wstring((m_widgets->CapsuleGap() + m_widgets->CapsuleWidth()) / 2));
+        center.SetReferenceParameter(L"p", m_props);
+        center.SetReferenceParameter(L"mc", m_widgets->Properties());
+        Start(m_props, L"ContentCenter", center, L"dock and media center");
+    }
 
     if (m_cluster) {
         m_clusterWidth = m_cluster->Width();
@@ -350,7 +358,7 @@ void Dock::BuildExpressions() {
     for (size_t i = 0; i < n; i++) {
         const std::wstring me = Param(i);
         // Icon i's center at rest, where the wave measures its distance from.
-        std::wstring rest = L"(p.Center" + clusterShift + L" - " + total(L"P") + L" / 2 + " + start(i, L"P") + L" + p.Pitch * " + me +
+        std::wstring rest = L"(p.ContentCenter" + clusterShift + L" - " + total(L"P") + L" / 2 + " + start(i, L"P") + L" + p.Pitch * " + me +
                             L".P / 2)";
         auto s = m_compositor.CreateExpressionAnimation(
             me + L".P * (1 + (p.MaxScale - 1) * p.Intensity * (Cos(Clamp(Abs(p.PointerX - " + rest +
@@ -365,7 +373,7 @@ void Dock::BuildExpressions() {
 
         // Slots packed around the dock's center; the icon sits centered in
         // its slot (Offset is its top-left before scaling).
-        const std::wstring slotCenter = L"p.Center" + clusterShift + L" - " + total(L"S") + L" / 2 + " + start(i, L"S") + L" + p.Pitch * " +
+        const std::wstring slotCenter = L"p.ContentCenter" + clusterShift + L" - " + total(L"S") + L" / 2 + " + start(i, L"S") + L" + p.Pitch * " +
                                         me + L".S / 2";
         // The magnetic pull: a fraction of the way to the pointer, capped, eased in by Mag (stays 0 under reduce motion).
         const std::wstring pull = L" + Clamp((p.PointerX - (" + slotCenter + L")) * 0.18, -" + std::to_wstring(kPullPx * m_m.restSize / 28) +
@@ -380,7 +388,7 @@ void Dock::BuildExpressions() {
     }
 
     if (d >= 0) {
-        auto dx = m_compositor.CreateExpressionAnimation(L"p.Center" + clusterShift + L" - " + total(L"S") + L" / 2 + p.Pitch * " +
+        auto dx = m_compositor.CreateExpressionAnimation(L"p.ContentCenter" + clusterShift + L" - " + total(L"S") + L" / 2 + p.Pitch * " +
                                                          sum(d, L"S") + L" + dv.Slot / 2 - " +
                                                          std::to_wstring(m_divider.Size().x / 2));
         bind(dx);
@@ -416,7 +424,7 @@ void Dock::BuildExpressions() {
         bind(width);
         Start(m_pill, L"Size.X", width, L"pill width");
 
-        auto left = m_compositor.CreateExpressionAnimation(L"p.Center - pill.Size.X / 2");
+        auto left = m_compositor.CreateExpressionAnimation(L"p.ContentCenter - pill.Size.X / 2");
         left.SetReferenceParameter(L"p", m_props);
         left.SetReferenceParameter(L"pill", m_pill);
         Start(m_pill, L"Offset.X", left, L"pill x");
@@ -453,7 +461,7 @@ std::pair<float, float> Dock::RestIconCenter(size_t index) const {
     const float pitch = m_m.restSize + m_m.gap;
     const float divider = d >= 0 ? m_m.gap : 0.0f;
     // The rest layout HitTest uses, with every icon fully present.
-    const float left = m_m.centerX + m_shift - (pitch * n + divider) / 2;
+    const float left = (m_m.centerX - CapsuleExtent() / 2) + m_shift - (pitch * n + divider) / 2;
     const float x = left + pitch * index + (d >= 0 && static_cast<int>(index) >= d ? divider : 0.0f) + pitch / 2;
     return {x, IconY() + m_m.restSize / 2};
 }
@@ -468,7 +476,7 @@ std::pair<float, float> Dock::MagnifiedIconCenterAndTop(size_t index) const {
     for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
     const float pitch = m_m.restSize + m_m.gap;
     const float divider = d >= 0 ? m_m.gap : 0.0f;
-    const float restLeft = m_m.centerX + m_shift - (pitch * n + divider) / 2;
+    const float restLeft = (m_m.centerX - CapsuleExtent() / 2) + m_shift - (pitch * n + divider) / 2;
     std::vector<float> mag(n);
     float total = divider;
     for (size_t k = 0; k < n; k++) {
@@ -477,7 +485,7 @@ std::pair<float, float> Dock::MagnifiedIconCenterAndTop(size_t index) const {
         mag[k] = 1 + (m_m.maxScale - 1) * (m_hovering ? 1.0f : 0.0f) * (std::cos(t * kPi) + 1) / 2;
         total += pitch * mag[k];
     }
-    float left = m_m.centerX + m_shift - total / 2;
+    float left = (m_m.centerX - CapsuleExtent() / 2) + m_shift - total / 2;
     for (size_t k = 0; k < index; k++) {
         if (static_cast<int>(k) == d) left += divider;
         left += pitch * mag[k];
@@ -498,7 +506,7 @@ Dock::Target Dock::HitTarget(float x, float y) const {
     for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
     const float pitch = m_m.restSize + m_m.gap;
     const float divider = d >= 0 ? m_m.gap : 0.0f;
-    const float restLeft = m_m.centerX + m_shift - (pitch * n + divider) / 2;
+    const float restLeft = (m_m.centerX - CapsuleExtent() / 2) + m_shift - (pitch * n + divider) / 2;
     std::vector<float> mag(n);
     float total = divider;
     for (size_t k = 0; k < n; k++) {
@@ -510,7 +518,7 @@ Dock::Target Dock::HitTarget(float x, float y) const {
 
     // The pill's width as the expressions compute it, with every icon fully present.
     const float pillWidth = m_clusterOffset + (n > 0 ? total - m_m.gap : 0.0f) + 2 * m_m.padding;
-    const float pillLeft = m_m.centerX - pillWidth / 2;
+    const float pillLeft = (m_m.centerX - CapsuleExtent() / 2) - pillWidth / 2;
     const float pillTop = m_m.bottom - m_m.pillHeight;
 
     // The targets left to right, as horizontal spans: the cluster (all of it with HALO 2.0, else the Start logo),
@@ -523,7 +531,7 @@ Dock::Target Dock::HitTarget(float x, float y) const {
         else spans.push_back({cl + m_cluster->StartX(), cl + m_cluster->StartX() + m_cluster->StartWidth()});
         targets.push_back({Kind::Start, -1});
     }
-    float left = m_m.centerX + m_shift - total / 2;
+    float left = (m_m.centerX - CapsuleExtent() / 2) + m_shift - total / 2;
     for (size_t k = 0; k < n; k++) {
         if (static_cast<int>(k) == d) left += divider;
         const float slot = pitch * mag[k];

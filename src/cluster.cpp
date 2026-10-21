@@ -519,17 +519,18 @@ void DockWidgets::SetPressed(Part p) {
 }
 
 void DockWidgets::SetMedia(halo::svc::MediaState const& st) {
+    const bool shown = st.has && st.playing;
     std::wstring title = st.title.empty() ? st.artist : st.title;
     std::wstring artist = st.title.empty() ? L"" : st.artist;
     if (st.has && title.empty()) title = L"Now Playing";
     size_t sig = 0;
     for (size_t i = 0; i < st.art.size(); i += 97) sig = sig * 31 + st.art[i];
     sig ^= static_cast<size_t>(st.artSize) << 40;
-    if (m_title == title && m_artist == artist && m_hasMedia == st.has && m_playing == st.playing && m_canNext == st.canNext && m_artSig == sig) return;
+    if (m_title == title && m_artist == artist && m_hasMedia == shown && m_playing == st.playing && m_canNext == st.canNext && m_artSig == sig) return;
     const bool hadMedia = m_hasMedia;
     m_title = title;
     m_artist = artist;
-    m_hasMedia = st.has;
+    m_hasMedia = shown;
     m_playing = st.playing;
     m_canNext = st.canNext;
     if (sig != m_artSig) m_thumb = st.artSize > 0 ? Thumb(st.art, st.artSize, m_thumbPx) : std::vector<uint32_t>{};
