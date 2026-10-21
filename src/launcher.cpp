@@ -98,7 +98,7 @@ constexpr float kMenuRowH = 32;
 constexpr float kMenuPad = 8;
 constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 24;
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
-constexpr int kMaxApps = 6, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
+constexpr int kMaxApps = 12, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
 constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2;  // kClockTimer: halo2, re-armed to each minute boundary
 constexpr int kListBuffer = 4, kScrollMs = 180;  // rows drawn past each end of the list; the scroll slide
 constexpr UINT kMsgAppsFolder = WM_APP + 1;  // lParam: a Launcher::Found* from the Apps folder thread, owned by the panel
@@ -701,14 +701,14 @@ void Launcher::Build() {
     m_lw = m_h2 ? std::round(wl * s) : m_w;
     m_rightW = rightW;
 
-    // [start] recent_apps / recent_files: 0 hides the section; up to six files is one row.
+    // HALO 2.0 keeps twelve slots per section; classic Start follows its preferences.
     auto const& cfg = settings::Get().start;
-    const size_t maxApps = std::min(cfg.recentApps, kMaxApps);
-    size_t maxFiles = std::min(cfg.recentFiles, kMaxFiles);
-    if (m_h2) {  // the widget strip eats the room recent files had: they come back only on a roomy screen, as one row
+    const size_t maxApps = m_h2 ? kMaxApps : std::min(cfg.recentApps, 6);
+    size_t maxFiles = m_h2 ? kMaxFiles : std::min(cfg.recentFiles, kMaxFiles);
+    if (m_h2) {  // Keep every recent item; the home body scrolls on smaller displays.
         m_plan = start::PlanLeft(start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s),
                                  maxApps > 0, maxFiles > 0);
-        maxFiles = m_plan.files ? std::min<size_t>(maxFiles, kFileCols) : 0;
+        m_homeScroll = 0;
     }
     m_showApps = maxApps > 0;
     m_showFiles = maxFiles > 0;
@@ -723,9 +723,9 @@ void Launcher::Build() {
     }
 
     // Top to bottom: search bar, recent apps (one row), recent files (2 x 6), the dock bar under a hairline.
-    // The apps and the files share six columns. (halo2: search, greeting, widgets, recent apps, [one row of files], the dock bar.)
+    // Both recent sections share six columns; HALO 2.0 places the greeting and widgets above search.
     const float innerW = wl - 2 * kPad, colW = innerW / kFileCols;
-    const float searchTop = m_h2 ? start::kSearchTop : kSearchTop;
+    const float searchTop = m_h2 ? m_plan.searchY : kSearchTop;
     const float searchBot = searchTop + kSearchH;
     float appsLabelY, appsTop, filesLabelY, filesTop, dividerY;
     if (m_h2) {
@@ -760,7 +760,8 @@ void Launcher::Build() {
     m_appCells.clear();
     m_fileCells.clear();
     for (size_t i = 0; i < m_apps.size(); i++) {
-        float x = kPad + (i + 0.5f) * colW - kIconSize / 2, y = appsTop + (kAppRowH - kIconSize) / 2;
+        float x = kPad + (i % kFileCols + 0.5f) * colW - kIconSize / 2,
+              y = appsTop + (i / kFileCols) * kAppRowH + (kAppRowH - kIconSize) / 2;
         m_appCells.push_back(R(x * s, y * s, (x + kIconSize) * s, (y + kIconSize) * s));
     }
     for (size_t i = 0; i < m_files.size(); i++) {
@@ -783,17 +784,12 @@ void Launcher::Build() {
     m_staticHits.push_back({m_powerRect, Kind::Power, 0});
 
     if (m_h2) {  // the widget strip: greeting + quote, then two cards (clock/battery/power mode, month)
-        const float cardA = 232, cardGap = 12;
+        const float cardGap = ui::kS4, cardA = (innerW - cardGap) / 2;
         m_greetRect = R(kPad * s, m_plan.greetY * s, (kPad + innerW) * s, (m_plan.greetY + m_plan.greetH) * s);
         m_cardRect = R(kPad * s, m_plan.widgetsY * s, (kPad + cardA) * s, (m_plan.widgetsY + m_plan.widgetsH) * s);
         m_calRect = R((kPad + cardA + cardGap) * s, m_plan.widgetsY * s, (kPad + innerW) * s, (m_plan.widgetsY + m_plan.widgetsH) * s);
-        // The power-mode chip: along the bottom of the clock card, or (compact) under the battery on its right.
-        const float chipH = 28;
-        if (m_plan.weekOnly)
-            m_modeRect = R((kPad + cardA - 12 - 116) * s, (m_plan.widgetsY + 30) * s, (kPad + cardA - 12) * s, (m_plan.widgetsY + 30 + chipH) * s);
-        else
-            m_modeRect = R((kPad + 12) * s, (m_plan.widgetsY + m_plan.widgetsH - 12 - chipH) * s, (kPad + cardA - 12) * s,
-                           (m_plan.widgetsY + m_plan.widgetsH - 12) * s);
+        m_modeRect = R((kPad + 12) * s, (m_plan.widgetsY + 44) * s,
+                       (kPad + cardA - 12) * s, (m_plan.widgetsY + 72) * s);
         m_battery = svc::ReadBattery();
         m_mode = svc::ReadPowerMode();
     }
@@ -907,6 +903,12 @@ void Launcher::Build() {
         m_caret.Brush(m_comp.CreateColorBrush(Col(theme::P().text)));
         m_content.Children().InsertAtTop(m_caret);
     }
+    if (m_h2) {
+        m_headerSurface = MakeSurface(m_lw, searchTop * s);
+        auto header = MakeSurfaceVisual(m_headerSurface, m_lw, searchTop * s);
+        m_content.Children().InsertAtTop(header);
+        Redraw(m_headerSurface, &Launcher::DrawHeader);
+    }
     {   // the body: one text surface, and the icon sprites on top of it
         float h = m_bodyBottom - m_bodyTop;
         m_bodySurface = MakeSurface(m_lw, h);
@@ -914,7 +916,11 @@ void Launcher::Build() {
         v.Offset({0, m_bodyTop, 0});
         m_content.Children().InsertAtTop(v);
         m_bodyIcons = m_comp.CreateContainerVisual();
-        m_bodyIcons.Size({m_w, m_h});
+        m_bodyIcons.Size({m_lw, m_h});
+        auto homeClip = m_comp.CreateInsetClip();
+        homeClip.TopInset(m_bodyTop);
+        homeClip.BottomInset(m_h - m_bodyBottom);
+        m_bodyIcons.Clip(homeClip);
         m_content.Children().InsertAtTop(m_bodyIcons);
     }
     {   // the result rows
@@ -992,6 +998,7 @@ void Launcher::BuildBody() {
         float w = r.right - r.left, h = r.bottom - r.top;
         ic.v = m_comp.CreateSpriteVisual();
         ic.v.Size({w, h});
+        if (m_h2) { r.top -= m_homeScroll; r.bottom -= m_homeScroll; }
         ic.v.Offset({r.left, r.top, 0});
         ic.v.CenterPoint({w / 2, h / 2, 0});
         ic.v.Brush(brush);
@@ -1045,9 +1052,17 @@ void Launcher::BuildBody() {
             float ix = (c.left + c.right) / 2 - kFileIcon * s / 2, iy = c.top + 8 * s;
             m_fileSprites.push_back(sprite(FileBrush(m_files[i].path, kFileIcon), R(ix, iy, ix + kFileIcon * s, iy + kFileIcon * s)));
         }
-        if (m_h2 && m_mode != svc::PowerMode::Unknown) m_hits.push_back({m_modeRect, Kind::PowerMode, 0});
+
     }
     if (m_query.empty()) m_hits.push_back({m_allAppsRect, Kind::AllApps, 0});
+    if (m_h2 && !results) {
+        for (auto& hit : m_hits) {
+            if (hit.kind != Kind::App && hit.kind != Kind::File && hit.kind != Kind::AllApps) continue;
+            hit.r.top = std::max(hit.r.top - m_homeScroll, m_bodyTop);
+            hit.r.bottom = std::min(hit.r.bottom - m_homeScroll, m_bodyBottom);
+        }
+    }
+    if (m_h2 && m_mode != svc::PowerMode::Unknown) m_hits.push_back({m_modeRect, Kind::PowerMode, 0});
     for (auto const& h : m_staticHits) m_hits.push_back(h);
     Redraw(m_bodySurface, &Launcher::DrawBody);
 
@@ -1191,7 +1206,7 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
     dc->CreateSolidColorBrush(pal.text, white.put());
     dc->CreateSolidColorBrush(pal.textSoft, soft.put());
     dc->CreateSolidColorBrush(pal.dim, dim.put());
-    const float dy = oy - m_bodyTop;
+    const float dy = oy - m_bodyTop - (m_h2 && !Listing() ? m_homeScroll : 0);
     auto at = [&](D2D1_RECT_F r) { return R(r.left + ox, r.top + dy, r.right + ox, r.bottom + dy); };
 
     auto fLabel = txt.Format(L"Segoe UI Variable Text", 12 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
@@ -1233,7 +1248,6 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
         return;
     }
 
-    if (m_h2) DrawWidgets(dc, ox, dy);
     if (m_showApps) txt.Draw(dc, L"RECENT APPS", fLabel.get(), at(m_appsLabel), dim.get());
     if (m_showApps && m_apps.empty())
         txt.Draw(dc, L"Apps you open show up here", fRow.get(),
@@ -1632,6 +1646,11 @@ void Launcher::OnKey(WPARAM vk) {
             return;
         }
     }
+    if (m_h2 && !Listing() && !m_menuOpen && (vk == VK_NEXT || vk == VK_PRIOR || vk == VK_HOME || vk == VK_END)) {
+        const float page = m_bodyBottom - m_bodyTop;
+        ScrollHome(vk == VK_HOME ? -m_plan.contentBottom * m_s : vk == VK_END ? m_plan.contentBottom * m_s : vk == VK_NEXT ? page : -page);
+        return;
+    }
     switch (vk) {
         case VK_ESCAPE:  // closes the Power menu first, then clears the query, then leaves All apps, then the panel
             if (m_menuOpen) ToggleMenu(false);
@@ -2000,6 +2019,14 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_MOUSEWHEEL:  // three rows a notch; a touchpad's smaller steps add up
+            if (m_open && m_h2 && !m_menuOpen && !Listing()) {
+                POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
+                ScreenToClient(m_hwnd, &p);
+                if (p.x - m_shadowM < m_lw && p.y - kTop * m_s >= m_bodyTop && p.y - kTop * m_s < m_bodyBottom) {
+                    ScrollHome(-GET_WHEEL_DELTA_WPARAM(w) * ui::kS6 * m_s / WHEEL_DELTA);
+                    return 0;
+                }
+            }
             if (m_open && m_h2 && !m_menuOpen && m_detail != Detail::None) {  // over the right column the radio list scrolls
                 POINT p;
                 if (GetCursorPos(&p) && ScreenToClient(m_hwnd, &p) && p.x - m_shadowM >= m_lw) {
@@ -2124,11 +2151,6 @@ std::wstring DateText(SYSTEMTIME const& st, wchar_t const* format) {
     return GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, format, b, 64, nullptr) ? std::wstring(b) : std::wstring();
 }
 
-std::wstring TimeText(SYSTEMTIME const& st) {
-    wchar_t b[64] = {};
-    return GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &st, nullptr, b, 64) ? std::wstring(b) : std::wstring();
-}
-
 // 0 = Sunday .. 6 = Saturday: the column-0 weekday of the user's calendar.
 int FirstWeekday() {
     DWORD v = 0;  // LOCALE_IFIRSTDAYOFWEEK: 0 = Monday .. 6 = Sunday
@@ -2148,7 +2170,7 @@ std::wstring WeekdayLetter(int dow) {  // dow 0 = Sunday
 
 float Launcher::PanelX() const {
     const RECT& mon = m_anchor.monitor;
-    if (m_h2) return std::min(mon.left + start::kScreenMargin * m_s, std::max(static_cast<float>(mon.left), mon.right - m_w));  // 2.0: on the left of the screen
+    if (m_h2) return mon.left + (mon.right - mon.left - m_w) / 2;
     return static_cast<float>(std::clamp(m_anchor.centerX - static_cast<int>(m_w) / 2, static_cast<int>(mon.left), static_cast<int>(mon.right - m_w)));
 }
 
@@ -2169,7 +2191,7 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
 
     {   // "Hello, Name" and the quote of the day
         auto g = at(m_greetRect);
-        auto fHello = txt.Format(ui::kFontDisplay, ui::kHeading * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        auto fHello = txt.Format(ui::kFontDisplay, ui::kDisplay * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         txt.Draw(dc, L"Hello, " + start::FirstName(m_user, m_user), fHello.get(), R(g.left, g.top, g.right, g.top + start::kGreetH * s),
                  c.ink.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
         if (m_plan.quote) {
@@ -2187,37 +2209,23 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
         dc->DrawRoundedRectangle(rr, c.line.get(), 1.0f);
     };
 
-    {   // clock card: time, date, battery, power-mode chip
+    {   // Battery, remaining runtime and Windows power mode.
         auto r = at(m_cardRect);
         card(r);
-        auto fTime = txt.Format(ui::kFontDisplay, (compact ? 20.0f : ui::kDisplay) * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        auto fDate = txt.Format(ui::kFontText, ui::kCaption * s, DWRITE_FONT_WEIGHT_NORMAL);
         auto fBody = txt.Format(ui::kFontText, ui::kBody * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        auto fGlyph = txt.Format(ui::kFontIcons, ui::kIconSmall * s, DWRITE_FONT_WEIGHT_NORMAL);
-        const float timeH = (compact ? 24.0f : 32.0f) * s, timeTop = r.top + (compact ? 6.0f : 8.0f) * s;
-        const float rightEdge = compact ? r.right - pad - 116 * s - ui::kS2 * s : r.right - pad - 76 * s;
-        txt.Draw(dc, TimeText(st), fTime.get(), R(r.left + pad, timeTop, rightEdge, timeTop + timeH), c.ink.get(),
-                 DWRITE_TEXT_ALIGNMENT_LEADING, true);
-        txt.Draw(dc, DateText(st, compact ? L"ddd d MMM" : L"dddd, d MMMM"), fDate.get(),
-                 R(r.left + pad, timeTop + timeH, compact ? rightEdge : r.right - pad, timeTop + timeH + 16 * s), c.soft.get(),
-                 DWRITE_TEXT_ALIGNMENT_LEADING, true);
-        if (m_battery.hasBattery) {  // top right: 82% and what it is doing
-            const wchar_t* state = m_battery.ac ? (m_battery.charging ? L"Charging" : L"Plugged in") : L"On battery";
-            const float bx = r.right - pad - (compact ? 116.0f : 76.0f) * s;
-            txt.Draw(dc, std::to_wstring(m_battery.percent) + L"%", fBody.get(), R(bx, r.top + 8 * s, r.right - pad, r.top + 28 * s),
-                     c.ink.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
-            if (!compact)
-                txt.Draw(dc, state, fDate.get(), R(bx, r.top + 28 * s, r.right - pad, r.top + 44 * s), c.dim.get(),
-                         DWRITE_TEXT_ALIGNMENT_TRAILING, true);
+        auto fSub = txt.Format(ui::kFontText, ui::kCaption * s, DWRITE_FONT_WEIGHT_NORMAL);
+        const std::wstring battery = m_battery.hasBattery ? std::to_wstring(m_battery.percent) + L"%" : L"AC power";
+        std::wstring remaining = m_battery.charging ? L"Charging" : m_battery.ac ? L"Plugged in" : L"Estimating…";
+        if (!m_battery.ac && m_battery.remainingSeconds >= 0) {
+            const int minutes = m_battery.remainingSeconds / 60;
+            remaining = std::to_wstring(minutes / 60) + L"h " + std::to_wstring(minutes % 60) + L"m left";
         }
-        auto chip = at(m_modeRect);  // clickable when Windows tells us the mode; read-only (dim) otherwise
-        const bool live = m_mode != svc::PowerMode::Unknown;
-        const float cr = (chip.bottom - chip.top) / 2;
-        dc->FillRoundedRectangle(D2D1::RoundedRect(chip, cr, cr), c.hover.get());
-        txt.Draw(dc, L"", fGlyph.get(), R(chip.left + 8 * s, chip.top, chip.left + 28 * s, chip.bottom), live ? c.ink.get() : c.dim.get(),
-                 DWRITE_TEXT_ALIGNMENT_CENTER);
-        txt.Draw(dc, ModeLabel(m_mode), fDate.get(), R(chip.left + 32 * s, chip.top, chip.right - 8 * s, chip.bottom),
-                 live ? c.ink.get() : c.dim.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        txt.Draw(dc, battery, fBody.get(), R(r.left + pad, r.top + 8 * s, r.right - pad, r.top + 36 * s), c.ink.get());
+        txt.Draw(dc, remaining, fSub.get(), R(r.left + 68 * s, r.top + 8 * s, r.right - pad, r.top + 36 * s),
+                 c.dim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING, true);
+        auto chip = at(m_modeRect);
+        dc->FillRoundedRectangle(D2D1::RoundedRect(chip, ui::kRadiusSmall * s, ui::kRadiusSmall * s), c.hover.get());
+        txt.Draw(dc, ModeLabel(m_mode), fSub.get(), chip, c.soft.get(), DWRITE_TEXT_ALIGNMENT_CENTER, true);
     }
 
     {   // month card: title, weekday letters, the days with today in a circle (or just this week when short of room)
@@ -2254,6 +2262,18 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
     }
 }
 
+void Launcher::ScrollHome(float delta) {
+    m_homeScroll = std::clamp(m_homeScroll + delta, 0.0f, std::max(0.0f, m_plan.contentBottom * m_s - m_bodyBottom));
+    BuildBody();
+    m_hoverIndex = -2;
+}
+
+void Launcher::DrawHeader(ID2D1DeviceContext* dc, float ox, float oy) {
+    dc->Clear(D2D1::ColorF(0, 0.0f));
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    DrawWidgets(dc, ox, oy);
+}
+
 void Launcher::RedrawBody() {
     if (!m_open || !m_h2 || !m_bodySurface || Listing()) return;
     try { Redraw(m_bodySurface, &Launcher::DrawBody); } catch (...) {}
@@ -2270,6 +2290,7 @@ void Launcher::ArmClock() {
 void Launcher::RefreshWidgets() {
     m_battery = svc::ReadBattery();
     m_mode = svc::ReadPowerMode();
+    if (m_headerSurface) Redraw(m_headerSurface, &Launcher::DrawHeader);
     RedrawBody();
 }
 
@@ -2286,6 +2307,7 @@ void Launcher::CycleMode() {
         m_mode = now == svc::PowerMode::Unknown ? next : now;
         Log(std::wstring(L"power mode: ") + ModeLabel(m_mode));
     }
+    if (m_headerSurface) Redraw(m_headerSurface, &Launcher::DrawHeader);
     RedrawBody();
 }
 

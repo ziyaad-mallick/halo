@@ -61,6 +61,7 @@ bool SetDefaultOutput(std::wstring const& id);  // false -> opened the Sound set
 // ---- Power ----------------------------------------------------------------------------
 struct Battery {
     int percent = 100;
+    int remainingSeconds = -1;  // Windows estimate; -1 means unavailable.
     bool hasBattery = false, ac = true, charging = false;
 };
 Battery ReadBattery();

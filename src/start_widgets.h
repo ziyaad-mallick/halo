@@ -149,13 +149,13 @@ inline MonthGrid MakeMonthGrid(int y, int m, int today, int firstDow) {
 }
 
 // ---- Layout -------------------------------------------------------------------------------------------
-inline constexpr float kScreenMargin = 24, kPanelTop = 8;  // as launcher.cpp: margin to the screen edge, room above for the spring
-inline constexpr float kLeftMax = 540, kLeftMin = 480, kRightW = 312, kRightMinW = 264;
-inline constexpr float kSearchTop = 16, kSearchH = 40, kGap = 10, kLabelH = 16;
+inline constexpr float kScreenMargin = 24, kPanelTop = 8;
+inline constexpr float kLeftMax = 720, kLeftMin = 480, kRightW = 384, kRightMinW = 280;
+inline constexpr float kSearchTop = 208, kSearchH = 40, kGap = 16, kLabelH = 16;
 inline constexpr float kAppRowH = 64, kFileCellH = 70, kBottomH = 56;
-inline constexpr float kGreetQuoteH = 40, kGreetH = 24;     // "Hello, Name" + quote line / the greeting alone
-inline constexpr float kWidgetsH = 120, kWidgetsCompactH = 64;
-inline constexpr float kRightPad = 16, kRightMinH = 336;
+inline constexpr float kGreetQuoteH = 64, kGreetH = 40;
+inline constexpr float kWidgetsH = 80, kWidgetsCompactH = 80;
+inline constexpr float kRightPad = 24, kRightMinH = 336;
 
 struct Widths {
     float left, right, total;
@@ -178,46 +178,28 @@ inline float AvailHeight(float monitorTopPx, float anchorBottomPx, float scale) 
     return (anchorBottomPx - monitorTopPx) / scale - kPanelTop - 8;
 }
 
-// The left column, top to bottom, as y's from the top of the panel. Levels, from roomiest to tightest:
-//   0 greeting + quote, widgets (clock, month, battery, power mode), recent apps, recent files
-//   1 the same without recent files
-//   2 the greeting without the quote
-//   3 the month shrinks to this week
-// The first level whose height fits `avail` wins; level 3 is used if even that does not.
+// Greeting, compact widgets, search, two rows of apps and files; recent content scrolls when needed.
 struct LeftPlan {
     int level = 0;
-    bool quote = true, files = true, weekOnly = false;
-    float greetY = 0, greetH = 0, widgetsY = 0, widgetsH = 0;
+    bool quote = true, files = true, weekOnly = true;
+    float greetY = 24, greetH = kGreetQuoteH, widgetsY = 104, widgetsH = kWidgetsH;
+    float searchY = kSearchTop;
     float appsLabelY = 0, appsTop = 0, filesLabelY = 0, filesTop = 0;
-    float dividerY = 0, height = 0;
+    float dividerY = 0, height = 0, contentBottom = 0;
 };
 inline LeftPlan PlanLeft(float avail, bool wantApps, bool wantFiles) {
     LeftPlan p;
-    for (int level = 0; level <= 3; level++) {
-        p = LeftPlan{};
-        p.level = level;
-        p.quote = level <= 1;
-        p.files = wantFiles && level == 0;
-        p.weekOnly = level == 3;
-        float y = kSearchTop + kSearchH + kGap;
-        p.greetY = y;
-        p.greetH = p.quote ? kGreetQuoteH : kGreetH;
-        y += p.greetH + kGap;
-        p.widgetsY = y;
-        p.widgetsH = p.weekOnly ? kWidgetsCompactH : kWidgetsH;
-        y += p.widgetsH + kGap;
-        p.appsLabelY = y;  // also where the "ALL APPS" header of the list goes when the section itself is off
-        p.appsTop = y + kLabelH + 6;
-        if (wantApps) y = p.appsTop + kAppRowH + kGap;
-        if (p.files) {
-            p.filesLabelY = y;
-            p.filesTop = y + kLabelH + 6;
-            y = p.filesTop + kFileCellH + kGap;
-        }
-        p.dividerY = y;
-        p.height = y + 1 + kBottomH;
-        if (p.height <= avail) break;
-    }
+    p.files = wantFiles;
+    float y = p.searchY + kSearchH + kGap;
+    p.appsLabelY = y;
+    p.appsTop = y + kLabelH + 8;
+    if (wantApps) y = p.appsTop + 2 * kAppRowH + kGap;
+    p.filesLabelY = y;
+    p.filesTop = y + kLabelH + 8;
+    if (wantFiles) y = p.filesTop + 74 + kFileCellH + kGap;
+    p.contentBottom = y;
+    p.height = std::min(avail, y + 4 + kBottomH);
+    p.dividerY = p.height - kBottomH - 4;
     return p;
 }
 

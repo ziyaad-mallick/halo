@@ -203,6 +203,7 @@ Battery ReadBattery() {
     if (GetSystemPowerStatus(&s)) {
         b.hasBattery = !(s.BatteryFlag & 128) && s.BatteryLifePercent <= 100;
         b.percent = s.BatteryLifePercent <= 100 ? s.BatteryLifePercent : 100;
+        b.remainingSeconds = s.BatteryLifeTime == DWORD(-1) ? -1 : static_cast<int>(s.BatteryLifeTime);
         b.ac = s.ACLineStatus == 1;
         b.charging = (s.BatteryFlag & 8) != 0;
     }

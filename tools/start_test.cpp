@@ -86,20 +86,21 @@ static void Layout() {
         CHECK(right.bottom <= height - start::kRightPad + 0.01f);       // the right column fits its own height
         CHECK(right.tilesY >= 0 && right.brightY > right.tilesY && right.volY > right.brightY && right.mediaY > right.volY &&
               right.usageY > right.mediaY);
-        // the left column's blocks are in order and above the divider
-        CHECK(plan.widgetsY > plan.greetY && plan.appsTop > plan.widgetsY + plan.widgetsH && plan.dividerY > plan.appsTop + start::kAppRowH);
-        if (plan.files) CHECK(plan.filesTop > plan.appsTop && plan.dividerY > plan.filesTop + start::kFileCellH);
-        // a page of results always fits under the search bar: at least 5 rows of 34
-        CHECK(plan.dividerY - (start::kSearchTop + start::kSearchH + 8) >= 5 * 34);
+        CHECK(plan.greetY < plan.widgetsY);
+        CHECK(plan.widgetsY + plan.widgetsH <= plan.searchY);
+        CHECK(plan.searchY + start::kSearchH < plan.appsLabelY);
+        CHECK(plan.files && plan.quote && plan.weekOnly);
+        CHECK(plan.filesTop >= plan.appsTop + 2 * start::kAppRowH);
+        CHECK(plan.contentBottom >= plan.filesTop + 74 + start::kFileCellH);
+        CHECK(plan.dividerY > plan.searchY + start::kSearchH + 34);
+        // Every one of the 12 files is reachable by scrolling; never drop a section for height.
+        const float maxScroll = std::max(0.0f, plan.contentBottom - plan.dividerY);
+        CHECK(plan.filesTop + 74 + start::kFileCellH - maxScroll <= plan.dividerY);
     }
-    // Shrinking only ever drops things: the level never falls as the room shrinks, and nothing taller than the room is chosen
-    // unless it is already the tightest.
-    int last = 0;
-    for (float avail = 700; avail >= 300; avail -= 4) {
+    for (float avail = 700; avail >= 336; avail -= 4) {
         auto p = start::PlanLeft(avail, true, true);
-        CHECK(p.level >= last);
-        last = p.level;
-        CHECK(p.height <= avail || p.level == 3);
+        CHECK(p.height <= avail && p.files && p.quote && p.weekOnly);
+        CHECK(p.contentBottom >= p.filesTop + 74 + start::kFileCellH);
     }
     // The right column holds for every panel height the left can produce.
     for (float h = start::kRightMinH; h <= 560; h += 4) CHECK(start::PlanRight(h).bottom <= h - start::kRightPad + 0.01f);

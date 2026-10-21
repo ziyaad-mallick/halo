@@ -162,6 +162,8 @@ private:
     float PanelX() const;                  // the panel's left edge in screen px (halo2 sits on the left of the screen)
     float CornerX() const;                 // where along the panel the swoop grows from (the dock is under it)
     void BuildRight(float rightW);         // the right column's visuals, hit rects and first paint
+    void ScrollHome(float delta);
+    void DrawHeader(ID2D1DeviceContext* dc, float ox, float oy);
     void DrawWidgets(ID2D1DeviceContext* dc, float ox, float oy);  // greeting, quote, clock, month, battery, power mode
     void DrawRight(ID2D1DeviceContext* dc, float ox, float oy);    // tiles, sliders, now playing / the radio list
     void DrawUsage(ID2D1DeviceContext* dc, float ox, float oy);    // the usage monitor
@@ -224,7 +226,8 @@ private:
     float m_shadowM = 0, m_shadowB = 0;          // shadow margin (px) at the sides / bottom of the window
     winrt::Windows::Foundation::Numerics::float3 PanelHome() const;
     wuc::ContainerVisual m_content{nullptr};  // the panel's contents; dims behind the menu
-    wuc::CompositionDrawingSurface m_searchSurface{nullptr}, m_bodySurface{nullptr};
+    wuc::CompositionDrawingSurface m_searchSurface{nullptr}, m_bodySurface{nullptr}, m_headerSurface{nullptr};
+    float m_homeScroll = 0;
     wuc::SpriteVisual m_caret{nullptr};
     wuc::ContainerVisual m_bodyIcons{nullptr};  // the body's icon sprites, swapped with the body
     // The result rows: their own surface and icons, drawn a few rows past each end of what shows, in a holder that
