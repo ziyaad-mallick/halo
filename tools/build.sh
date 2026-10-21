@@ -52,6 +52,11 @@ build_cluster_test() {
   "$CXX" "${COMMON[@]}" src/cluster.cpp src/settings.cpp tools/cluster_test.cpp -o build/cluster_test.exe "${WINLIBS[@]}"
 }
 
+build_dock_hit_test() {
+  echo "== dock_hit_test.exe"
+  "$CXX" "${COMMON[@]}" src/dock.cpp src/cluster.cpp src/settings.cpp tools/dock_hit_test.cpp -o build/dock_hit_test.exe "${WINLIBS[@]}"
+}
+
 build_swoop_test() {
   echo "== swoop_test.exe"
   "$CXX" "${COMMON[@]}" -DHALO_SWOOP_TEST src/swoop.cpp tools/swoop_test.cpp -o "${SWOOP_TEST_OUT:-build/swoop_test.exe}" -ldwmapi -lpsapi -luser32 -lgdi32
@@ -74,6 +79,7 @@ case "${1:-halo}" in
   icons_test) build_icons_test ;;
   pins_test) build_pins_test ;;
   cluster_test) build_cluster_test ;;
+  dock_hit_test) build_dock_hit_test ;;
   swoop_test) build_swoop_test ;;
   settings_launch_test) build_settings_launch_test ;;
   start_test) build_start_test ;;

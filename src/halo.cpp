@@ -95,7 +95,7 @@ constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
 constexpr UINT kMsgSettings = WM_APP + 50;  // halo::settings::Watch: settings.ini changed
-constexpr UINT kMsgVolume = WM_APP + 61;  // HALO 2.0: the speaker volume / mute changed elsewhere
+constexpr UINT kMsgDockMedia = WM_APP + 62, kMsgDockRadios = WM_APP + 63;
 constexpr UINT kMsgGuardianGone = WM_APP + 60;  // the guardian that started us exited
 constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Control Center) / kRight (notifications)
 constexpr UINT kMsgTestNotifCenter = WM_APP + 21;  // HALO_TEST=1: toggle the Notification Center
@@ -238,7 +238,6 @@ private:
     // HALO 2.0: the right side opens the notification column on its own (with the calendar), not the Control Center.
     void OpenNotifications();
     void ToggleNotifications();
-    void SyncVolume();
     void TogglePanel() { if (m_cc && m_cc->IsOpen()) ClosePanel(); else OpenPanel(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
     std::wstring LaunchTarget(RunningApp const& app) const;
@@ -269,8 +268,9 @@ private:
     std::unique_ptr<halo::Swoop> m_swoop;  // after m_tracker: dies first, giving windows their transitions back
     std::unique_ptr<Dock> m_dock;
     std::unique_ptr<DockCluster> m_cluster;
-    std::unique_ptr<DockWidgets> m_widgets;  // HALO 2.0: Wi-Fi + volume, right of the pill
-    halo::svc::AudioEndpoint m_speaker;       // bound while HALO 2.0 is on
+    std::unique_ptr<DockWidgets> m_widgets;  // HALO 2.0: Wi-Fi, Bluetooth and Now Playing
+    halo::svc::Media m_dockMedia;
+    halo::svc::Radios m_dockRadios;
     std::unique_ptr<halo::AppLabel> m_label;
     std::unique_ptr<halo::Launcher> m_launcher;
     std::unique_ptr<halo::Previews> m_previews;
@@ -311,6 +311,8 @@ private:
 // throws winrt::hresult_error out of a noexcept destructor -> terminate on every exit. Drop the
 // visual owners while the compositor is still alive.
 Halo::~Halo() {
+    m_dockMedia.Stop();
+    m_dockRadios.Stop();
     m_label.reset();
 }
 
@@ -748,14 +750,18 @@ wuc::SpriteVisual Halo::BuildPillShadow(wuc::ContainerVisual const& pill) {
 }
 
 void Halo::BuildDock() {
+    m_dockMedia.Stop();
+    m_dockRadios.Stop();
     auto pill = BuildPill();
     m_cluster = std::make_unique<DockCluster>(m_comp, m_gdev, m_hwnd, m_metrics.pillHeight, m_scale.v);
     if (halo::settings::Get().halo2) {
         m_widgets = std::make_unique<DockWidgets>(m_comp, m_gdev, m_metrics.pillHeight, m_scale.v);
-        if (!m_speaker.Available()) m_speaker.Bind(eRender, m_hwnd, kMsgVolume);
-        SyncVolume();
-    } else {
-        m_speaker.Unbind();
+        m_dockRadios.Start(m_hwnd, kMsgDockRadios);
+        m_dockMedia.Start(m_hwnd, kMsgDockMedia, [this] {
+            if (!m_widgets) return;
+            auto const& state = m_dockMedia.State();
+            m_widgets->SetMedia(state.title, state.has, state.playing);
+        });
     }
     m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics, m_cluster.get(), m_widgets.get());
     Step(L"pill shadow", [&] {
@@ -1410,10 +1416,6 @@ void Halo::ToggleNotifications() {
     else OpenNotifications();
 }
 
-// The speaker's level and mute onto the dock's volume widget.
-void Halo::SyncVolume() {
-    if (m_widgets) m_widgets->SetVolume(m_speaker.Volume(), m_speaker.Muted(), m_speaker.Available());
-}
 
 void Halo::ClosePanel() {
     KillTimer(m_hwnd, kPanelStagger);
@@ -1478,22 +1480,10 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 else OpenLauncher();
             }
             return 0;
-        case kMsgVolume: m_speaker.OnMessage(w); SyncVolume(); return 0;
-        case WM_MOUSEWHEEL:
-            if (m_cfg.halo2 && m_dock && m_widgets && m_state == State::Shown) {
-                POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};  // screen coordinates
-                ScreenToClient(m_hwnd, &p);
-                if (m_dock->HitTarget(static_cast<float>(p.x), static_cast<float>(p.y)).kind == Dock::Kind::Volume &&
-                    m_speaker.Available()) {
-                    // 2 % a notch, like the Windows volume; raising it unmutes.
-                    const float step = GET_WHEEL_DELTA_WPARAM(w) / static_cast<float>(WHEEL_DELTA) * 0.02f;
-                    m_speaker.SetVolume(std::clamp(m_speaker.Volume() + step, 0.0f, 1.0f));
-                    if (step > 0 && m_speaker.Muted()) m_speaker.SetMute(false);
-                    SyncVolume();
-                    return 0;
-                }
-            }
-            break;
+        case kMsgDockMedia: m_dockMedia.Pull(); return 0;
+        case kMsgDockRadios:
+            if (m_widgets) m_widgets->SetBluetooth(m_dockRadios.HasBluetooth(), m_dockRadios.BluetoothOn());
+            return 0;
         case kMsgIntellihideChanged:
             if (w || l) {
                 if (!m_trackingMouse) StartHide();
@@ -1583,7 +1573,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (m_dock && m_state == State::Shown) {
                 const Dock::Target target = m_dock->HitTarget(mx, my);
                 m_pressedStart = target.kind == Dock::Kind::Start;
-                m_pressedWidget = target.kind == Dock::Kind::Wifi || target.kind == Dock::Kind::Volume ? target.kind : Dock::Kind::None;
+                m_pressedWidget = target.kind == Dock::Kind::Wifi || target.kind == Dock::Kind::Bluetooth || target.kind == Dock::Kind::Media ? target.kind : Dock::Kind::None;
                 m_pressed = m_dock->HitTest(mx, my);
                 m_dock->SetPressed(m_pressed);
                 if (m_pressed >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
@@ -1597,9 +1587,10 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 widget != Dock::Kind::None && m == WM_LBUTTONUP && m_dock && m_dock->HitTarget(mx, my).kind == widget) {
                 if (widget == Dock::Kind::Wifi) {
                     OpenLauncher();  // Start hosts the Wi-Fi list
-                } else if (m_speaker.Available()) {
-                    m_speaker.SetMute(!m_speaker.Muted());
-                    SyncVolume();
+                } else if (widget == Dock::Kind::Bluetooth) {
+                    OpenLauncher();
+                } else if (widget == Dock::Kind::Media && m_dockMedia.State().has) {
+                    m_dockMedia.PlayPause();
                 }
             }
             if (m_pressed >= 0 && m_dock) {
@@ -1626,7 +1617,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
             return 0;
-        case WM_CLOSE: m_swoop.reset(); m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
+        case WM_CLOSE: m_swoop.reset(); m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); m_dockMedia.Stop(); m_dockRadios.Stop(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);

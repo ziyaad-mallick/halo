@@ -240,9 +240,9 @@ void DockCluster::Layout() {
     m_timeW = TextWidth(L"88:88", m_tfTime.get());
     m_wifiX = m_timeX + m_timeW + 10.0f * s;
     m_iconW = std::max(TextWidth(L"\uE701", m_tfIcons.get()), TextWidth(L"\uEBAA", m_tfIcons.get()));
-    m_battX = m_wifiX + m_iconW + 8.0f * s;
+    m_battX = halo::settings::Get().halo2 ? m_timeX + m_timeW + 12.0f * s : m_wifiX + m_iconW + 8.0f * s;
     m_battTextW = TextWidth(L"100%", m_tfBattText.get());
-    m_startWidth = std::round(28.0f * s);  // one rest-size icon slot
+    m_startWidth = std::round((halo::settings::Get().halo2 ? 36.0f : 28.0f) * s);  // one rest-size icon slot
     m_startX = m_battX + m_iconW + 3.0f * s + m_battTextW + 8.0f * s;
     m_width = std::ceil(m_startX + m_startWidth);
 }
@@ -277,6 +277,7 @@ void DockCluster::Render() {
         time->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         dc->DrawTextLayout({ox + m_timeX, oy}, time.get(), white.get());
 
+        if (!halo::settings::Get().halo2) {
         // Network: Wi-Fi or Ethernet glyph; dimmed Wi-Fi when offline.
         const NetState ns = ReadNet();
         const bool online = ns.online;
@@ -284,6 +285,8 @@ void DockCluster::Render() {
         auto netLayout = MakeLayout(std::wstring(1, net), m_tfIcons.get(), m_iconW);
         netLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         dc->DrawTextLayout({ox + m_wifiX, oy}, netLayout.get(), online ? white.get() : dim.get());
+
+        }
 
         // Battery: Battery0..10 (EBA0..EBAA) or BatteryCharging0..10 (EBAB..EBB5), then the percentage.
         SYSTEM_POWER_STATUS sps{};
@@ -301,7 +304,7 @@ void DockCluster::Render() {
         }
 
         // Start: the Windows 11 logo, four panes under one blue gradient.
-        const float logo = std::round(20.0f * m_scale);  // 17 before: ~18 % larger
+        const float logo = std::round((halo::settings::Get().halo2 ? 28.0f : 20.0f) * m_scale);  // 17 before: ~18 % larger
         const float gap = std::max(1.0f, std::round(logo / 14.0f));
         const float pane = (logo - gap) / 2;
         const float lx = ox + m_startX + (m_startWidth - logo) / 2;
@@ -330,12 +333,18 @@ DockWidgets::DockWidgets(winrt::Windows::UI::Composition::Compositor const& comp
                          winrt::Windows::UI::Composition::CompositionGraphicsDevice const& gdev,
                          float pillHeight, float scale)
     : m_gdev(gdev), m_pillHeight(pillHeight), m_scale(scale) {
-    m_slotW = std::round(28.0f * scale);  // one rest-size icon slot each
+    m_slotW = std::round(28.0f * scale);
+    m_mediaW = std::round(144.0f * scale);  // one rest-size icon slot each
     winrt::check_hresult(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                              reinterpret_cast<IUnknown**>(m_dwriteFactory.put())));
     winrt::check_hresult(m_dwriteFactory->CreateTextFormat(
         IconFontFamily(m_dwriteFactory.get()), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_STRETCH_NORMAL, 15.0f * scale, L"en-us", m_tfIcons.put()));
+    winrt::check_hresult(m_dwriteFactory->CreateTextFormat(
+        L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 12.0f * scale, L"en-us", m_tfMedia.put()));
+    m_tfMedia->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    m_tfMedia->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     m_tfIcons->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     m_tfIcons->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     if (m_gdev) {
@@ -349,12 +358,18 @@ DockWidgets::DockWidgets(winrt::Windows::UI::Composition::Compositor const& comp
     Render();
 }
 
-void DockWidgets::SetVolume(float level, bool muted, bool available) {
-    level = std::clamp(level, 0.0f, 1.0f);
-    if (level == m_volume && muted == m_muted && available == m_audio) return;
-    m_volume = level;
-    m_muted = muted;
-    m_audio = available;
+void DockWidgets::SetBluetooth(bool available, bool on) {
+    if (m_btAvailable == available && m_btOn == on) return;
+    m_btAvailable = available;
+    m_btOn = on;
+    Render();
+}
+
+void DockWidgets::SetMedia(std::wstring const& title, bool has, bool playing) {
+    if (m_title == title && m_hasMedia == has && m_playing == playing) return;
+    m_title = title;
+    m_hasMedia = has;
+    m_playing = playing;
     Render();
 }
 
@@ -384,11 +399,27 @@ void DockWidgets::Render() {
             dc->DrawLine({cx - h, cy + h}, {cx + h, cy - h}, white.get(), std::max(1.0f, 1.4f * m_scale));
         }
 
-        // Volume: Mute (E74F) or Volume0..3 (E992..E995) by level.
-        wchar_t vol = L'\uE74F';
-        if (m_audio && !m_muted)
-            vol = m_volume <= 0.0f ? L'\uE992' : m_volume < 0.34f ? L'\uE993' : m_volume < 0.67f ? L'\uE994' : L'\uE995';
-        glyph(kVolume, vol, m_audio ? white.get() : dim.get());
+        glyph(kBluetooth, 0xE702, m_btAvailable && m_btOn ? white.get() : dim.get());
+        const float inset = 8 * m_scale;
+        auto pill = D2D1::RectF(ox + SlotLeft(kMedia) + inset, oy + inset, ox + Width(), oy + m_pillHeight - inset);
+        winrt::com_ptr<ID2D1SolidColorBrush> fill;
+        dc->CreateSolidColorBrush(halo::theme::P().fill, fill.put());
+        const float radius = (pill.bottom - pill.top) / 2;
+        dc->FillRoundedRectangle(D2D1::RoundedRect(pill, radius, radius), fill.get());
+        const wchar_t play = m_hasMedia ? (m_playing ? 0xE769 : 0xE768) : 0xE8D6;
+        dc->DrawText(&play, 1, m_tfIcons.get(), D2D1::RectF(pill.left + 4 * m_scale, pill.top, pill.left + 28 * m_scale, pill.bottom),
+                     m_hasMedia ? white.get() : dim.get());
+        const std::wstring title = m_hasMedia ? (m_title.empty() ? L"Now Playing" : m_title) : L"Not Playing";
+        winrt::com_ptr<IDWriteTextLayout> label;
+        const float textWidth = std::max(1.0f, pill.right - pill.left - 40 * m_scale);
+        if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(title.c_str(), static_cast<UINT32>(title.size()), m_tfMedia.get(),
+                                                      textWidth, pill.bottom - pill.top, label.put()))) {
+            DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+            winrt::com_ptr<IDWriteInlineObject> ellipsis;
+            m_dwriteFactory->CreateEllipsisTrimmingSign(m_tfMedia.get(), ellipsis.put());
+            label->SetTrimming(&trim, ellipsis.get());
+            dc->DrawTextLayout({pill.left + 28 * m_scale, pill.top}, label.get(), m_hasMedia ? white.get() : dim.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
     } catch (...) {
         interop->EndDraw();
         throw;

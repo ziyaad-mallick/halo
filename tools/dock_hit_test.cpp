@@ -81,9 +81,9 @@ int wmain(int argc, wchar_t** argv) {
         items.push_back({L"app" + std::to_wstring(i), comp.CreateColorBrush(), false, i >= 4});
     dock.SetItems(items);
 
-    // Pill geometry at rest: cluster 192 + gap 10, 5 slots of 38 + a 10 divider (one unpinned), widgets 56 + 10.
+    // Pill geometry at rest: cluster 192 + gap 10, 5 slots of 38 + a 10 divider (one unpinned), the measured widget width + 10.
     const float cW = cluster.Width();  // font-dependent (192 with the stock Segoe metrics)
-    const float right = h2 ? 66.0f : 0.0f;
+    const float right = h2 ? widgets.Width() + 10.0f : 0.0f;
     const float pillW = (cW + 10.0f) + 5 * 38.0f - 10.0f + 10.0f + right + 20.0f;
     const float pillL = m.centerX - pillW / 2, pillR = pillL + pillW;
     const float midY = m.bottom - m.pillHeight / 2;
@@ -126,16 +126,16 @@ int wmain(int argc, wchar_t** argv) {
         CHECK(dock.HitTarget(cl + cW + 2.0f, midY).kind == Dock::Kind::Start);  // the gap before the first icon
         CHECK(dock.HitTarget(pillR - 3.0f, midY).kind == Dock::Kind::App);
     } else {
-        // The whole cluster is Start: the time, Wi-Fi, battery, the logo and the gaps between.
+        // The whole cluster is Start: time, battery, logo and the gaps between.
         for (float x = cl; x <= cl + cW; x += 4.0f) CHECK(dock.HitStart(x, midY));
         CHECK(dock.HitStart(cl + 5.0f, midY - 20.0f));
-        // The widgets on the right: Wi-Fi, volume; every point across them hits one, none is dead.
-        float wl = pillR - 10.0f - 56.0f;
-        for (float x = wl; x < wl + 56.0f; x += 2.0f) {
+        // The widgets on the right: Wi-Fi, Bluetooth, media; every point across them hits one, none is dead.
+        float wl = pillR - 10.0f - widgets.Width();
+        for (float x = wl; x < wl + widgets.Width(); x += 2.0f) {
             auto t = dock.HitTarget(x, midY);
-            CHECK(t.kind == (x <= wl + 28.0f ? Dock::Kind::Wifi : Dock::Kind::Volume));
+            CHECK(t.kind == (x <= wl + 28.0f ? Dock::Kind::Wifi : x <= wl + 56.0f ? Dock::Kind::Bluetooth : Dock::Kind::Media));
         }
-        CHECK(dock.HitTarget(pillR - 2.0f, midY).kind == Dock::Kind::Volume);  // the pill's right padding
+        CHECK(dock.HitTarget(pillR - 2.0f, midY).kind == Dock::Kind::Media);  // the pill's right padding
         CHECK(dock.HitTarget(wl - 4.0f, midY).kind != Dock::Kind::None);       // the divider before them
         CHECK(!dock.HitStart(wl + 10.0f, midY));
     }

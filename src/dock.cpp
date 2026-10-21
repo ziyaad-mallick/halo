@@ -20,9 +20,9 @@ using namespace winrt::Windows::UI::Composition;
 namespace {
 
 constexpr float kPi = 3.14159265f;
-constexpr int kFocusMs = 150;      // magnification in and out
-constexpr int kMagnetMs = 120;     // the pull toward the pointer easing in and out
-constexpr float kPullPx = 4.0f;    // its reach at the rest size of 28
+constexpr int kFocusMs = 90;      // magnification in and out
+constexpr int kMagnetMs = 70;     // the pull toward the pointer easing in and out
+constexpr float kPullPx = 2.0f;    // its reach at the rest size of 28
 constexpr int kPresenceMs = 250;   // an icon growing in or shrinking out
 constexpr int kFadeMs = 150;       // running dots
 constexpr int kPressInMs = 60;
@@ -373,7 +373,7 @@ void Dock::BuildExpressions() {
         const std::wstring slotCenter = L"p.Center" + clusterShift + L" - " + total(L"S") + L" / 2 + " + start(i, L"S") + L" + p.Pitch * " +
                                         me + L".S / 2";
         // The magnetic pull: a fraction of the way to the pointer, capped, eased in by Mag (stays 0 under reduce motion).
-        const std::wstring pull = L" + Clamp((p.PointerX - (" + slotCenter + L")) * 0.3, -" + std::to_wstring(kPullPx * m_m.restSize / 28) +
+        const std::wstring pull = L" + Clamp((p.PointerX - (" + slotCenter + L")) * 0.18, -" + std::to_wstring(kPullPx * m_m.restSize / 28) +
                                   L", " + std::to_wstring(kPullPx * m_m.restSize / 28) + L") * " + me + L".Mag";
         auto x = m_compositor.CreateExpressionAnimation(slotCenter + pull + L" - p.Rest / 2");
         bind(x);
@@ -547,7 +547,7 @@ Dock::Target Dock::HitTarget(float x, float y) const {
         const float wl = pillLeft + pillWidth - m_m.padding - m_rightWidth;
         for (int s = 0; s < DockWidgets::kSlots; s++) {
             spans.push_back({wl + m_widgets->SlotLeft(s), wl + m_widgets->SlotRight(s)});
-            targets.push_back({s == DockWidgets::kWifi ? Kind::Wifi : Kind::Volume, -1});
+            targets.push_back({s == DockWidgets::kWifi ? Kind::Wifi : s == DockWidgets::kBluetooth ? Kind::Bluetooth : Kind::Media, -1});
         }
     }
     // Reaches the pill's edge (the padding) and half a gap beyond; the gaps between targets are at most one gap.

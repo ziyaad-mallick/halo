@@ -7,6 +7,7 @@
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.Networking.Connectivity.h>
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -121,11 +122,11 @@ private:
     bool m_networkRegistered = false;
 };
 
-// HALO 2.0 quick-settings widgets on the right of the dock pill: Wi-Fi state and volume. Only draws; the owner
+// HALO 2.0 dock widgets: Wi-Fi, Bluetooth, compact Now Playing. Only draws; the owner
 // pushes the volume (it holds the audio endpoint) and forwards network changes.
 class DockWidgets {
 public:
-    enum Slot { kWifi = 0, kVolume = 1, kSlots = 2 };
+    enum Slot { kWifi = 0, kBluetooth = 1, kMedia = 2, kSlots = 3 };
 
     DockWidgets(winrt::Windows::UI::Composition::Compositor const& compositor,
                 winrt::Windows::UI::Composition::CompositionGraphicsDevice const& gdev,
@@ -133,12 +134,12 @@ public:
                 float scale);
 
     winrt::Windows::UI::Composition::SpriteVisual Visual() const { return m_visual; }
-    float Width() const { return m_slotW * static_cast<float>(kSlots); }
-    float SlotLeft(int slot) const { return m_slotW * slot; }
-    float SlotRight(int slot) const { return m_slotW * (slot + 1); }
+    float Width() const { return 2 * m_slotW + m_mediaW; }
+    float SlotLeft(int slot) const { return m_slotW * std::min(slot, 2); }
+    float SlotRight(int slot) const { return slot == kMedia ? Width() : m_slotW * (slot + 1); }
 
-    // level 0..1; `available` false when there is no audio endpoint.
-    void SetVolume(float level, bool muted, bool available);
+    void SetBluetooth(bool available, bool on);
+    void SetMedia(std::wstring const& title, bool has, bool playing);
     void OnNetworkChanged() { Render(); }
     void Render();
 
@@ -150,7 +151,9 @@ private:
     winrt::com_ptr<IDWriteTextFormat> m_tfIcons;
     float m_pillHeight = 50.0f;
     float m_scale = 1.0f;
+    winrt::com_ptr<IDWriteTextFormat> m_tfMedia;
+    float m_mediaW = 144.0f;
+    bool m_btAvailable = false, m_btOn = false, m_hasMedia = false, m_playing = false;
+    std::wstring m_title;
     float m_slotW = 28.0f;
-    float m_volume = 0.0f;
-    bool m_muted = false, m_audio = false;
 };

@@ -65,7 +65,7 @@ public:
     // What the point is on, as currently drawn. Hit-testing is magnetic: the point snaps to the nearest target
     // (an app icon, the Start logo or, with HALO 2.0, the whole left cluster, the Wi-Fi and volume widgets), so
     // the gaps between targets and the pill's edges are not dead, and a little above the pill still counts.
-    enum class Kind { None, App, Start, Wifi, Volume };
+    enum class Kind { None, App, Start, Wifi, Bluetooth, Media };
     struct Target {
         Kind kind = Kind::None;
         int index = -1;  // App: into the last SetItems
