@@ -34,6 +34,12 @@ constexpr float kSliderHitH = kSliderH + 2 * kS1;  // its pointer target: 4 px t
 constexpr float kMediaArt = 48;   // now-playing artwork
 constexpr float kMediaH = kMediaArt + 2 * kS3;  // the now-playing module
 
+// Notification Center: compact floating cards, a quiet heading, then a calendar widget.
+constexpr float kNotificationWidth = 360, kNotificationEdge = kS4;
+constexpr float kNotificationPad = kS4, kNotificationGap = kS3;
+constexpr float kNotificationRadius = kRadiusLarge;
+constexpr float kNotificationCalendarHead = kS4, kNotificationCalendarRow = 28;
+
 // Motion.
 constexpr int kFastMs = 90, kSlowMs = 280;  // fast was 120
 constexpr int kHoverMs = 80;                // a highlight gliding between controls, and fading in/out

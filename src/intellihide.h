@@ -50,6 +50,7 @@ public:
 
     // Sets the dock's current bounding rectangle on the screen (in screen coordinates).
     void SetDockRect(RECT const& rc) {
+        if (EqualRect(&m_dockRect, &rc)) return;
         m_dockRect = rc;
         Evaluate(true);
     }

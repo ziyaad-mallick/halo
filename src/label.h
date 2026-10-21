@@ -274,11 +274,13 @@ public:
             m_visual.Offset({targetX, targetY, 0.0f});
             AnimateOpacity(1.0f, 120);
             m_visible = true;
-        } else {
+        } else if (targetX != m_targetX || targetY != m_targetY) {
             // Already visible: slide the whole Offset to the new icon. Do not set
             // Offset directly here; that would stop the running animation.
             AnimateOffset({targetX, targetY, 0.0f}, 90);
         }
+        m_targetX = targetX;
+        m_targetY = targetY;
     }
 
     // Fades out and hides the label
@@ -431,6 +433,7 @@ private:
     winrt::com_ptr<IDWriteFactory> m_dwrite;
     winrt::com_ptr<IDWriteTextFormat> m_format;
 
+    float m_targetX = 0, m_targetY = 0;
     float m_scale = 1.0f;
     bool m_visible = false;
     std::wstring m_currentText;

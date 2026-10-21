@@ -318,6 +318,10 @@ void Previews::Finish() {
     Clear();
     ShowWindow(m_hwnd, SW_HIDE);
     m_root.Children().RemoveAll();
+    m_strip = nullptr;
+    m_plate = nullptr;
+    m_plateShape = nullptr;
+    m_closeBtn = nullptr;
     m_hover = -1;
     m_inside = false;
     m_tracking = false;

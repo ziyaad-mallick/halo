@@ -63,10 +63,10 @@ namespace halo {
 namespace {
 
 // Logical px; everything is scaled by the monitor DPI.
-constexpr float kWStd = 360;          // panel width when standalone (attached, it follows the Control Center)
-constexpr float kEdge = 10;           // gap to the screen edge (right and top)
-constexpr float kPad = 12, kIcon = 32, kTextX = kPad + kIcon + 10, kRadius = 16, kGap = 8, kPeek = 10;  // the Control Center's grid
-constexpr float kHeaderY = 12, kTitleY = 30, kBodyY = 48, kLine = 15, kMinH = 62, kCollapseH = 28;
+constexpr float kWStd = ui::kNotificationWidth;          // panel width when standalone (attached, it follows the Control Center)
+constexpr float kEdge = ui::kNotificationEdge;           // gap to the screen edge (right and top)
+constexpr float kPad = ui::kNotificationPad, kIcon = 32, kTextX = kPad + kIcon + ui::kS3, kRadius = ui::kNotificationRadius, kGap = ui::kNotificationGap, kPeek = 8;  // the Control Center's grid
+constexpr float kHeaderY = 16, kTitleY = 36, kBodyY = 56, kLine = 16, kMinH = 76, kCollapseH = 28;
 constexpr float kHeadH = 38, kMoreH = 28, kEmptyH = 56;
 constexpr float kCalHeadStd = 74, kCalNav = 26, kCalDow = 18, kCalRowStd = 26, kCalHStd = kCalHeadStd + kCalNav + 4 + kCalDow + 2 + 6 * kCalRowStd + 12;
 constexpr int kMaxCards = 6, kMaxCardsAttached = 3;
@@ -83,34 +83,42 @@ D2D1_COLOR_F Wash(float darkAlpha) { return theme::Dark() ? ColorF(1, 1, 1, dark
 // A soft drop shadow that follows a rounded-rect mask. Lives under the clipped glass, so it
 // must be a sibling of the clipped container, not a child.
 wuc::SpriteVisual MakeShadow(wuc::Compositor const& comp, wuc::CompositionGraphicsDevice const& gdev, float wPx, float hPx,
-                             float radPx, float blur, float dy, theme::Argb col) {
+                                  float radPx, float blur, float dy, theme::Argb col) {
     if (col.a == 0 || blur <= 0) return nullptr;
     try {
-        auto surface = gdev.CreateDrawingSurface({wPx, hPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        constexpr float q = 0.25f;
+        const float m = std::ceil(blur + dy), fw = wPx + 2 * m, fh = hPx + 2 * m;  // the panel plus room for the blur on every side
+        auto surface = gdev.CreateDrawingSurface({std::ceil(fw * q), std::ceil(fh * q)},
+                                                 winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                                                  winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
         auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
         winrt::com_ptr<ID2D1DeviceContext> dc;
         POINT off{};
         if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) return nullptr;
-        dc->Clear(ColorF(0, 0.0f));
+        dc->Clear(D2D1::ColorF(0, 0.0f));
         winrt::com_ptr<ID2D1SolidColorBrush> b;
-        dc->CreateSolidColorBrush(ColorF(1, 1, 1, 1), b.put());
-        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(off.x + 0.0f, off.y + 0.0f, off.x + wPx, off.y + hPx), radPx, radPx), b.get());
+        dc->CreateSolidColorBrush(D2D1::ColorF(col.r / 255.0f, col.g / 255.0f, col.b / 255.0f, 1), b.put());
+        constexpr int layers = 16;
+        const float a = col.a / 255.0f, each = 1 - std::pow(1 - a, 1.0f / layers);  // the layers add up to `a` in the middle
+        b->SetOpacity(each);
+        for (int i = 0; i < layers; i++) {
+            const float e = blur * 0.85f * (1 - static_cast<float>(i) / layers);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(off.x + (m - e) * q, off.y + (m + dy - e) * q,
+                                                                   off.x + (m + wPx + e) * q, off.y + (m + dy + hPx + e) * q),
+                                                       (radPx + e) * q, (radPx + e) * q), b.get());
+        }
         interop->EndDraw();
-        auto mask = comp.CreateSurfaceBrush(surface);
-        mask.Stretch(wuc::CompositionStretch::Fill);
-        auto sh = comp.CreateDropShadow();
-        sh.BlurRadius(blur);
-        sh.Color(theme::C(col));
-        sh.Offset({0, dy, 0});
-        sh.Mask(mask);
+        auto brush = comp.CreateSurfaceBrush(surface);
+        brush.Stretch(wuc::CompositionStretch::Fill);
+        brush.BitmapInterpolationMode(wuc::CompositionBitmapInterpolationMode::Linear);
         auto v = comp.CreateSpriteVisual();
-        v.Size({wPx, hPx});
-        v.Brush(mask);
-        v.Shadow(sh);
+        v.Size({fw, fh});
+        v.Offset({-m, -m, 0});
+        v.Brush(brush);
         return v;
     } catch (...) { return nullptr; }
 }
+
 
 
 
@@ -372,6 +380,17 @@ struct NotificationCenter::Impl {
 
 Snapshot NotificationCenter::Impl::Query(std::set<std::wstring>& iconDone) {
     Snapshot snap;
+#ifdef HALO_NOTIF_TEST
+    snap.ok = true;
+    FILETIME testTime; GetSystemTimeAsFileTime(&testTime);
+    const LONGLONG now = (static_cast<LONGLONG>(testTime.dwHighDateTime) << 32) | testTime.dwLowDateTime;
+    snap.items = {
+        {1, L"calendar", L"", L"Calendar", L"Design review", L"Your review starts in ten minutes.", now},
+        {2, L"messages", L"", L"Messages", L"Alex", L"The updated designs are ready to review.", now - 600000000LL},
+        {3, L"messages", L"", L"Messages", L"Alex", L"Sent the final version.", now - 1200000000LL},
+        {4, L"files", L"", L"Files", L"Download complete", L"Quarterly report.pdf is ready.", now - 1800000000LL}};
+    return snap;
+#endif
     try {
         auto l = wun::Management::UserNotificationListener::Current();
         if (l.GetAccessStatus() != wun::Management::UserNotificationListenerAccessStatus::Allowed) {
@@ -858,6 +877,7 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
     c.outer.Size({wPx, hPx + (group ? kPeek * s : 0)});
     c.outer.CenterPoint({wPx / 2, 0, 0});
 
+    const bool quiet = c.row.kind == K::Header || c.row.kind == K::Empty || c.row.kind == K::More || c.row.kind == K::Collapse;
     if (group) {  // the rest of the stack peeking out from under the card
         for (int i = 2; i >= 1; --i) {
             auto peek = comp.CreateSpriteVisual();
@@ -873,7 +893,7 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
         }
     }
 
-    {
+    if (!quiet) {
         const float rr = (c.row.kind == K::Collapse || c.row.kind == K::More || c.row.kind == K::Header) ? c.row.h / 2 * s : kRadius * s;
         auto col = theme::P().shadow;
         col.a = static_cast<uint8_t>(col.a * 0.7f);
@@ -883,25 +903,27 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
     c.vis.Size({wPx, hPx});
     c.outer.Children().InsertAtTop(c.vis);
 
-    auto glass = comp.CreateSpriteVisual();
-    glass.RelativeSizeAdjustment({1, 1});
-    // The host backdrop already comes blurred by DWM; another Gaussian pass on top cost dropped frames
-    // whenever the panel moved (measured with tools/framegaps.cpp) for a barely softer look.
-    glass.Brush(comp.CreateHostBackdropBrush());
-    c.vis.Children().InsertAtTop(glass);
+    if (!quiet) {
+        auto glass = comp.CreateSpriteVisual();
+        glass.RelativeSizeAdjustment({1, 1});
+        // The host backdrop already comes blurred by DWM; another Gaussian pass on top cost dropped frames
+        // whenever the panel moved (measured with tools/framegaps.cpp) for a barely softer look.
+        glass.Brush(comp.CreateHostBackdropBrush());
+        c.vis.Children().InsertAtTop(glass);
 
-    auto tint = comp.CreateSpriteVisual();
-    tint.RelativeSizeAdjustment({1, 1});
-    const auto& gcc = settings::Get().cc;  // the notification column follows the Control Center's glass
-    tint.Brush(comp.CreateColorBrush(theme::Dark() || gcc.hasTint ? theme::C(theme::Glass(gcc).tint) : winrt::Windows::UI::ColorHelper::FromArgb(0xF0, 0xFA, 0xFA, 0xFC)));
-    c.vis.Children().InsertAtTop(tint);
+        auto tint = comp.CreateSpriteVisual();
+        tint.RelativeSizeAdjustment({1, 1});
+        const auto& gcc = settings::Get().cc;  // the notification column follows the Control Center's glass
+        tint.Brush(comp.CreateColorBrush(theme::Dark() || gcc.hasTint ? theme::C(theme::Glass(gcc).tint) : winrt::Windows::UI::ColorHelper::FromArgb(0xF0, 0xFA, 0xFA, 0xFC)));
+        c.vis.Children().InsertAtTop(tint);
 
-    if (noise) {
-        auto n = comp.CreateSpriteVisual();
-        n.RelativeSizeAdjustment({1, 1});
-        n.Opacity(theme::P().noise);
-        n.Brush(noise);
-        c.vis.Children().InsertAtTop(n);
+        if (noise) {
+            auto n = comp.CreateSpriteVisual();
+            n.RelativeSizeAdjustment({1, 1});
+            n.Opacity(theme::P().noise);
+            n.Brush(noise);
+            c.vis.Children().InsertAtTop(n);
+        }
     }
 
     c.surf = gdev.CreateDrawingSurface({wPx, hPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -913,38 +935,31 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
     c.content.Brush(sb);
     c.vis.Children().InsertAtTop(c.content);
 
-    const float t = s;
-    const bool pill = c.row.kind == K::Collapse || c.row.kind == K::More || c.row.kind == K::Header;
-    const float rad = pill ? c.row.h / 2 * s : kRadius * s;
-    c.rim = comp.CreateRoundedRectangleGeometry();
-    c.rim.Offset({t / 2, t / 2});
-    c.rim.CornerRadius({rad - t / 2, rad - t / 2});
-    c.rim.Size({wPx - t, hPx - t});
-    auto gradient = comp.CreateLinearGradientBrush();
-    gradient.MappingMode(wuc::CompositionMappingMode::Relative);
-    gradient.StartPoint({0, 0});
-    gradient.EndPoint({0, 1});
-    auto stop = [&](float at, uint8_t a) {
-        gradient.ColorStops().Append(comp.CreateColorGradientStop(at, winrt::Windows::UI::ColorHelper::FromArgb(a, 0xFF, 0xFF, 0xFF)));
-    };
-    stop(0.0f, 0x70); stop(0.35f, 0x18); stop(0.7f, 0x0A); stop(1.0f, 0x26);
-    if (!theme::Dark()) { gradient.ColorStops().Clear(); for (auto [at, c] : {std::pair{0.0f, theme::P().rimTop}, {0.35f, theme::P().rimMid}, {0.7f, theme::P().rimLow}, {1.0f, theme::P().rimBottom}}) gradient.ColorStops().Append(comp.CreateColorGradientStop(at, theme::C(c))); }
-    auto sprite = comp.CreateSpriteShape(c.rim);
-    sprite.StrokeBrush(gradient);
-    sprite.StrokeThickness(t);
-    auto rimVisual = comp.CreateShapeVisual();
-    rimVisual.RelativeSizeAdjustment({1, 1});
-    rimVisual.Shapes().Append(sprite);
-    if (theme::P().edge.a) {  // hairline edge for light glass
-        auto edge = comp.CreateSpriteShape(c.rim);
-        edge.StrokeBrush(comp.CreateColorBrush(theme::C(theme::P().edge)));
-        edge.StrokeThickness(t);
-        rimVisual.Shapes().Append(edge);
+    if (!quiet) {
+        const float t = s;
+        const bool pill = c.row.kind == K::Collapse || c.row.kind == K::More || c.row.kind == K::Header;
+        const float rad = pill ? c.row.h / 2 * s : kRadius * s;
+        c.rim = comp.CreateRoundedRectangleGeometry();
+        c.rim.Offset({t / 2, t / 2});
+        c.rim.CornerRadius({rad - t / 2, rad - t / 2});
+        c.rim.Size({wPx - t, hPx - t});
+        auto sprite = comp.CreateSpriteShape(c.rim);
+        sprite.StrokeBrush(comp.CreateColorBrush(theme::C(theme::P().edge.a ? theme::P().edge : theme::P().rimLow)));
+        sprite.StrokeThickness(t);
+        auto rimVisual = comp.CreateShapeVisual();
+        rimVisual.RelativeSizeAdjustment({1, 1});
+        rimVisual.Shapes().Append(sprite);
+        if (theme::P().edge.a) {  // hairline edge for light glass
+            auto edge = comp.CreateSpriteShape(c.rim);
+            edge.StrokeBrush(comp.CreateColorBrush(theme::C(theme::P().edge)));
+            edge.StrokeThickness(t);
+            rimVisual.Shapes().Append(edge);
+        }
+        c.vis.Children().InsertAtTop(rimVisual);
     }
-    c.vis.Children().InsertAtTop(rimVisual);
 
     c.clip = comp.CreateRoundedRectangleGeometry();
-    c.clip.CornerRadius({rad, rad});
+    c.clip.CornerRadius({kRadius * s, kRadius * s});
     c.clip.Size({wPx, hPx});
     c.vis.Clip(comp.CreateGeometricClip(c.clip));
     Draw(c, false, -1);
@@ -1024,11 +1039,10 @@ void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColor
         }
     }
     if (!drawn) {
-        size_t hsh = std::hash<std::wstring>{}(r.n.appKey);
-        br->SetColor(ColorF(0.25f + (hsh & 0xFF) / 700.0f, 0.3f + ((hsh >> 8) & 0xFF) / 700.0f, 0.5f + ((hsh >> 16) & 0xFF) / 600.0f, 1));
+        br->SetColor(theme::P().fill);
         dc->FillRoundedRectangle(ir, br);
         std::wstring letter = r.n.app.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(towupper(r.n.app[0])));
-        br->SetColor(theme::P().onAccent);
+        br->SetColor(kText);
         dc->DrawText(letter.c_str(), 1, fPill.get(), ir.rect, br);
     }
 
@@ -1088,7 +1102,7 @@ void NotificationCenter::Impl::DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColor
 void NotificationCenter::Impl::DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, int part) {
     wchar_t buf[96];
     SYSTEMTIME t = today;
-    if (!attached) {  // big weekday + date (attached, the Control Center header shows them)
+    if (!attached && !settings::Get().halo2) {  // big weekday + date (attached, the Control Center header shows them)
         br->SetColor(accent);
         if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"dddd", buf, 96, nullptr)) {
             CharUpperW(buf);
@@ -1204,7 +1218,7 @@ void NotificationCenter::Impl::Update(bool firstShow) {
         y += h + extra + kGap;
         rows.push_back(std::move(r));
     };
-    const bool calendarFirst = settings::Get().halo2 && !attached;
+    const bool calendarFirst = false;  // macOS: notifications above widgets.
     if (calendarFirst) {
         Row r;
         r.key = L"cal";
@@ -1367,10 +1381,10 @@ void NotificationCenter::Impl::ApplyGeometry() {
     GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
     s = dx / 96.0f;
     if (!attached) {
-        kW = settings::Get().halo2 ? 408.0f : kWStd;
-        kCalHead = kCalHeadStd;
-        kCalRow = kCalRowStd;
-        kCalH = kCalHStd;
+        kW = kWStd;
+        kCalHead = settings::Get().halo2 ? ui::kNotificationCalendarHead : kCalHeadStd;
+        kCalRow = settings::Get().halo2 ? ui::kNotificationCalendarRow : kCalRowStd;
+        kCalH = kCalHead + kCalNav + 4 + kCalDow + 2 + 6 * kCalRow + 12;
         availH = (work.bottom - work.top) / s - 2 * kEdge;
         return;
     }

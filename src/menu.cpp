@@ -271,6 +271,8 @@ void Menu::Close(bool instant) {
 void Menu::Finish() {
     ShowWindow(m_hwnd, SW_HIDE);
     m_root.Children().RemoveAll();
+    m_menu = nullptr;
+    m_hoverPlate = nullptr;
     m_rows.clear();
     m_hover = -1;
 }

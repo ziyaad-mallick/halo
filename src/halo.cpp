@@ -768,8 +768,9 @@ void Halo::BuildDock() {
         m_dockMedia.Start(m_hwnd, kMsgDockMedia, [this] {
             if (!m_widgets) return;
             auto const& state = m_dockMedia.State();
+            const bool wasShown = m_widgets->CapsuleShown();
             m_widgets->SetMedia(state);
-            if (m_dock) UpdateRegion();  // the capsule opened or closed
+            if (m_dock && wasShown != m_widgets->CapsuleShown()) UpdateRegion();  // the capsule opened or closed
         });
     }
     m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics, m_cluster.get(), m_widgets.get());
@@ -1131,14 +1132,16 @@ void Halo::ShowPreviewsFor(int item) {
 
 void Halo::PointerMove(float x, float y) {
     if (m_autoHide) Reveal();
+    Dock::Target target;
     if (m_dock) {
         m_dock->OnPointerMove(x);
-        m_dock->SetMagnet(m_dock->HitTest(x, y));
-        if (m_widgets) m_widgets->SetHover(MediaPart(m_dock->HitTarget(x, y).kind));
+        target = m_dock->HitTarget(x, y);
+        m_dock->SetMagnet(target.kind == Dock::Kind::App ? target.index : -1);
+        if (m_widgets) m_widgets->SetHover(MediaPart(target.kind));
     }
     if (m_menu && m_menu->IsOpen()) return;  // no name label or preview strip over an open menu
     if (m_dock && m_previews) {
-        int hit = m_dock->HitTest(x, y);
+        int hit = target.kind == Dock::Kind::App ? target.index : -1;
         bool running = hit >= 0 && hit < static_cast<int>(m_items.size()) && !m_items[hit].key.empty();
         if (hit != m_hoverItem) {
             m_hoverItem = hit;
@@ -1150,7 +1153,7 @@ void Halo::PointerMove(float x, float y) {
         if (running) KillTimer(m_hwnd, kPreviewGrace);
     }
     if (m_dock && m_label) {
-        int hit = m_dock->HitTest(x, y);
+        int hit = target.kind == Dock::Kind::App ? target.index : -1;
         if (m_previews && m_previews->IsVisible()) {
             m_label->Hide();  // the strip names the windows
         } else if (hit >= 0 && hit < static_cast<int>(m_appNames.size()) && !m_appNames[hit].empty()) {
@@ -1604,17 +1607,19 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_CAPTURECHANGED:
             if (std::exchange(m_pressedStart, false) && m == WM_LBUTTONUP && m_dock && m_dock->HitStart(mx, my))
                 OpenLauncher();
-            const Dock::Kind releasedWidget = std::exchange(m_pressedWidget, Dock::Kind::None);
-            if (m_widgets && MediaPart(releasedWidget) != DockWidgets::Part::None) {
-                m_widgets->SetPressed(DockWidgets::Part::None);
-                if (m_pressed < 0 && m == WM_LBUTTONUP) ReleaseCapture();
-            }
-            if (const Dock::Kind widget = releasedWidget;
-                widget != Dock::Kind::None && m == WM_LBUTTONUP && m_dock && m_dock->HitTarget(mx, my).kind == widget) {
-                if (widget == Dock::Kind::MediaPlay && m_dockMedia.State().has) {
-                    m_dockMedia.PlayPause();
-                } else if (widget == Dock::Kind::MediaNext && m_dockMedia.State().canNext) {
-                    m_dockMedia.Next();
+            {
+                const Dock::Kind releasedWidget = std::exchange(m_pressedWidget, Dock::Kind::None);
+                if (m_widgets && MediaPart(releasedWidget) != DockWidgets::Part::None) {
+                    m_widgets->SetPressed(DockWidgets::Part::None);
+                    if (m_pressed < 0 && m == WM_LBUTTONUP) ReleaseCapture();
+                }
+                if (const Dock::Kind widget = releasedWidget;
+                    widget != Dock::Kind::None && m == WM_LBUTTONUP && m_dock && m_dock->HitTarget(mx, my).kind == widget) {
+                    if (widget == Dock::Kind::MediaPlay && m_dockMedia.State().has) {
+                        m_dockMedia.PlayPause();
+                    } else if (widget == Dock::Kind::MediaNext && m_dockMedia.State().canNext) {
+                        m_dockMedia.Next();
+                    }
                 }
             }
             if (m_pressed >= 0 && m_dock) {

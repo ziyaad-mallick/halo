@@ -176,13 +176,14 @@ struct Group {
 std::mutex g_statsMu;
 std::string g_statsJson = "{\"running\":false}";
 
-std::vector<DWORD> PidsByName(const wchar_t* exe) {
-    std::vector<DWORD> v;
+std::map<std::wstring, std::vector<DWORD>> ProcessGroups() {
+    std::map<std::wstring, std::vector<DWORD>> v;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return v;
     PROCESSENTRY32W pe{sizeof pe};
     for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
-        if (_wcsicmp(pe.szExeFile, exe) == 0) v.push_back(pe.th32ProcessID);
+        for (auto name : {HALO_EXE, L"guardian.exe", L"dwm.exe"})
+            if (_wcsicmp(pe.szExeFile, name) == 0) v[name].push_back(pe.th32ProcessID);
     CloseHandle(snap);
     return v;
 }
@@ -229,10 +230,11 @@ void StatsThread() {
             }
         }
 
+        const auto processes = ProcessGroups();
         std::map<DWORD, ULONGLONG> nowCpu;
         auto measure = [&](const wchar_t* exe) {
             Group g;
-            g.pids = PidsByName(exe);
+            if (auto it = processes.find(exe); it != processes.end()) g.pids = it->second;
             g.running = !g.pids.empty();
             double cpuSec = 0;
             for (DWORD pid : g.pids) {
