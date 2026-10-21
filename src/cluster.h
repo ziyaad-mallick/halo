@@ -7,6 +7,7 @@
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.Networking.Connectivity.h>
+#include "services.h"
 #include <algorithm>
 #include <cmath>
 #include <string>
@@ -122,38 +123,55 @@ private:
     bool m_networkRegistered = false;
 };
 
-// HALO 2.0 dock widgets: Wi-Fi, Bluetooth, compact Now Playing. Only draws; the owner
-// pushes the volume (it holds the audio endpoint) and forwards network changes.
+// HALO 2.0 Now Playing pill: a separate floating pill beside the dock (same height, glass, radius and hairline as
+// the dock's), [artwork][title over artist][play/pause][next]. Drawn only when the track or its state changes;
+// the buttons' hover and pressed highlights are small visuals whose opacity the compositor animates, and the pill
+// fades and scales in and out with the "Show" property of Properties() (0 = nothing playing: transparent, no cost).
 class DockWidgets {
 public:
-    enum Slot { kWifi = 0, kBluetooth = 1, kMedia = 2, kSlots = 3 };
+    enum class Part { None, Body, Play, Next };
 
     DockWidgets(winrt::Windows::UI::Composition::Compositor const& compositor,
                 winrt::Windows::UI::Composition::CompositionGraphicsDevice const& gdev,
                 float pillHeight,
                 float scale);
 
-    winrt::Windows::UI::Composition::SpriteVisual Visual() const { return m_visual; }
-    float Width() const { return 2 * m_slotW + m_mediaW; }
-    float SlotLeft(int slot) const { return m_slotW * std::min(slot, 2); }
-    float SlotRight(int slot) const { return slot == kMedia ? Width() : m_slotW * (slot + 1); }
-
-    void SetBluetooth(bool available, bool on);
-    void SetMedia(std::wstring const& title, bool has, bool playing);
-    void OnNetworkChanged() { Render(); }
-    void Render();
+    winrt::Windows::UI::Composition::ContainerVisual Capsule() const { return m_capsule; }
+    winrt::Windows::UI::Composition::CompositionPropertySet Properties() const { return m_props; }
+    float CapsuleHeight() const { return m_capH; }
+    float CapsuleWidth() const { return m_capW; }
+    float CapsuleGap() const { return m_capGap; }
+    bool CapsuleShown() const { return m_hasMedia; }
+    // Horizontal extent of a part, in the pill's coordinates.
+    float PartLeft(Part p) const;
+    float PartRight(Part p) const;
+    bool CanNext() const { return m_canNext; }
+    // The glass (built by the owner, so it is the dock's) goes underneath everything else.
+    void AttachCapsuleGlass(winrt::Windows::UI::Composition::ContainerVisual const& glass);
+    void SetHover(Part p);
+    void SetPressed(Part p);
+    void SetMedia(halo::svc::MediaState const& state);
 
 private:
+    void Render();
+    void AnimateShow(float to);
+    void MoveHighlight(winrt::Windows::UI::Composition::ShapeVisual const& v, Part p, bool glide);
+
+    winrt::Windows::UI::Composition::Compositor m_comp{nullptr};
     winrt::Windows::UI::Composition::CompositionGraphicsDevice m_gdev{nullptr};
     winrt::Windows::UI::Composition::CompositionDrawingSurface m_surface{nullptr};
-    winrt::Windows::UI::Composition::SpriteVisual m_visual{nullptr};
+    winrt::Windows::UI::Composition::SpriteVisual m_content{nullptr};
+    winrt::Windows::UI::Composition::ContainerVisual m_capsule{nullptr};
+    winrt::Windows::UI::Composition::ShapeVisual m_hoverHl{nullptr}, m_pressHl{nullptr};
+    winrt::Windows::UI::Composition::CompositionPropertySet m_props{nullptr};
     winrt::com_ptr<IDWriteFactory> m_dwriteFactory;
-    winrt::com_ptr<IDWriteTextFormat> m_tfIcons;
-    float m_pillHeight = 50.0f;
+    winrt::com_ptr<IDWriteTextFormat> m_tfGlyph, m_tfTitle, m_tfArtist;
     float m_scale = 1.0f;
-    winrt::com_ptr<IDWriteTextFormat> m_tfMedia;
-    float m_mediaW = 144.0f;
-    bool m_btAvailable = false, m_btOn = false, m_hasMedia = false, m_playing = false;
-    std::wstring m_title;
-    float m_slotW = 28.0f;
+    bool m_hasMedia = false, m_playing = false, m_canNext = false;
+    std::wstring m_title, m_artist;
+    float m_capH = 50.0f, m_capW = 0.0f, m_capGap = 12.0f, m_inset = 8.0f, m_art = 34.0f, m_textW = 0.0f;
+    Part m_hover = Part::None, m_press = Part::None;
+    int m_thumbPx = 0;
+    std::vector<uint32_t> m_thumb;  // the artwork box-filtered to the thumb size (a few KB, not the source image)
+    size_t m_artSig = 0;
 };

@@ -75,6 +75,11 @@ using winrt::Windows::Foundation::Numerics::float2;
 
 namespace {
 
+// The Now Playing capsule's part a dock hit lands on (only its buttons have hover and pressed states).
+DockWidgets::Part MediaPart(Dock::Kind k) {
+    return k == Dock::Kind::MediaPlay ? DockWidgets::Part::Play : k == Dock::Kind::MediaNext ? DockWidgets::Part::Next : DockWidgets::Part::None;
+}
+
 // Motion defaults; [taskbar] speed / motion / effect / hide_delay in settings.ini scale or replace them.
 constexpr float kSpringDamping = 0.72f;   // < 1 overshoots slightly
 constexpr int kSpringPeriodMs = 55;       // lower = snappier
@@ -209,11 +214,11 @@ private:
     LRESULT OnMessage(UINT, WPARAM, LPARAM);
     void InitComposition();
     void InitGraphics();
-    wuc::ContainerVisual BuildPill(int noiseHeight = 0, float radius = 0.0f, halo::settings::Surface const* glass = nullptr);
+    wuc::ContainerVisual BuildPill(int noiseHeight = 0, float radius = 0.0f, halo::settings::Surface const* glass = nullptr, int noiseWidth = 0);
     void ComputeMetrics();
     void ApplySettings(bool themeFlipped = false);
     void RebuildDock(bool keepIcons = false);
-    wuc::SpriteVisual BuildPillShadow(wuc::ContainerVisual const& pill);
+    wuc::SpriteVisual BuildPillShadow(wuc::ContainerVisual const& pill, float radius = 0.0f);
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
     void RefreshDock();
@@ -558,7 +563,7 @@ wuc::CompositionBrush Halo::MakeNoiseBrush(int w, int h) {
 // grain and a 1px rim whose vertical gradient is bright on top and faintly
 // bright again at the bottom. Layers size relative to the container, which
 // the dock resizes and clips.
-wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius, halo::settings::Surface const* glassCfg) {
+wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius, halo::settings::Surface const* glassCfg, int noiseWidth) {
     auto pill = m_comp.CreateContainerVisual();
 
     auto glass = m_comp.CreateSpriteVisual();
@@ -575,7 +580,7 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius, halo::settin
         auto noise = m_comp.CreateSpriteVisual();
         noise.RelativeSizeAdjustment({1, 1});
         noise.Opacity(halo::theme::P().noise);
-        noise.Brush(MakeNoiseBrush(m_monitor.right - m_monitor.left, noiseHeight ? noiseHeight : static_cast<int>(std::ceil(m_metrics.pillHeight))));
+        noise.Brush(MakeNoiseBrush(noiseWidth ? noiseWidth : m_monitor.right - m_monitor.left, noiseHeight ? noiseHeight : static_cast<int>(std::ceil(m_metrics.pillHeight))));
         pill.Children().InsertAtTop(noise);
     });
 
@@ -703,10 +708,10 @@ void Halo::RebuildDock(bool keepIcons) {
 
 // A soft drop shadow for the dock pill: a brushless sprite that follows the pill's size and
 // offset, its shadow shaped by a nine-grid rounded-rect mask. A sibling of the (clipped) pill.
-wuc::SpriteVisual Halo::BuildPillShadow(wuc::ContainerVisual const& pill) {
+wuc::SpriteVisual Halo::BuildPillShadow(wuc::ContainerVisual const& pill, float radius) {
     auto const& pal = halo::theme::P();
     if (!pal.shadow.a) return nullptr;
-    const int ri = std::max(2, static_cast<int>(std::ceil(m_metrics.cornerRadius)));
+    const int ri = std::max(2, static_cast<int>(std::ceil(radius > 0 ? radius : m_metrics.cornerRadius)));
     const int side = 2 * ri + 2;
     auto surface = MakeSurface({static_cast<float>(side), static_cast<float>(side)});
     auto interop = surface.as<ICompositionDrawingSurfaceInterop>();
@@ -756,11 +761,15 @@ void Halo::BuildDock() {
     m_cluster = std::make_unique<DockCluster>(m_comp, m_gdev, m_hwnd, m_metrics.pillHeight, m_scale.v);
     if (halo::settings::Get().halo2) {
         m_widgets = std::make_unique<DockWidgets>(m_comp, m_gdev, m_metrics.pillHeight, m_scale.v);
-        m_dockRadios.Start(m_hwnd, kMsgDockRadios);
+        if (m_widgets->Capsule()) {  // the Now Playing capsule has its own glass, the same recipe as the dock's
+            m_widgets->AttachCapsuleGlass(BuildPill(static_cast<int>(std::ceil(m_widgets->CapsuleHeight())), 0.0f, nullptr,
+                                                    static_cast<int>(std::ceil(m_widgets->CapsuleWidth()))));
+        }
         m_dockMedia.Start(m_hwnd, kMsgDockMedia, [this] {
             if (!m_widgets) return;
             auto const& state = m_dockMedia.State();
-            m_widgets->SetMedia(state.title, state.has, state.playing);
+            m_widgets->SetMedia(state);
+            if (m_dock) UpdateRegion();  // the capsule opened or closed
         });
     }
     m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics, m_cluster.get(), m_widgets.get());
@@ -768,6 +777,17 @@ void Halo::BuildDock() {
         auto shadow = BuildPillShadow(pill);
         if (shadow && pill.Parent()) pill.Parent().Children().InsertBelow(shadow, pill);
     });
+    if (m_widgets && m_widgets->Capsule() && m_widgets->Capsule().Parent()) {
+        Step(L"capsule shadow", [&] {
+            auto cap = m_widgets->Capsule();
+            auto shadow = BuildPillShadow(cap);
+            if (!shadow) return;
+            auto fade = m_comp.CreateExpressionAnimation(L"cap.Opacity");  // gone with the capsule
+            fade.SetReferenceParameter(L"cap", cap);
+            shadow.StartAnimation(L"Opacity", fade);
+            cap.Parent().Children().InsertBelow(shadow, cap);
+        });
+    }
     if (!m_tracker) {
         m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
         m_swoop = std::make_unique<halo::Swoop>([this](HWND w, RECT const& from, RECT& icon) { return SwoopTarget(w, from, icon); },
@@ -968,7 +988,7 @@ void Halo::UpdateRegion() {
     bool hidden = m_state == State::Hidden;
     float half = (hidden ? m_dock->RestWidth() : m_dock->MaxWidth()) / 2;
     int left = std::max(0, static_cast<int>(m_metrics.centerX - half));
-    int right = std::min(m_width, static_cast<int>(std::ceil(m_metrics.centerX + half)));
+    int right = std::min(m_width, static_cast<int>(std::ceil(m_metrics.centerX + half + m_dock->CapsuleExtent())));
     SetWindowRgn(m_hwnd, CreateRectRgn(left, hidden ? m_height - kStripPx : 0, right, m_height), TRUE);
     if (m_intellihide) m_intellihide->SetDockRect(GetPillRectScreen());
     Log(L"input region x " + std::to_wstring(left) + L".." + std::to_wstring(right) + (hidden ? L" (strip)" : L""));
@@ -1114,6 +1134,7 @@ void Halo::PointerMove(float x, float y) {
     if (m_dock) {
         m_dock->OnPointerMove(x);
         m_dock->SetMagnet(m_dock->HitTest(x, y));
+        if (m_widgets) m_widgets->SetHover(MediaPart(m_dock->HitTarget(x, y).kind));
     }
     if (m_menu && m_menu->IsOpen()) return;  // no name label or preview strip over an open menu
     if (m_dock && m_previews) {
@@ -1144,6 +1165,7 @@ void Halo::PointerMove(float x, float y) {
 void Halo::PointerLeave() {
     if (m_label) m_label->Hide();
     if (m_dock) m_dock->OnPointerLeave();
+    if (m_widgets) m_widgets->SetHover(DockWidgets::Part::None);
     m_hoverItem = -1;
     KillTimer(m_hwnd, kPreviewTimer);
     if (m_previews && m_previews->IsVisible()) {  // time to move onto the strip; the dock stays up meanwhile
@@ -1481,9 +1503,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case kMsgDockMedia: m_dockMedia.Pull(); return 0;
-        case kMsgDockRadios:
-            if (m_widgets) m_widgets->SetBluetooth(m_dockRadios.HasBluetooth(), m_dockRadios.BluetoothOn());
-            return 0;
+        case kMsgDockRadios: return 0;
         case kMsgIntellihideChanged:
             if (w || l) {
                 if (!m_trackingMouse) StartHide();
@@ -1573,24 +1593,27 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (m_dock && m_state == State::Shown) {
                 const Dock::Target target = m_dock->HitTarget(mx, my);
                 m_pressedStart = target.kind == Dock::Kind::Start;
-                m_pressedWidget = target.kind == Dock::Kind::Wifi || target.kind == Dock::Kind::Bluetooth || target.kind == Dock::Kind::Media ? target.kind : Dock::Kind::None;
+                m_pressedWidget = target.kind == Dock::Kind::MediaPlay || target.kind == Dock::Kind::MediaNext ? target.kind : Dock::Kind::None;
+                if (m_widgets) m_widgets->SetPressed(MediaPart(m_pressedWidget));
                 m_pressed = m_dock->HitTest(mx, my);
                 m_dock->SetPressed(m_pressed);
-                if (m_pressed >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
+                if ((m_pressed >= 0 || MediaPart(m_pressedWidget) != DockWidgets::Part::None) && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
             }
             return 0;
         case WM_LBUTTONUP:
         case WM_CAPTURECHANGED:
             if (std::exchange(m_pressedStart, false) && m == WM_LBUTTONUP && m_dock && m_dock->HitStart(mx, my))
                 OpenLauncher();
+            if (m_widgets && MediaPart(m_pressedWidget) != DockWidgets::Part::None) {
+                m_widgets->SetPressed(DockWidgets::Part::None);
+                if (m_pressed < 0 && m == WM_LBUTTONUP) ReleaseCapture();
+            }
             if (const Dock::Kind widget = std::exchange(m_pressedWidget, Dock::Kind::None);
                 widget != Dock::Kind::None && m == WM_LBUTTONUP && m_dock && m_dock->HitTarget(mx, my).kind == widget) {
-                if (widget == Dock::Kind::Wifi) {
-                    OpenLauncher();  // Start hosts the Wi-Fi list
-                } else if (widget == Dock::Kind::Bluetooth) {
-                    OpenLauncher();
-                } else if (widget == Dock::Kind::Media && m_dockMedia.State().has) {
+                if (widget == Dock::Kind::MediaPlay && m_dockMedia.State().has) {
                     m_dockMedia.PlayPause();
+                } else if (widget == Dock::Kind::MediaNext && m_dockMedia.State().canNext) {
+                    m_dockMedia.Next();
                 }
             }
             if (m_pressed >= 0 && m_dock) {

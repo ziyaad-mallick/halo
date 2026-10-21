@@ -65,7 +65,8 @@ public:
     // What the point is on, as currently drawn. Hit-testing is magnetic: the point snaps to the nearest target
     // (an app icon, the Start logo or, with HALO 2.0, the whole left cluster, the Wi-Fi and volume widgets), so
     // the gaps between targets and the pill's edges are not dead, and a little above the pill still counts.
-    enum class Kind { None, App, Start, Wifi, Bluetooth, Media };
+    // Media is the Now Playing capsule's artwork and title; MediaPlay and MediaNext are its buttons.
+    enum class Kind { None, App, Start, Media, MediaPlay, MediaNext };
     struct Target {
         Kind kind = Kind::None;
         int index = -1;  // App: into the last SetItems
@@ -108,6 +109,9 @@ public:
 
     // Width of the pill at rest and at full magnification (with every icon
     // still on its way out counted), for sizing the window's input region.
+    // How far the Now Playing capsule reaches right of the pill (its gap and width once open; 0 while hidden), for the
+    // window's input region.
+    float CapsuleExtent() const;
     float RestWidth() const;
     float MaxWidth() const;
 
@@ -152,10 +156,7 @@ private:
 
     DockCluster* m_cluster = nullptr;
     DockWidgets* m_widgets = nullptr;
-    winrt::Windows::UI::Composition::SpriteVisual m_rightDivider{nullptr};
     bool m_h2 = false;           // HALO 2.0 at construction (the dock is rebuilt when it flips)
-    float m_rightWidth = 0.0f;   // the widgets' width
-    float m_rightOffset = 0.0f;  // widgets + the divider before them
     float m_shift = 0.0f;        // (cluster - widgets) / 2: where the app icons' centre sits relative to the dock's
     unsigned m_magnetId = 0;     // the entry id pulled toward the pointer
     winrt::Windows::UI::Composition::SpriteVisual m_clusterDivider{nullptr};
