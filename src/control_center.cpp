@@ -207,6 +207,7 @@ struct ControlCenter::Impl {
     svc::Media media;
     std::vector<svc::Device> outs;
     bool outsOpen = false;
+    size_t outOffset = 0, outVisible = 0;
     Expand expand = Expand::None;
     size_t listCap = SIZE_MAX;  // the most list rows Layout() may show (it lowers this when the panel would not fit)
     float volume = 0;
@@ -276,6 +277,7 @@ struct ControlCenter::Impl {
     float TopPx() const { return std::lround(motion::kPad * s) + MaxPx() - shownPx; }  // the pill's y in the window
     void Resize(float hPx, bool animate);
     float MaxH() const { return std::min(kMaxH, std::max(200.0f, (mon.bottom - mon.top) / s - 2 * kMargin)); }
+    bool Dense() const { return (mon.bottom - mon.top) / s < 636.0f; }
     SIZE WindowPx() const;
 
     LRESULT PanelProc(HWND h, UINT m, WPARAM w, LPARAM l);
@@ -344,6 +346,12 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     const float x = static_cast<short>(LOWORD(l)) / s - motion::kPad, y = (static_cast<short>(HIWORD(l)) - TopPx()) / s;
     switch (m) {
         case WM_ERASEBKGND: return 1;
+        case WM_DPICHANGED:
+            // The composition tree and text formats use the DPI from Open(). Rebuild them on the next open;
+            // keep a live frame from stretching stale surfaces across the new monitor scale.
+            stale = true;
+            if (st == St::Open) Close();
+            return 0;
         case WM_ACTIVATE:
             if (LOWORD(w) == WA_INACTIVE && st == St::Open) {  // clicked outside, unless it was the notification column
                 HWND other = reinterpret_cast<HWND>(l);
@@ -354,7 +362,22 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_KEYDOWN:
             if (w == VK_ESCAPE) Close();
+            else if (outsOpen && (w == VK_UP || w == VK_DOWN)) {
+                if (w == VK_UP && outOffset) --outOffset;
+                if (w == VK_DOWN && outOffset + outVisible < outs.size()) ++outOffset;
+                Render();
+            }
             return 0;
+        case WM_MOUSEWHEEL:
+            if (st == St::Open && outsOpen && outVisible < outs.size()) {
+                const int delta = GET_WHEEL_DELTA_WPARAM(w);
+                const size_t steps = static_cast<size_t>(std::max(1, std::abs(delta) / WHEEL_DELTA));
+                if (delta > 0) outOffset -= std::min(outOffset, steps);
+                else outOffset = std::min(outs.size() - outVisible, outOffset + steps);
+                Render();
+                return 0;
+            }
+            break;
         case WM_LBUTTONDOWN:
             if (st != St::Open) return 0;
             Settle();  // a click shows its result at once
@@ -470,10 +493,11 @@ void ControlCenter::Impl::Open(bool pointer) {
     QueryPerformanceCounter(&q0);
     QueryPerformanceFrequency(&qf);
 
-    HMONITOR hm = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);  // one column on the primary monitor
+    HMONITOR hm = owner ? MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST)
+                        : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(hm, &mi);
-    mon = mi.rcMonitor;
+    mon = mi.rcWork;
     UINT dx = 96, dy = 96;
     GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
     s = dx / 96.0f;
@@ -500,7 +524,7 @@ void ControlCenter::Impl::Open(bool pointer) {
         Layout();
         const int pad = static_cast<int>(std::lround(motion::kPad * s)), mg = static_cast<int>(std::lround(kMargin * s));
         int wPx = static_cast<int>(std::ceil(kW * s)), hPx = static_cast<int>(std::ceil(height * s));
-        rect = {mon.right - wPx - mg, mon.bottom - mg - hPx, 0, 0};  // the bottom right, where Quick Settings opens
+        rect = {mon.right - wPx - mg, mon.bottom - mg - hPx, 0, 0};  // beside the dock, within its work area
         rect.right = rect.left + wPx;
         rect.bottom = rect.top + hPx;
         SIZE wp = WindowPx();
@@ -1028,12 +1052,16 @@ void ControlCenter::Impl::Click(Item const& it) {
             mic.SetMute(micMuted);
             Pulse(it);
             break;
-        case Id::OutRow: outsOpen = !outsOpen; break;
+        case Id::OutRow:
+            outsOpen = !outsOpen;
+            if (!outsOpen) outOffset = 0;
+            break;
         case Id::OutDev: {
             auto id = outs[it.arg].id;
             svc::SetDefaultOutput(id);
             for (auto& d : outs) d.isDefault = d.id == id;
             outsOpen = false;
+            outOffset = 0;
             if (!svc::DryRun()) { speaker.Bind(eRender, hot, kMsgAudio); SyncSpeaker(); }
             break;
         }
@@ -1076,36 +1104,46 @@ float ControlCenter::Impl::TextWidth(std::wstring const& t, IDWriteTextFormat* f
 void ControlCenter::Impl::Layout() {
     using namespace ui;
     items.clear();
+    const bool dense = Dense() ||
+        636.0f + (outsOpen ? outs.size() * kListRowH + kS1 : 0) + (powerOpen ? kPowH + kGap : 0) > MaxH();
+    const float insetY = dense ? 8.0f : kInset;
+    const float gap = dense ? 2.0f : kGap;
+    const float headerH = dense ? 44.0f : kHeaderH;
+    const float pillH = dense ? 46.0f : kPillH;
+    const bool compactOutputs = dense && outsOpen;
+    const float mediaH = compactOutputs ? 0.0f : dense ? 56.0f : kMediaH;
+    const float actionD = dense ? 36.0f : kRoundAction;
+    const float powerH = dense ? 44.0f : kPowH;
     const float x0 = kInset, x1 = kW - kInset;
-    float y = kInset;
+    float y = insetY;
     auto add = [&](Id id, D2D1_RECT_F r, int arg = 0, float rad = kRadiusSmall) { items.push_back({id, r, arg, rad}); };
 
     // Header, on the glass itself: the time and date (opens the calendar), the battery chip (cycles the power mode).
-    add(Id::Clock, {x0, y, x0 + 220, y + kHeaderH}, 0, kRadiusSmall);
-    add(Id::Battery, {x1 - 136, y + kS2, x1, y + kHeaderH - kS2}, 0, kRadiusSmall);
-    y += kHeaderH + kGap;
+    add(Id::Clock, {x0, y, x0 + 220, y + headerH}, 0, kRadiusSmall);
+    add(Id::Battery, {x1 - 136, y + kS2, x1, y + headerH - kS2}, 0, kRadiusSmall);
+    y += headerH + gap;
 
     // The toggle grid: three rows of 64 px on two columns.
     //   Wi-Fi pill            | Bluetooth pill          (round toggle; the text side opens the list)
     //   Airplane | Hotspot    | Do not disturb pill     (icon-only tiles)
     //   Night light pill      | Dark mode pill
-    const float col = (x1 - x0 - kGap) / 2, half = (col - kGap) / 2, rx = x0 + col + kGap;
+    const float col = (x1 - x0 - gap) / 2, half = (col - gap) / 2, rx = x0 + col + gap;
     auto pill = [&](float l, float top, Id back, Id dot, Id text) {
-        const float r = l + col, icx = l + kS3 + kRound / 2, icy = top + kPillH / 2;
-        add(back, {l, top, r, top + kPillH}, 0, kRadiusLarge);
-        add(text, {icx + kRound / 2 + kS3, top + kS2, r - kS1, top + kPillH - kS2}, 0, kRadiusSmall);
+        const float r = l + col, icx = l + kS3 + kRound / 2, icy = top + pillH / 2;
+        add(back, {l, top, r, top + pillH}, 0, kRadiusLarge);
+        add(text, {icx + kRound / 2 + kS3, top + kS2, r - kS1, top + pillH - kS2}, 0, kRadiusSmall);
         add(dot, {icx - kRound / 2, icy - kRound / 2, icx + kRound / 2, icy + kRound / 2}, 0, kRound / 2);
     };
     pill(x0, y, Id::WifiPill, Id::Wifi, Id::WifiText);
     pill(rx, y, Id::BtPill, Id::Bluetooth, Id::BtText);
-    y += kPillH + kGap;
-    add(Id::Airplane, {x0, y, x0 + half, y + kPillH}, 0, kRadiusLarge);
-    add(Id::Hotspot, {x0 + half + kGap, y, x0 + col, y + kPillH}, 0, kRadiusLarge);
-    add(Id::Dnd, {rx, y, x1, y + kPillH}, 0, kRadiusLarge);
-    y += kPillH + kGap;
-    add(Id::Night, {x0, y, x0 + col, y + kPillH}, 0, kRadiusLarge);
-    add(Id::Dark, {rx, y, x1, y + kPillH}, 0, kRadiusLarge);
-    y += kPillH + kGap;
+    y += pillH + gap;
+    add(Id::Airplane, {x0, y, x0 + half, y + pillH}, 0, kRadiusLarge);
+    add(Id::Hotspot, {x0 + half + gap, y, x0 + col, y + pillH}, 0, kRadiusLarge);
+    add(Id::Dnd, {rx, y, x1, y + pillH}, 0, kRadiusLarge);
+    y += pillH + gap;
+    add(Id::Night, {x0, y, x0 + col, y + pillH}, 0, kRadiusLarge);
+    add(Id::Dark, {rx, y, x1, y + pillH}, 0, kRadiusLarge);
+    y += pillH + gap;
 
     // The Wi-Fi / Bluetooth list, when one is open.
     size_t listed = 0;
@@ -1113,22 +1151,29 @@ void ControlCenter::Impl::Layout() {
         bool wifi = expand == Expand::Wifi;
         size_t n = std::min(wifi ? svc::WifiNets().size() : svc::BtDevices().size(), listCap);
         listed = n;
-        float h = kS4 + kTitleLine + kS1 + std::max<size_t>(1, n) * kListRowH + kS2;
+        float h = insetY + kTitleLine + kS1 + std::max<size_t>(1, n) * kListRowH + kS2;
         add(Id::ListTile, {x0, y, x1, y + h}, 0, kRadiusLarge);
         for (size_t i = 0; i < n; i++) {
-            float t = y + kS4 + kTitleLine + kS1 + i * kListRowH;
+            float t = y + insetY + kTitleLine + kS1 + i * kListRowH;
             add(wifi ? Id::WifiNet : Id::BtDev, {x0 + kS2, t, x1 - kS2, t + kListRowH}, static_cast<int>(i), kRadiusSmall);
         }
-        y += h + kGap;
+        y += h + gap;
     }
 
     // One module for both sliders: Display, then Sound (whose output list opens under it). The Sound row
     // is always laid out (greyed when there is no output), so the height never depends on the audio read.
     if (cfg().showSliders) {
         const bool disp = bright >= 0;
-        const float extra = outsOpen ? outs.size() * kListRowH + kS1 : 0;
         const float blk = kTitleLine + kS2 + kSliderH;  // a label over a track
-        const float h = kS4 + (disp ? blk + kS4 : 0) + blk + kS4 + extra;
+        const float baseH = kS4 + (disp ? blk + kS4 : 0) + blk + kS4;
+        const float tailH = (cfg().showMedia && !compactOutputs ? mediaH + insetY : 0) + actionD + gap +
+                            (powerOpen ? powerH + gap : 0) + insetY - gap;
+        const size_t roomRows = static_cast<size_t>(std::max(0.0f,
+            std::floor((MaxH() - (y + baseH + gap + tailH + kS1)) / kListRowH)));
+        outVisible = outsOpen ? std::min(outs.size(), roomRows) : 0;
+        if (outVisible && outOffset + outVisible > outs.size()) outOffset = outs.size() - outVisible;
+        const float extra = outsOpen ? outVisible * kListRowH + kS1 : 0;
+        const float h = baseH + extra;
         add(Id::DisplayTile, {x0, y, x1, y + h}, 0, kRadiusLarge);
         float t = y + kS4;
         if (disp) {
@@ -1140,46 +1185,46 @@ void ControlCenter::Impl::Layout() {
         add(Id::Vol, {x0 + kS4, t + blk - kSliderH, x1 - kS4, t + blk});
         t += blk + kS4;
         if (outsOpen)
-            for (size_t i = 0; i < outs.size(); i++)
+            for (size_t i = outOffset; i < outOffset + outVisible; i++)
                 add(Id::OutDev, {x0 + kS2, t + i * kListRowH, x1 - kS2, t + (i + 1) * kListRowH}, static_cast<int>(i), kRadiusSmall);
-        y += h + kGap;
+        y += h + gap;
     }
 
     // Now Playing: always there, so the panel never changes height when a session turns up.
-    if (cfg().showMedia) {
-        add(Id::MediaTile, {x0, y, x1, y + kMediaH}, 0, kRadiusLarge);
-        const float cy = y + kMediaH / 2, b = kRound;
+    if (cfg().showMedia && mediaH > 0) {
+        add(Id::MediaTile, {x0, y, x1, y + mediaH}, 0, kRadiusLarge);
+        const float cy = y + mediaH / 2, b = kRound;
         float r = x1 - kS3;
         add(Id::Next, {r - b, cy - b / 2, r, cy + b / 2}, 0, b / 2);
         r -= b + kS1;
         add(Id::PlayPause, {r - b, cy - b / 2, r, cy + b / 2}, 0, b / 2);
         r -= b + kS1;
         add(Id::Prev, {r - b, cy - b / 2, r, cy + b / 2}, 0, b / 2);
-        y += kMediaH + kS4;
+        y += mediaH + insetY;
     }
 
     // Actions: free-standing round buttons across the width.
     {
         Id ids[] = {Id::Mic, Id::Snip, Id::Cast, Id::Settings, Id::Lock, Id::Power};
-        const float d = kRoundAction, step = (x1 - x0 - d) / 5;
+        const float d = actionD, step = (x1 - x0 - d) / 5;
         for (int i = 0; i < 6; i++) {
             float l = x0 + i * step;
             add(ids[i], {l, y, l + d, y + d}, 0, d / 2);
         }
-        y += d + kGap;
+        y += d + gap;
     }
     // The inline Sleep / Restart / Shut down choice under the actions.
     if (powerOpen) {
-        add(Id::PowerTile, {x0, y, x1, y + kPowH}, 0, kRadiusLarge);
+        add(Id::PowerTile, {x0, y, x1, y + powerH}, 0, kRadiusLarge);
         Id ids[] = {Id::PowSleep, Id::PowRestart, Id::PowShut};
         float w3 = (x1 - x0 - 2 * kS2 - 2 * kS1) / 3;
         for (int i = 0; i < 3; i++) {
             float l = x0 + kS2 + i * (w3 + kS1);
-            add(ids[i], {l, y + kS2, l + w3, y + kPowH - kS2}, 0, kRadiusSmall);
+            add(ids[i], {l, y + kS2, l + w3, y + powerH - kS2}, 0, kRadiusSmall);
         }
-        y += kPowH + kGap;
+        y += powerH + gap;
     }
-    y += kInset - kGap;
+    y += insetY - gap;
     if (y > MaxH() && listed > 1) {  // a long list would push the panel off the screen: list only what fits
         listCap = listed - std::min<size_t>(listed - 1, static_cast<size_t>(std::ceil((y - MaxH()) / kListRowH)));
         Layout();
@@ -1429,7 +1474,12 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 }
                 break;
             case Id::SoundTile:
-                txt(L"Sound", fTitle.get(), {r.left + kS4, r.top, r.left + 112, r.bottom}, theme::A(kText, speaker.Available() ? 1.0f : 0.5f));
+                {
+                    std::wstring label = L"Sound";
+                    if (outsOpen && outs.size() > outVisible)
+                        label += L" " + std::to_wstring(outOffset + (outVisible ? 1 : 0)) + L"/" + std::to_wstring(outs.size());
+                    txt(label, fTitle.get(), {r.left + kS4, r.top, r.left + 112, r.bottom}, theme::A(kText, speaker.Available() ? 1.0f : 0.5f));
+                }
                 break;
             case Id::Clock: {
                 wchar_t tb[32] = L"", db[64] = L"";
@@ -1491,12 +1541,12 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             case Id::Dnd: togglePill(r, dnd, 0xE708, false, L"Do not disturb"); break;
             case Id::Night: togglePill(r, night, 0xF08C, false, L"Night light"); break;
             case Id::Dark: togglePill(r, dark, 0, true, L"Dark mode"); break;
-            case Id::Snip: round(cx, cy, kRoundAction / 2, false, true, 0xE8C6, fIcon.get(), false); break;
-            case Id::Cast: round(cx, cy, kRoundAction / 2, false, true, 0xE7F4, fIcon.get(), false); break;
-            case Id::Settings: round(cx, cy, kRoundAction / 2, false, true, 0xE713, fIcon.get(), false); break;
-            case Id::Lock: round(cx, cy, kRoundAction / 2, false, true, 0xE72E, fIcon.get(), false); break;
-            case Id::Power: round(cx, cy, kRoundAction / 2, powerOpen, true, 0xE7E8, fIcon.get(), false); break;
-            case Id::Mic: round(cx, cy, kRoundAction / 2, micMuted, mic.Available(), micMuted ? 0xEC54 : 0xE720, fIcon.get(), false); break;
+            case Id::Snip: round(cx, cy, (r.right - r.left) / 2, false, true, 0xE8C6, fIcon.get(), false); break;
+            case Id::Cast: round(cx, cy, (r.right - r.left) / 2, false, true, 0xE7F4, fIcon.get(), false); break;
+            case Id::Settings: round(cx, cy, (r.right - r.left) / 2, false, true, 0xE713, fIcon.get(), false); break;
+            case Id::Lock: round(cx, cy, (r.right - r.left) / 2, false, true, 0xE72E, fIcon.get(), false); break;
+            case Id::Power: round(cx, cy, (r.right - r.left) / 2, powerOpen, true, 0xE7E8, fIcon.get(), false); break;
+            case Id::Mic: round(cx, cy, (r.right - r.left) / 2, micMuted, mic.Available(), micMuted ? 0xEC54 : 0xE720, fIcon.get(), false); break;
             case Id::PowSleep: case Id::PowRestart: case Id::PowShut:
                 box(r, kRadiusSmall, theme::P().fill);
                 txt(it.id == Id::PowSleep ? L"Sleep" : it.id == Id::PowRestart ? L"Restart" : L"Shut down", fBtn.get(), r, kText);
