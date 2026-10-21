@@ -84,7 +84,7 @@ public:
 
 private:
     enum class Kind { App, File, Result, Settings, Power, MenuItem, AllApps,
-                      PowerMode, CcWifi, CcWifiMore, CcBt, CcBtMore, CcBright, CcVol, CcMute, CcPrev, CcPlay, CcNext, CcBack, CcRefresh, CcRow, CcQuick, CcAction };
+                      PowerMode, CcWifi, CcWifiMore, CcBt, CcBtMore, CcBright, CcVol, CcMute, CcPrev, CcPlay, CcNext, CcBack, CcRefresh, CcRow, CcQuick, CcAction, CcOutMore };
     struct Hit {
         D2D1_RECT_F r;
         Kind kind;
@@ -158,12 +158,22 @@ private:
 
     // ---- HALO 2.0 (settings.halo2): the wider two-column panel. Left = Start plus a widget strip; right = a compact
     // control centre on the same services the Control Center uses. With halo2 off none of this runs. ----
-    enum class Detail { None, Wifi, Bt };
+    enum class Detail { None, Wifi, Bt, Output };
     float PanelX() const;                  // the panel's left edge in screen px (halo2 sits on the left of the screen)
     float CornerX() const;                 // where along the panel the swoop grows from (the dock is under it)
     void BuildRight(float rightW);         // the right column's visuals, hit rects and first paint
     void ScrollHome(float delta);
     void ScrollRight(float delta);
+    void SetScroll(wuc::ContainerVisual const& hold, float y);  // slides a scroll holder to -y on the compositor
+    void RehoverAtCursor();
+    void CcPlate(D2D1_RECT_F const* r, float radius);            // the right column's hover plate (content coords)
+    void CcPress(bool down);
+    void ApplySliders(bool animate);
+    std::wstring AppName(std::wstring const& target) const;
+    void ReleaseVisuals();
+    void ShiftHits();                                            // HALO 2.0 home: the scrolled, clipped rects of the home hits
+    void BlinkCaret();
+    void OpenMotion(wuc::Visual const& v, winrt::Windows::Foundation::Numerics::float3 rest, bool in);
     void DrawHeader(ID2D1DeviceContext* dc, float ox, float oy);
     void DrawWidgets(ID2D1DeviceContext* dc, float ox, float oy);  // greeting, quote, clock, month, battery, power mode
     void DrawRight(ID2D1DeviceContext* dc, float ox, float oy);    // tiles, sliders, now playing / the radio list
@@ -175,7 +185,9 @@ private:
     void StopServices();                   // on Close: nothing runs while Start is closed
     void RefreshWidgets();                 // time, battery, power mode; re-armed once a minute while open
     void ArmClock();
-    void CycleMode();
+    void SetMode(int index);               // a segment of the power-mode control (0 efficiency, 1 balanced, 2 performance)
+    void FocusVisible();
+    void CcTab(int dir);
     void ToggleDetail(Detail d);
     void CcClick(Hit const& hit);
     void CcDrag(float x);                  // slider drag (panel coords)
@@ -193,12 +205,27 @@ private:
     float m_rightW = 0;
     svc::Battery m_battery;
     svc::PowerMode m_mode = svc::PowerMode::Unknown;
-    svc::AudioEndpoint m_speaker;
+    svc::AudioEndpoint m_speaker, m_mic;
     svc::Radios m_radios;
     svc::Media m_media;
     usage::Sampler m_sampler;
     usage::Sample m_use;
-    bool m_wifiOn = false, m_btOn = false, m_muted = false, m_servicesOn = false;
+    bool m_wifiOn = false, m_btOn = false, m_muted = false, m_micMuted = false, m_servicesOn = false;
+    bool m_hotspotAvail = false, m_hotspotOn = false, m_savedWifi = true, m_savedBt = true;
+    std::vector<svc::Device> m_outs;       // output devices, read when the list opens
+    std::wstring m_outName;                // the default one, for the Sound slider's caption
+    D2D1_RECT_F m_modeSeg[3]{};            // the power-mode segments (panel coords)
+    float m_barTop = 0;                    // the footer's top (px): the right column scrolls above it
+    std::vector<D2D1_RECT_F> m_hitBase;   // m_hits' rects before the home scroll
+    std::vector<Hit> m_ccBase;             // the right column's controls in content coords (what is drawn)
+    wuc::ContainerVisual m_ccClip{nullptr}, m_ccHold{nullptr}, m_homeHold{nullptr};
+    wuc::ShapeVisual m_ccPlate{nullptr}, m_sliderShapes{nullptr};
+    wuc::CompositionRoundedRectangleGeometry m_ccPlateShape{nullptr}, m_brTrack{nullptr}, m_brFill{nullptr}, m_vlTrack{nullptr}, m_vlFill{nullptr};
+    wuc::CompositionSpriteShape m_ccPlateSprite{nullptr};
+    bool m_ccPlateOn = false;
+    float m_menuShadowPad = 0;
+    wuc::ContainerVisual m_menuOuter{nullptr};
+    bool m_caretOn = true, m_demo = false;  // m_demo (HALO_TEST): the right column pretends radios and devices exist
     std::wstring m_ssid;
     float m_vol = 0;
     int m_bright = -1;

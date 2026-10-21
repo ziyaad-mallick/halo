@@ -78,12 +78,12 @@ static void Layout() {
         const float height = std::max(plan.height, start::kRightMinH);
         auto widths = start::PlanWidths(c.w / c.scale);
         auto right = start::PlanRight(height);
-        std::printf("%gx%g @%g%%: avail %.0f -> level %d, height %.0f, width %.0f+%.0f=%.0f of %.0f, right gap %.0f%s\n", c.w, c.h,
+        std::printf("%gx%g @%g%%: avail %.0f -> level %d, height %.0f, width %.0f+%.0f=%.0f of %.0f, right gap %.0f row %.0f\n", c.w, c.h,
                     c.scale * 100, avail, plan.level, height, widths.left, widths.right, widths.total, c.w / c.scale, right.gap,
-                    right.roomy ? " roomy" : "");
+                    right.rowH);
         CHECK(height <= avail);                                         // it fits vertically: shrunk, not clipped
         CHECK(widths.total + 2 * start::kScreenMargin <= c.w / c.scale + 0.01f);  // and horizontally
-        CHECK(right.bottom >= right.actionsY + right.actionsH);       // the right column fits its own height
+        CHECK(right.bottom >= right.usageY + right.usageH);           // the right column holds all its groups
         CHECK(right.tilesY >= 0 && right.brightY > right.tilesY && right.volY > right.brightY && right.mediaY > right.volY &&
               right.usageY > right.mediaY);
         CHECK(plan.greetY < plan.widgetsY);
@@ -91,24 +91,27 @@ static void Layout() {
         CHECK(plan.searchY + start::kSearchH < plan.appsLabelY);
         CHECK(plan.files && plan.quote && plan.weekOnly);
         CHECK(plan.filesTop >= plan.appsTop + 2 * start::kAppRowH);
-        CHECK(plan.contentBottom >= plan.filesTop + 74 + start::kFileCellH);
+        CHECK(plan.contentBottom >= plan.filesTop + start::tk::kFileRows * start::kFileCellH);  // 6 rows of 2 columns = 12 files
         CHECK(plan.dividerY > plan.searchY + start::kSearchH + 34);
         // Every one of the 12 files is reachable by scrolling; never drop a section for height.
         const float maxScroll = std::max(0.0f, plan.contentBottom - plan.dividerY);
-        CHECK(plan.filesTop + 74 + start::kFileCellH - maxScroll <= plan.dividerY);
+        CHECK(plan.filesTop + start::tk::kFileRows * start::kFileCellH - maxScroll <= plan.dividerY);
     }
     for (float avail = 700; avail >= 336; avail -= 4) {
         auto p = start::PlanLeft(avail, true, true);
         CHECK(p.height <= avail && p.files && p.quote && p.weekOnly);
-        CHECK(p.contentBottom >= p.filesTop + 74 + start::kFileCellH);
+        CHECK(p.contentBottom >= p.filesTop + start::tk::kFileRows * start::kFileCellH);
     }
     // The right column holds for every panel height the left can produce.
     for (float h = start::kRightMinH; h <= 720; h += 4) {
         auto r = start::PlanRight(h);
         CHECK(r.usageY >= r.mediaY + r.mediaH);
-        CHECK(r.actionsY >= r.usageY + r.usageH);
-        const float scroll = std::max(0.0f, r.bottom - h + start::kRightPad);
-        CHECK(r.actionsY + r.actionsH - scroll <= h - start::kRightPad + 0.01f);
+        CHECK(r.mediaY >= r.volY + r.sliderH && r.volY >= r.brightY + r.sliderH);
+        CHECK(r.brightY >= r.rowY[3] + r.rowH);
+        for (int i = 1; i < 4; i++) CHECK(r.rowY[i] >= r.rowY[i - 1] + r.rowH);
+        // The footer is below the viewport: the viewport is h - footer, and the content scrolls by what exceeds it.
+        const float viewport = h - start::kBottomH - 1, scroll = std::max(0.0f, r.bottom - viewport);
+        CHECK(r.usageY + r.usageH - scroll <= viewport - start::kRightPad + 0.01f);
     }
 }
 

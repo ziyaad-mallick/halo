@@ -11,6 +11,8 @@
 #include <cwctype>
 #include <string>
 
+#include "tokens.h"
+
 namespace halo::start {
 
 // ---- Quote of the day ---------------------------------------------------------------------------------
@@ -148,13 +150,28 @@ inline MonthGrid MakeMonthGrid(int y, int m, int today, int firstDow) {
     return g;
 }
 
+// ---- Tokens -------------------------------------------------------------------------------------------
+// Everything Start 2.0 draws comes from these, which come from tokens.h. Type: 4 sizes, 2 weights. Spacing: 8 px inside
+// a card, 16 between items of a group, 24 between groups. Radii: panel, then one for cards and tiles, one for rows
+// inside them; a pill, chip, badge or slider is fully round. Elevation: the panel and the Power menu cast a
+// shadow, nothing flat does. Motion: fast (feedback) and slow (entrances), nothing overshoots.
+namespace tk {
+constexpr float kHero = ui::kDisplay, kTitle = ui::kHeading, kText = ui::kBody, kCap = ui::kCaption;
+constexpr float kInCard = ui::kS2, kPad = ui::kS3, kInGroup = ui::kS4, kGroup = ui::kS6, kMargin = ui::kS6;
+constexpr float kRCard = ui::kRadiusLarge, kRRow = ui::kRadiusSmall, kRPanel = ui::kPanelRadius;
+constexpr float kTile = 56, kBadge = 32, kTrack = 28, kCardH = 88, kAppCellH = 72, kAppIcon = 44, kFileRowH = 32, kFileIcon = 20,
+                kFileRows = 6, kSeg = 24, kMedia = 72, kMediaArt = 48, kMediaBtn = 32, kUsageRow = 22, kChevBtn = 28;
+constexpr float kMenuShadowBlur = 24, kMenuShadowDy = 8;  // the one raised surface besides the panel: the Power menu
+constexpr int kFastMs = ui::kFastMs, kSlowMs = ui::kSlowMs;
+}  // namespace tk
+
 // ---- Layout -------------------------------------------------------------------------------------------
 inline constexpr float kScreenMargin = 24, kPanelTop = 8;
-inline constexpr float kLeftMax = 720, kLeftMin = 480, kRightW = 384, kRightMinW = 280;
-inline constexpr float kSearchTop = 208, kSearchH = 40, kGap = 16, kLabelH = 16;
-inline constexpr float kAppRowH = 64, kFileCellH = 70, kBottomH = 56;
+inline constexpr float kLeftMax = 664, kLeftMin = 480, kRightW = 384, kRightMinW = 280;
+inline constexpr float kSearchTop = 228, kSearchH = 40, kGap = 24, kLabelH = 16;
+inline constexpr float kAppRowH = tk::kAppCellH, kFileCellH = tk::kFileRowH, kBottomH = 56;
 inline constexpr float kGreetQuoteH = 64, kGreetH = 40;
-inline constexpr float kWidgetsH = 80, kWidgetsCompactH = 80;
+inline constexpr float kWidgetsH = tk::kCardH;
 inline constexpr float kRightPad = 24, kRightMinH = 336;
 
 struct Widths {
@@ -178,11 +195,11 @@ inline float AvailHeight(float monitorTopPx, float anchorBottomPx, float scale) 
     return (anchorBottomPx - monitorTopPx) / scale - kPanelTop - 8;
 }
 
-// Greeting, compact widgets, search, two rows of apps and files; recent content scrolls when needed.
+// Greeting, two cards, search, two rows of apps and six rows of files (two columns); recent content scrolls when needed.
 struct LeftPlan {
     int level = 0;
     bool quote = true, files = true, weekOnly = true;
-    float greetY = 24, greetH = kGreetQuoteH, widgetsY = 104, widgetsH = kWidgetsH;
+    float greetY = 32, greetH = kGreetQuoteH, widgetsY = 116, widgetsH = kWidgetsH;
     float searchY = kSearchTop;
     float appsLabelY = 0, appsTop = 0, filesLabelY = 0, filesTop = 0;
     float dividerY = 0, height = 0, contentBottom = 0;
@@ -192,11 +209,11 @@ inline LeftPlan PlanLeft(float avail, bool wantApps, bool wantFiles) {
     p.files = wantFiles;
     float y = p.searchY + kSearchH + kGap;
     p.appsLabelY = y;
-    p.appsTop = y + kLabelH + 8;
+    p.appsTop = y + kLabelH + tk::kInCard;
     if (wantApps) y = p.appsTop + 2 * kAppRowH + kGap;
     p.filesLabelY = y;
-    p.filesTop = y + kLabelH + 8;
-    if (wantFiles) y = p.filesTop + 74 + kFileCellH + kGap;
+    p.filesTop = y + kLabelH + tk::kInCard;
+    if (wantFiles) y = p.filesTop + tk::kFileRows * tk::kFileRowH + tk::kInGroup;
     p.contentBottom = y;
     p.height = std::min(avail, y + 4 + kBottomH);
     p.dividerY = p.height - kBottomH - 4;
@@ -204,20 +221,36 @@ inline LeftPlan PlanLeft(float avail, bool wantApps, bool wantFiles) {
 }
 
 // The right column (a compact control centre) for a panel `height` tall. Everything is a y from the top of the panel.
+// Four rows of tiles (Wi-Fi/Bluetooth, Airplane/Hotspot, Do not disturb/Night light, Dark mode/Microphone), the
+// Display and Sound sliders, Now Playing, the usage grid. Spare height widens the gaps between groups a little.
 struct RightPlan {
     bool roomy = true;
-    float tilesY = 56, tilesH = 64;
-    float quickY = 136, quickH = 48;
-    float brightY = 320, volY = 364, sliderH = 24;
-    float mediaY = 412, mediaH = 88;
-    float usageY = 524, usageH = 64;
-    float actionsY = 612, actionsH = 36;
-    float gap = 16, bottom = 648;
+    float rowY[4] = {24, 88, 152, 216}, rowH = tk::kTile, rowGap = tk::kInCard;
+    float tilesY = 24, tilesH = tk::kTile;  // the first row
+    float brightY = 0, volY = 0, sliderH = tk::kTrack;
+    float mediaY = 0, mediaH = tk::kMedia;
+    float usageY = 0, usageH = kLabelH + 6 + 2 * tk::kUsageRow;
+    float gap = tk::kGroup, bottom = 0;
 };
 inline RightPlan PlanRight(float height) {
     RightPlan r;
-    // The column keeps the original Control Center's groups; scroll rather than compress controls.
-    r.bottom = std::max(r.bottom, height - kRightPad);
+    auto total = [&](float rowH, float gap) {
+        return 24 + 4 * rowH + 3 * r.rowGap + 3 * gap + 2 * r.sliderH + r.rowGap + r.mediaH + r.usageH + kRightPad;
+    };
+    float extra = std::max(0.0f, height - kBottomH - 1 - total(r.rowH, tk::kGroup));
+    if (extra >= 32) {  // room to spare: taller tiles first, then wider gaps between groups
+        r.rowH = 64;
+        extra -= 32;
+    }
+    r.gap = tk::kGroup + std::min(extra / 3, 12.0f);
+    for (int i = 0; i < 4; i++) r.rowY[i] = 24 + i * (r.rowH + r.rowGap);
+    r.tilesH = r.rowH;
+    const float rowsEnd = r.rowY[3] + r.rowH;
+    r.brightY = rowsEnd + r.gap;
+    r.volY = r.brightY + r.sliderH + r.rowGap;
+    r.mediaY = r.volY + r.sliderH + r.gap;
+    r.usageY = r.mediaY + r.mediaH + r.gap;
+    r.bottom = r.usageY + r.usageH + kRightPad;
     return r;
 }
 
