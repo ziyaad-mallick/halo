@@ -48,6 +48,7 @@ struct Settings {
     Theme theme = Theme::System;
     uint32_t accent = 0x14A394;
     bool reduceMotion = false;
+    bool halo2 = false;  // HALO 2.0: Start hosts the control centre; the right edge is notifications + calendar
     Taskbar taskbar;
     ControlCenter cc;
     Start start;

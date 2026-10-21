@@ -12,6 +12,7 @@ const std::vector<Key>& Schema() {
         {"general", "theme", Type::Theme, "system"},
         {"general", "accent", Type::Color, "#14A394"},
         {"general", "reduce_motion", Type::Bool, "off"},
+        {"general", "halo2", Type::Bool, "off"},
 
         {"taskbar", "effect", Type::Effect, "rise"},
         {"taskbar", "speed", Type::Int, "100", 50, 200},
@@ -188,6 +189,7 @@ Settings Parse(Values const& v) {
     s.theme = th == "dark" ? Theme::Dark : th == "light" ? Theme::Light : Theme::System;
     if (std::string a = str("general", "accent"); a.size() == 7) s.accent = Hex(a);
     s.reduceMotion = on("general", "reduce_motion");
+    s.halo2 = on("general", "halo2");
 
     surface("taskbar", s.taskbar);
     s.taskbar.iconSize = num("taskbar", "icon_size");
