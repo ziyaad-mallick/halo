@@ -32,8 +32,12 @@ struct Device {
 // The default endpoint of one direction (render = speakers, capture = microphone).
 class AudioEndpoint {
 public:
-    // `msg` is posted to `notify` when someone else changes the volume or mute state.
+    // `msg` is posted to `notify` when someone else changes the volume or mute state, and with
+    // wParam == kDeviceChanged when the default device of this direction changes. The owner
+    // passes that wParam to OnMessage(), which re-binds to the new default device.
+    static constexpr WPARAM kDeviceChanged = 1;
     bool Bind(EDataFlow flow, HWND notify, UINT msg);
+    void OnMessage(WPARAM w);
     void Unbind();
     bool Available() const { return m_vol != nullptr; }
     float Volume() const;
@@ -44,6 +48,11 @@ public:
 private:
     winrt::com_ptr<IAudioEndpointVolume> m_vol;
     winrt::com_ptr<IAudioEndpointVolumeCallback> m_cb;
+    winrt::com_ptr<IMMDeviceEnumerator> m_en;
+    winrt::com_ptr<IMMNotificationClient> m_nc;
+    EDataFlow m_flow = eRender;
+    HWND m_notify = nullptr;
+    UINT m_msg = 0;
 };
 
 std::vector<Device> OutputDevices();

@@ -956,8 +956,7 @@ void Launcher::Build() {
         veil.Size({m_menuW, m_menuH});
         // theme::P().veil is the full-screen dim; this one frosts the menu, so it follows the glass tint.
         const auto tint = theme::Glass(settings::Get().start).tint;
-        veil.Brush(m_comp.CreateColorBrush(theme::Dark() ? theme::C({0xB0, 0x16, 0x16, 0x1A})
-                                                          : theme::C({0xD8, tint.r, tint.g, tint.b})));
+        veil.Brush(m_comp.CreateColorBrush(theme::C({static_cast<uint8_t>(theme::Dark() ? 0xB0 : 0xD8), tint.r, tint.g, tint.b})));
         m_menu.Children().InsertAtTop(veil);
     }
     m_menuHover = plate(m_menuHoverShape);
@@ -1912,6 +1911,7 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
     if (m >= kMsgAudio && m <= kMsgUsage) {  // halo2 services
+        if (m == kMsgAudio) m_speaker.OnMessage(w);  // follows a default-device change
         OnServiceMessage(m);
         return 0;
     }
