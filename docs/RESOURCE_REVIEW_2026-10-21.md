@@ -20,3 +20,5 @@ Reviewed shell/dock, tracking/icons/pins, hooks/taskbar/guardian, monitors/intel
 Installed-shell baseline: 0.0 CPU seconds over five idle seconds, 49,410,048 private bytes, 112,877,568 working-set bytes, 40 threads. This is not a controlled before/after comparison. Percentage RAM/CPU/GPU savings are UNVERIFIED; removed work and retained handles are confirmed in code.
 
 Checks: media capture 0 failures; dock both modes pass; Start/sampler pass; search 10/0; Settings launch 0 failures; Control Center layout 0 reachability failures. Separate output: `build/halo-macos-efficiency-2026-10-21.exe`. Preferences is also rebuilt. No installation performed.
+
+Final Halo, Preferences and Start-test compilation exited 0. The final freshly rebuilt Start executable was blocked by Application Control; the earlier Start run this session passed. No security setting was changed or bypass attempted.
