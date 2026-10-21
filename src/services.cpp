@@ -1,4 +1,5 @@
 #include "services.h"
+#include "shell_launch.h"
 
 #include <functiondiscoverykeys_devpkey.h>
 #include <propsys.h>
@@ -492,7 +493,7 @@ bool ReadEnergySaver() {
 
 void OpenSettings(wchar_t const* uri) {
     if (DryRun()) return Log(std::wstring(L"DRYRUN open ") + uri);
-    ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
+    launch::Open(uri);
 }
 
 void SendWinChord(WORD key, bool shift) {

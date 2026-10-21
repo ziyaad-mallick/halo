@@ -1,4 +1,4 @@
-// Halo Settings (halo-settings.exe): the dashboard for docs/SETTINGS.md.
+// Halo Preferences (halo-settings.exe): the dashboard for docs/SETTINGS.md.
 //
 // A tiny HTTP server on 127.0.0.1 (random port, random 128-bit token in the URL path) that serves one
 // embedded page (ui/settings.html) plus a JSON API, shown in an Edge "app mode" window. The settings file is
@@ -545,7 +545,8 @@ BOOL CALLBACK FindWin(HWND h, LPARAM lp) {
     GetClassNameW(h, cls, 64);
     if (wcscmp(cls, L"Chrome_WidgetWin_1") != 0 || !IsWindowVisible(h)) return TRUE;
     GetWindowTextW(h, title, 128);
-    if (wcsncmp(title, L"Halo Settings", 13) == 0) { reinterpret_cast<FindCtx*>(lp)->found = h; return FALSE; }
+    if (wcsncmp(title, L"Halo Preferences", wcslen(L"Halo Preferences")) == 0 ||
+        wcsncmp(title, L"Halo Settings", wcslen(L"Halo Settings")) == 0) { reinterpret_cast<FindCtx*>(lp)->found = h; return FALSE; }
     return TRUE;
 }
 HWND FindSettingsWindow() {
@@ -558,8 +559,8 @@ void Focus(HWND h) {
     SetForegroundWindow(h);
 }
 
-// The app ID Halo Settings goes by. Its Start shortcut carries it and so does its Edge window, so Halo's dock shows
-// the window as Halo Settings, with this exe's icon, rather than as an Edge page.
+// The app ID Halo Preferences goes by. Its Start shortcut carries it and so does its Edge window, so Halo's dock shows
+// the window as Halo Preferences, with this exe's icon, rather than as an Edge page.
 constexpr wchar_t kAumid[] = L"Halo.Settings";
 constexpr GUID kAppUserModel = {0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}};
 const PROPERTYKEY kPkeyRelaunchCommand = {kAppUserModel, 2}, kPkeyRelaunchIcon = {kAppUserModel, 3},
@@ -582,12 +583,21 @@ bool SetProps(IPropertyStore* ps, std::vector<std::pair<PROPERTYKEY, std::wstrin
     return SUCCEEDED(ps->Commit()) && ok;
 }
 
-// "Halo Settings" in Start (and in Halo's search): a shortcut to this exe that carries kAumid.
+// "Halo Preferences" in Start (and in Halo's search): a shortcut to this exe that carries kAumid.
 void EnsureShortcut() {
     PWSTR programs = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs))) return;
-    std::wstring lnk = std::wstring(programs) + L"\\Halo Settings.lnk";
+    std::wstring lnk = std::wstring(programs) + L"\\Halo Preferences.lnk";
+    std::wstring legacy = std::wstring(programs) + L"\\Halo Settings.lnk";
     CoTaskMemFree(programs);
+    // Preserve the old shortcut on upgrade. Never replace an existing destination.
+    if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::wstring destination = GetFileAttributesW(lnk.c_str()) == INVALID_FILE_ATTRIBUTES
+            ? lnk : legacy + L".bak";
+        if (!MoveFileExW(legacy.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            OutputDebugStringW(L"Halo Preferences: could not migrate the old Start shortcut; it was preserved.\n");
+        }
+    }
     IShellLinkW* link = nullptr;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) return;
     std::wstring exe = SelfPath();
@@ -614,7 +624,7 @@ void TagWindow(HWND h) {
     if (FAILED(SHGetPropertyStoreForWindow(h, IID_PPV_ARGS(&ps)))) return;
     std::wstring exe = SelfPath();
     SetProps(ps, {{kPkeyRelaunchCommand, L"\"" + exe + L"\""}, {kPkeyRelaunchIcon, exe + L",0"},
-                  {kPkeyRelaunchName, L"Halo Settings"}, {kPkeyAumid, kAumid}});
+                  {kPkeyRelaunchName, L"Halo Preferences"}, {kPkeyAumid, kAumid}});
     ps->Release();
     wchar_t title[128] = {};
     GetWindowTextW(h, title, 128);
@@ -697,9 +707,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     for (unsigned char b : rnd) { char h[3]; snprintf(h, sizeof h, "%02x", b); g_token += h; }
 
     SOCKET ls = StartServer();
-    if (ls == INVALID_SOCKET) {  // a -mwindows exe has no console: without this, clicking Halo Settings would do nothing at all
-        MessageBoxW(nullptr, L"Halo Settings could not start its local server (127.0.0.1). Check that a firewall or security tool is not blocking it.",
-                    L"Halo Settings", MB_OK | MB_ICONWARNING);
+    if (ls == INVALID_SOCKET) {  // a -mwindows exe has no console: without this, clicking Halo Preferences would do nothing at all
+        MessageBoxW(nullptr, L"Halo Preferences could not start its local server (127.0.0.1). Check that a firewall or security tool is not blocking it.",
+                    L"Halo Preferences", MB_OK | MB_ICONWARNING);
         return 2;
     }
     g_lastRequest = GetTickCount64();

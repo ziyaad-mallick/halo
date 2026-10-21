@@ -1,5 +1,5 @@
 # Remove the installed copy that tools/install.ps1 made: stops guardian, halo and halo-settings, puts
-# Windows' taskbar back, deletes the logon entry (HKCU Run "Halo"), the Halo Settings Start-menu shortcut
+# Windows' taskbar back, deletes the logon entry (HKCU Run "Halo"), the Halo Preferences Start-menu shortcut
 # and %LOCALAPPDATA%\Halo\app. Settings, logs and the taskbar state file in %LOCALAPPDATA%\Halo stay unless
 # -RemoveData is given.
 #   tools/uninstall.ps1 [-RemoveData]
@@ -32,9 +32,11 @@ if (Test-Path $guardian) {
     Write-Warning 'guardian.exe is missing; if the taskbar is still hidden, sign out and back in or restart explorer.exe.'
 }
 
-# Halo Settings' Start-menu shortcut (written by halo-settings.exe --register).
-$lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Halo Settings.lnk'
-if (Test-Path $lnk) { Remove-Item $lnk -Force -ErrorAction SilentlyContinue }
+# Include the legacy shortcut for upgrades that have not registered the renamed app yet.
+foreach ($name in @('Halo Preferences.lnk', 'Halo Settings.lnk')) {
+    $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) $name
+    if (Test-Path $lnk) { Remove-Item $lnk -Force -ErrorAction SilentlyContinue }
+}
 
 # The image stays locked for a moment after the process is gone.
 if (Test-Path $app) {

@@ -1,12 +1,12 @@
 # Halo settings: the contract
 
 One file, `%LOCALAPPDATA%\Halo\settings.ini` (UTF-8, `key = value`, `[section]` headers, `;` comments).
-**Halo Settings** (`halo-settings.exe`, the dashboard) writes it; **Halo** (`halo.exe`) watches it and
+**Halo Preferences** (`halo-settings.exe`, the dashboard) writes it; **Halo** (`halo.exe`) watches it and
 applies every change live, without a restart. A missing file, section or key means the default below. A value
 out of range is clamped and a value Halo can't parse is ignored (the default is used instead), so a
 hand-edited file can never break the shell.
 
-Halo Settings writes the whole file atomically: it writes `settings.ini.tmp`, then calls
+Halo Preferences writes the whole file atomically: it writes `settings.ini.tmp`, then calls
 `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)`. Halo re-reads the file when its directory reports a change,
 debounced by 150 ms.
 
@@ -52,7 +52,7 @@ slow, `200` = twice as fast). `motion` scales distances and overshoot (`0` = no 
 | `motion` | int | `100` | 0–200 | |
 | `opacity` | int | `66` | 20–100 | glass tint strength, % |
 | `tint` | color | `#18191E` (dark) / `#F8F8FB` (light) | | glass tint colour; empty = theme default |
-| `blur` | int | `40` | 0–80 | reserved: Windows' host backdrop has a fixed blur, so Halo doesn't apply this yet (not shown in Halo Settings) |
+| `blur` | int | `40` | 0–80 | reserved: Windows' host backdrop has a fixed blur, so Halo doesn't apply this yet (not shown in Halo Preferences) |
 | `icon_size` | int | `48` | 32–72 | resting icon size, px |
 | `magnification` | int | `150` | 100–250 | hovered icon size, % of `icon_size`; 100 = off |
 | `autohide` | bool | `on` | | hide when a window touches the dock |
@@ -89,9 +89,9 @@ slow, `200` = twice as fast). `motion` scales distances and overshoot (`0` = no 
 | `recent_files` | int | `12` | 0–12 | recent files (two rows of six); 0 hides them |
 | `dim_desktop` | bool | `off` | | dim the screen behind Start |
 
-## Live stats (Halo Settings only)
+## Live stats (Halo Preferences only)
 
-Halo Settings samples `halo.exe` and `guardian.exe` once a second:
+Halo Preferences samples `halo.exe` and `guardian.exe` once a second:
 - **CPU**: process time delta ÷ wall time ÷ logical cores, %.
 - **RAM**: private bytes and working set, MB.
 - **GPU**: the sum of the PDH counter `\GPU Engine(pid_<pid>_*)\Utilization Percentage` for those processes, %.

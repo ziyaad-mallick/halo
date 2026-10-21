@@ -28,7 +28,7 @@ foreach ($pair in @(@($Halo, 'halo.exe'), @($Guardian, 'guardian.exe'), @($Setti
         catch { if ($i -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
     }
 }
-# Halo Settings: its Start-menu shortcut, which carries its app ID (skipped if the exe wasn't built).
+# Halo Preferences: its Start-menu shortcut, which carries its app ID (skipped if the exe wasn't built).
 if (Test-Path (Join-Path $app 'halo-settings.exe')) {
     Start-Process (Join-Path $app 'halo-settings.exe') -ArgumentList '--register' -Wait
 }

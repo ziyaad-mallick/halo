@@ -3,6 +3,7 @@
 #include "motion.h"
 #include "theme.h"
 #include "tokens.h"
+#include "shell_launch.h"
 
 #include <windows.ui.composition.interop.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -298,6 +299,7 @@ struct SettingsPage {
     const wchar_t* uri;
 };
 constexpr SettingsPage kSettingsPages[] = {
+    {L"Settings", L"windows system settings", L"ms-settings:"},
     {L"Wi-Fi", L"wifi wireless internet network", L"ms-settings:network-wifi"},
     {L"Ethernet", L"wired network cable", L"ms-settings:network-ethernet"},
     {L"VPN", L"network", L"ms-settings:network-vpn"},
@@ -348,15 +350,9 @@ constexpr SettingsPage kSettingsPages[] = {
 constexpr wchar_t kSettingsApp[] =
     L"shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
 
-// ShellExecute without its error dialog: a file deleted since the list was made (or a Settings page this Windows
-// lacks) must fail quietly, not park a modal message box on the shell's one UI thread.
+// Launch errors are visible without blocking the shell's one UI thread.
 void OpenQuietly(std::wstring const& target) {
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_FLAG_NO_UI;
-    sei.lpVerb = L"open";
-    sei.lpFile = target.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei)) Log(L"open failed (" + std::to_wstring(GetLastError()) + L"): " + target);
+    launch::Open(target);
 }
 
 IReference<float3> Ref3(float3 v) { return v; }  // spring animations take IReference<float3>
@@ -1424,7 +1420,10 @@ void Launcher::RunSearch() {
     for (auto const& p : kSettingsPages) {
         int rk = MatchRank(Lower(p.name), q);
         if (rk < 0) rk = MatchRank(L" " + std::wstring(p.words), q);  // the leading space: a word start ranks 1, never 0
-        if (rk >= 0) hits.push_back({rk, wcslen(p.name), {Result::Type::Setting, p.name, p.uri}});
+        if (rk >= 0) {
+            if (q == L"settings" && wcscmp(p.uri, L"ms-settings:") == 0) rk = -1;
+            hits.push_back({rk, wcslen(p.name), {Result::Type::Setting, p.name, p.uri}});
+        }
     }
     for (auto const& f : m_allFiles)
         if (int rk = MatchRank(Lower(f.name), q); rk >= 0) hits.push_back({rk, f.name.size(), {Result::Type::File, f.name, f.path}});
@@ -1544,7 +1543,7 @@ void Launcher::Activate(Kind kind, int index) {
         return;
     }
     Hide();
-    if (app) {
+    if (app && _wcsicmp(path.c_str(), kSettingsApp) != 0) {
         if (m_host.launch) m_host.launch(path);
     } else {
         OpenQuietly(path);

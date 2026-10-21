@@ -57,6 +57,11 @@ build_swoop_test() {
   "$CXX" "${COMMON[@]}" -DHALO_SWOOP_TEST src/swoop.cpp tools/swoop_test.cpp -o "${SWOOP_TEST_OUT:-build/swoop_test.exe}" -ldwmapi -lpsapi -luser32 -lgdi32
 }
 
+build_settings_launch_test() {
+  echo "== settings_launch_test.exe"
+  "$CXX" "${COMMON[@]}" tools/settings_launch_test.cpp -o build/settings_launch_test.exe -lole32 -luuid -lshell32 -luser32
+}
+
 case "${1:-halo}" in
   halo) build_halo ;;
   guardian) build_guardian ;;
@@ -65,6 +70,7 @@ case "${1:-halo}" in
   pins_test) build_pins_test ;;
   cluster_test) build_cluster_test ;;
   swoop_test) build_swoop_test ;;
-  all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test ;;
+  settings_launch_test) build_settings_launch_test ;;
+  all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac
