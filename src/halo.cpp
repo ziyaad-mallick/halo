@@ -1478,7 +1478,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 else OpenLauncher();
             }
             return 0;
-        case kMsgVolume: SyncVolume(); return 0;
+        case kMsgVolume: m_speaker.OnMessage(w); SyncVolume(); return 0;
         case WM_MOUSEWHEEL:
             if (m_cfg.halo2 && m_dock && m_widgets && m_state == State::Shown) {
                 POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};  // screen coordinates

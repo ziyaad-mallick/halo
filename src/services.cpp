@@ -58,6 +58,22 @@ struct VolumeCallback : winrt::implements<VolumeCallback, IAudioEndpointVolumeCa
     UINT msg;
 };
 
+// Posts `msg` (wParam kDeviceChanged) when the default endpoint of one direction changes.
+struct DeviceCallback : winrt::implements<DeviceCallback, IMMNotificationClient> {
+    DeviceCallback(EDataFlow f, HWND h, UINT m) : flow(f), hwnd(h), msg(m) {}
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow f, ERole role, LPCWSTR) override {
+        if (f == flow && role == eMultimedia) PostMessageW(hwnd, msg, AudioEndpoint::kDeviceChanged, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+    EDataFlow flow;
+    HWND hwnd;
+    UINT msg;
+};
+
 }  // namespace
 
 bool DryRun() {
@@ -89,10 +105,23 @@ bool AudioEndpoint::Bind(EDataFlow flow, HWND notify, UINT msg) {
     }
     m_cb = winrt::make<VolumeCallback>(notify, msg);
     m_vol->RegisterControlChangeNotify(m_cb.get());
+    m_flow = flow;
+    m_notify = notify;
+    m_msg = msg;
+    m_en = en;
+    m_nc = winrt::make<DeviceCallback>(flow, notify, msg);
+    m_en->RegisterEndpointNotificationCallback(m_nc.get());
     return true;
 }
 
+void AudioEndpoint::OnMessage(WPARAM w) {
+    if (w == kDeviceChanged && m_notify) Bind(m_flow, m_notify, m_msg);  // follow the new default device
+}
+
 void AudioEndpoint::Unbind() {
+    if (m_en && m_nc) m_en->UnregisterEndpointNotificationCallback(m_nc.get());
+    m_nc = nullptr;
+    m_en = nullptr;
     if (m_vol && m_cb) m_vol->UnregisterControlChangeNotify(m_cb.get());
     m_cb = nullptr;
     m_vol = nullptr;
