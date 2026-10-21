@@ -44,3 +44,42 @@ Microsoft documents that native Wi-Fi scanning and current-connection queries ca
 DeviceWatcher supports dynamic additions/updates/removals. Stop is asynchronous; a stopped watcher cannot simply be restarted while it is still stopping. Halo uses fresh sessions and unsubscribes old callbacks: [DeviceWatcher lifecycle](https://learn.microsoft.com/en-us/uwp/api/windows.devices.enumeration.devicewatcher).
 
 The visual recommendations emphasize clear toggle labels/state, predictable placement, readable hierarchy, and connected transitions. Specific preview dimensions are design recommendations, not platform requirements: [Apple toggles](https://developer.apple.com/design/human-interface-guidelines/toggles), [Microsoft motion](https://learn.microsoft.com/en-us/windows/apps/design/motion/), [Microsoft typography](https://learn.microsoft.com/en-us/windows/apps/design/signature-experiences/typography).
+
+
+## CEO refinement — 21 October 2026
+
+Implemented sequentially on `feat/halo-2`: `c6bae21` (centered Start), `dd97fa7` (grouped right controls),
+`823d582` (calendar-first notifications), `6ae34bf` (dock order/media/magnetic tuning).
+The direct CEO request supersedes the earlier mock-approval prerequisite above.
+
+- Start: 1104 logical px wide on roomy displays, 28 px greeting, quote, 80 px battery/week widgets above search.
+  Twelve actual MRU apps and twelve recent files are supported; fewer appear when history has fewer items.
+  The recent area scrolls instead of discarding files on smaller displays. Battery runtime is the Windows
+  estimate, with an estimating state when Windows supplies no estimate.
+- Right column: original Control Center grouping and shell actions, independent home scrolling, bounded
+  Wi-Fi/BT details, concise usage numbers. Airplane mode, hotspot, sound output and microphone actions
+  currently open native Windows settings; these are not embedded detail pages or direct toggles.
+- Notifications: wider standalone Halo 2.0 column at the top right, calendar before notification header/cards,
+  capped entrance staggering and reduced-motion fallback. Legacy attached mode remains available in classic Halo.
+- Dock: time/battery/36 px Start slot with 28 px logo, apps, Wi-Fi/BT, 144 px media slot with ellipsis and
+  play/pause. Event-driven radio/media subscriptions stop on rebuild and close. Pull reach 2 px, easing 70 ms.
+
+Verification this session:
+
+- Final isolated build `HALO_OUT=build/halo-refinement-2026-10-21.exe tools/build.sh halo`: exit 0, no warnings.
+- `build/start_test.exe`: `start_test: all passed`; six monitor/scale cases fit, all recent content remains
+  reachable, right actions remain reachable by scrolling. Sampler: three samples in 3.3 s; stop 1 ms.
+- `build/dock_hit_test.exe` and `build/dock_hit_test.exe h2`: `All dock hit-test checks PASSED` in both modes.
+- `python tools/settings_search_test.py`: `10 checks, 0 failures`.
+- `git diff --check`: pass. Initial native test launches were blocked by Application Control; later direct
+  runs passed. No security settings were changed. The test build was not installed or launched as a shell.
+
+Design audit limits: shared palette/type/spacing/radius/motion tokens are reused, with remaining legacy
+hardcoded values. Native grayscale/squint/contrast, light/dark appearance, focus traversal, mixed DPI,
+actual radio/media interaction and perceived smoothness are **UNVERIFIED**. Layout fixtures cover fitting
+and reachability, not rendering. The 90-second cold-user check still needs the CEO. Do not claim native
+visual approval or measured smoothness from the build and fixtures alone.
+
+CEO install command, after reviewing the separate build (CTO must not run):
+`powershell -ExecutionPolicy Bypass -File tools/install.ps1 -Halo build/halo-refinement-2026-10-21.exe`.
+General > HALO 2.0 must be enabled to see the new layout. No install, push or live-shell replacement performed.

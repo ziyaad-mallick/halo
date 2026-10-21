@@ -122,15 +122,19 @@ here when something goes wrong).
 Turn on **General > HALO 2.0** in Halo Preferences (or `halo2 = on` under `[general]`). It applies live and
 can be turned off again at any time; with it off, Halo behaves exactly as before.
 
-- Clicking anywhere in the dock's left cluster (the Windows logo, Wi-Fi, battery, the time) opens Start,
-  which hosts the control centre.
-- The right side (the bottom-right hot corner and the right-edge swipe) opens notifications and a calendar
-  instead of the Control Center.
-- The right of the dock gets two small widgets: Wi-Fi (click opens Start) and volume (scroll to change it,
-  click to mute).
+- Start is centered above the dock. The greeting and daily quote lead, followed by compact battery/runtime,
+  power-mode and week widgets, search, twelve recent apps and twelve recent files. The recent sections scroll
+  on shorter displays (mouse wheel or Page Up / Page Down / Home / End).
+- The right column groups connectivity, quick controls, brightness, sound, media and a concise 2 × 2 usage grid.
+  It scrolls independently; radio detail pages remain bounded. Airplane mode, hotspot and audio output use
+  their Windows settings pages; the other quick toggles use the existing native services.
+- The right edge opens a panel from the top right: calendar first, then notifications.
+- Dock order: time, battery, larger Windows button, apps, Wi-Fi, Bluetooth, compact Now Playing.
+  Clicking Now Playing pauses/resumes the current media session. Wi-Fi and Bluetooth open Start's controls.
+- Magnetic app hover uses a smaller pull and quicker easing; reduce motion disables the magnetic pull.
 
-The dock's hover is magnetic in both versions: icons are easy to hit, with no dead gaps, and the hovered
-icon eases a little toward the pointer (not with reduce motion).
+Build the dock hit fixture with `tools/build.sh dock_hit_test`, then run `build/dock_hit_test.exe`
+and `build/dock_hit_test.exe h2` to check both modes.
 
 ## Going back to the Windows taskbar
 
