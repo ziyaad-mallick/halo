@@ -21,7 +21,7 @@ WINLIBS=(-lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldw
 
 build_halo() {
   echo "== halo.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/cluster.cpp src/icons.cpp src/apps.cpp src/winkey.cpp src/edge.cpp src/launcher.cpp src/previews.cpp src/menu.cpp src/pins.cpp src/swoop.cpp     src/control_center.cpp src/notifications.cpp src/services.cpp src/settings.cpp src/taskbar.cpp -lwbemuuid -lwlanapi -lpsapi     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}" -lkernel32
+  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/cluster.cpp src/icons.cpp src/apps.cpp src/winkey.cpp src/edge.cpp src/launcher.cpp src/usage.cpp src/previews.cpp src/menu.cpp src/pins.cpp src/swoop.cpp     src/control_center.cpp src/notifications.cpp src/services.cpp src/settings.cpp src/taskbar.cpp -lwbemuuid -lwlanapi -lpsapi -lpdh     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}" -lkernel32
 }
 
 build_guardian() {
@@ -57,6 +57,11 @@ build_swoop_test() {
   "$CXX" "${COMMON[@]}" -DHALO_SWOOP_TEST src/swoop.cpp tools/swoop_test.cpp -o "${SWOOP_TEST_OUT:-build/swoop_test.exe}" -ldwmapi -lpsapi -luser32 -lgdi32
 }
 
+build_start_test() {
+  echo "== start_test.exe"
+  "$CXX" "${COMMON[@]}" src/usage.cpp tools/start_test.cpp -o build/start_test.exe -lpdh -luser32
+}
+
 build_settings_launch_test() {
   echo "== settings_launch_test.exe"
   "$CXX" "${COMMON[@]}" tools/settings_launch_test.cpp -o build/settings_launch_test.exe -lole32 -luuid -lshell32 -luser32
@@ -71,6 +76,7 @@ case "${1:-halo}" in
   cluster_test) build_cluster_test ;;
   swoop_test) build_swoop_test ;;
   settings_launch_test) build_settings_launch_test ;;
-  all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test ;;
+  start_test) build_start_test ;;
+  all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test; build_start_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac
