@@ -26,9 +26,9 @@
 namespace halo::motion {
 
 constexpr float kDamping = 0.72f;  // the dock's reveal spring (halo.cpp kSpringDamping)
-constexpr int kPeriodMs = 55;      // halo.cpp kSpringPeriodMs
-constexpr unsigned kOutMs = 160;
-constexpr unsigned kFadeInMs = 180;
+constexpr int kPeriodMs = 44;      // was 55 (halo.cpp kSpringPeriodMs is the dock's own)
+constexpr unsigned kOutMs = 110;     // was 160
+constexpr unsigned kFadeInMs = 130;  // was 180
 constexpr float kPad = 16.0f;  // logical px of margin a panel window keeps around its visual
 
 namespace detail {
