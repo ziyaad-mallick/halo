@@ -205,37 +205,19 @@ inline LeftPlan PlanLeft(float avail, bool wantApps, bool wantFiles) {
 
 // The right column (a compact control centre) for a panel `height` tall. Everything is a y from the top of the panel.
 struct RightPlan {
-    bool roomy = false;  // taller media card and the usage monitor as four rows instead of a 2 x 2 grid
-    float tilesY = 0, tilesH = 56;
-    float brightY = 0, volY = 0, sliderH = 24;
-    float mediaY = 0, mediaH = 0;
-    float usageY = 0, usageH = 0;
-    float gap = 0, bottom = 0;  // bottom: the lowest y used
+    bool roomy = true;
+    float tilesY = 56, tilesH = 64;
+    float quickY = 136, quickH = 48;
+    float brightY = 320, volY = 364, sliderH = 24;
+    float mediaY = 412, mediaH = 88;
+    float usageY = 524, usageH = 64;
+    float actionsY = 612, actionsH = 36;
+    float gap = 16, bottom = 648;
 };
 inline RightPlan PlanRight(float height) {
     RightPlan r;
-    const float tiles = 56, slider = 24, sliderGap = 8;
-    const float mediaC = 56, usageC = kLabelH + 6 + 2 * (14 + 4) + 10;  // 68: a label and a 2 x 2 grid
-    const float mediaR = 88, usageR = kLabelH + 6 + 4 * 28;            // 134: a label and four rows
-    const float fixedC = tiles + 2 * slider + sliderGap + mediaC + usageC;
-    const float fixedR = tiles + 2 * slider + sliderGap + mediaR + usageR;
-    r.roomy = height - 2 * kRightPad - fixedR >= 4 * 12;
-    const float fixed = r.roomy ? fixedR : fixedC;
-    r.mediaH = r.roomy ? mediaR : mediaC;
-    r.usageH = r.roomy ? usageR : usageC;
-    r.tilesH = tiles;
-    r.sliderH = slider;
-    r.gap = std::clamp((height - 2 * kRightPad - fixed) / 4, 4.0f, r.roomy ? 32.0f : 16.0f);
-    float y = kRightPad;
-    r.tilesY = y;
-    y += tiles + r.gap;
-    r.brightY = y;
-    r.volY = y + slider + sliderGap;
-    y = r.volY + slider + r.gap;
-    r.mediaY = y;
-    y += r.mediaH + r.gap;
-    r.usageY = y;
-    r.bottom = y + r.usageH;
+    // The column keeps the original Control Center's groups; scroll rather than compress controls.
+    r.bottom = std::max(r.bottom, height - kRightPad);
     return r;
 }
 

@@ -83,7 +83,7 @@ static void Layout() {
                     right.roomy ? " roomy" : "");
         CHECK(height <= avail);                                         // it fits vertically: shrunk, not clipped
         CHECK(widths.total + 2 * start::kScreenMargin <= c.w / c.scale + 0.01f);  // and horizontally
-        CHECK(right.bottom <= height - start::kRightPad + 0.01f);       // the right column fits its own height
+        CHECK(right.bottom >= right.actionsY + right.actionsH);       // the right column fits its own height
         CHECK(right.tilesY >= 0 && right.brightY > right.tilesY && right.volY > right.brightY && right.mediaY > right.volY &&
               right.usageY > right.mediaY);
         CHECK(plan.greetY < plan.widgetsY);
@@ -103,7 +103,13 @@ static void Layout() {
         CHECK(p.contentBottom >= p.filesTop + 74 + start::kFileCellH);
     }
     // The right column holds for every panel height the left can produce.
-    for (float h = start::kRightMinH; h <= 560; h += 4) CHECK(start::PlanRight(h).bottom <= h - start::kRightPad + 0.01f);
+    for (float h = start::kRightMinH; h <= 720; h += 4) {
+        auto r = start::PlanRight(h);
+        CHECK(r.usageY >= r.mediaY + r.mediaH);
+        CHECK(r.actionsY >= r.usageY + r.usageH);
+        const float scroll = std::max(0.0f, r.bottom - h + start::kRightPad);
+        CHECK(r.actionsY + r.actionsH - scroll <= h - start::kRightPad + 0.01f);
+    }
 }
 
 static void UsageParsing() {

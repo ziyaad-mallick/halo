@@ -709,6 +709,7 @@ void Launcher::Build() {
         m_plan = start::PlanLeft(start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s),
                                  maxApps > 0, maxFiles > 0);
         m_homeScroll = 0;
+        m_rightScroll = 0;
     }
     m_showApps = maxApps > 0;
     m_showFiles = maxFiles > 0;
@@ -2027,6 +2028,14 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                     return 0;
                 }
             }
+            if (m_open && m_h2 && !m_menuOpen && m_detail == Detail::None) {
+                POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
+                ScreenToClient(m_hwnd, &p);
+                if (p.x - m_shadowM >= m_lw) {
+                    ScrollRight(-GET_WHEEL_DELTA_WPARAM(w) * ui::kS6 * m_s / WHEEL_DELTA);
+                    return 0;
+                }
+            }
             if (m_open && m_h2 && !m_menuOpen && m_detail != Detail::None) {  // over the right column the radio list scrolls
                 POINT p;
                 if (GetCursorPos(&p) && ScreenToClient(m_hwnd, &p) && p.x - m_shadowM >= m_lw) {
@@ -2262,6 +2271,13 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
     }
 }
 
+void Launcher::ScrollRight(float delta) {
+    m_rightScroll = std::clamp(m_rightScroll + delta, 0.0f, std::max(0.0f, m_rplan.bottom * m_s - m_h + start::kRightPad * m_s));
+    LayoutRight();
+    m_ccHover = -1;
+    RedrawRight();
+}
+
 void Launcher::ScrollHome(float delta) {
     m_homeScroll = std::clamp(m_homeScroll + delta, 0.0f, std::max(0.0f, m_plan.contentBottom * m_s - m_bodyBottom));
     BuildBody();
@@ -2316,6 +2332,9 @@ void Launcher::CycleMode() {
 void Launcher::StartServices() {
     if (!m_h2) return;
     m_servicesOn = true;
+    m_dnd = svc::ReadDnd();
+    m_night = svc::ReadNightLight();
+    m_dark = svc::ReadDarkMode();
     m_speaker.Bind(eRender, m_hwnd, kMsgAudio);
     m_vol = m_speaker.Available() ? m_speaker.Volume() : 0.0f;
     m_muted = m_speaker.Available() && m_speaker.Muted();
@@ -2416,6 +2435,7 @@ int Launcher::CcIndexOf(Kind kind, int index) const {
 }
 
 Launcher::Hit const* Launcher::CcHitAt(float x, float y) const {
+    if (y < start::kRightPad * m_s || y >= m_h - start::kRightPad * m_s) return nullptr;
     for (size_t i = m_ccHits.size(); i-- > 0;)  // later entries sit on top of earlier ones (a chevron on its tile)
         if (In(m_ccHits[i].r, x, y)) return &m_ccHits[i];
     return nullptr;
@@ -2426,7 +2446,10 @@ void Launcher::LayoutRight() {
     const float s = m_s, pad = start::kRightPad * s, x0 = m_lw + pad, x1 = m_w - pad;
     auto const& p = m_rplan;
     m_ccHits.clear();
-    auto add = [&](Kind k, int i, D2D1_RECT_F r) { m_ccHits.push_back({r, k, i}); };
+    auto add = [&](Kind k, int i, D2D1_RECT_F r) {
+        if (m_detail == Detail::None) { r.top -= m_rightScroll; r.bottom -= m_rightScroll; }
+        m_ccHits.push_back({r, k, i});
+    };
 
     const float tileGap = ui::kS2 * s, tw = (x1 - x0 - tileGap) / 2, ty0 = p.tilesY * s, ty1 = (p.tilesY + p.tilesH) * s;
     const D2D1_RECT_F wifi = R(x0, ty0, x0 + tw, ty1), bt = R(x1 - tw, ty0, x1, ty1);
@@ -2437,6 +2460,21 @@ void Launcher::LayoutRight() {
     add(Kind::CcBtMore, 0, more(bt));
 
     if (m_detail == Detail::None) {
+        for (int i = 0; i < 6; ++i) {
+            const float x = i % 2 ? x1 - tw : x0;
+            const float y = (p.quickY + (i / 2) * (p.quickH + ui::kS2)) * s;
+            add(Kind::CcQuick, i, R(x, y, x + tw, y + p.quickH * s));
+        }
+        const float step = (x1 - x0) / 6;
+        for (int i = 0; i < 6; ++i)
+            add(Kind::CcAction, i, R(x0 + i * step, p.actionsY * s, x0 + i * step + p.actionsH * s, (p.actionsY + p.actionsH) * s));
+        m_usageRect.top = p.usageY * s - m_rightScroll;
+        m_usageRect.bottom = m_usageRect.top + p.usageH * s;
+        m_usageVisual.Offset({m_usageRect.left, m_usageRect.top, 0});
+        auto usageClip = m_comp.CreateInsetClip();
+        usageClip.TopInset(std::max(0.0f, pad - m_usageRect.top));
+        usageClip.BottomInset(std::max(0.0f, m_usageRect.bottom - (m_h - pad)));
+        m_usageVisual.Clip(usageClip);
         const float bh = p.sliderH * s;
         add(Kind::CcBright, 0, R(x0, p.brightY * s, x1, p.brightY * s + bh));
         add(Kind::CcVol, 0, R(x0, p.volY * s, x1, p.volY * s + bh));
@@ -2501,6 +2539,13 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
     // The hairline between the columns.
     dc->FillRectangle(R(ox, oy + start::kRightPad * s, ox + std::max(1.0f, std::round(s)), oy + m_h - start::kRightPad * s), c.line.get());
 
+    dc->PushAxisAlignedClip(R(ox + start::kRightPad * s, oy + start::kRightPad * s,
+                              ox + m_w - m_lw - start::kRightPad * s, oy + m_h - start::kRightPad * s), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    if (m_detail == Detail::None) {
+        auto title = txt.Format(ui::kFontDisplay, ui::kHeading * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        txt.Draw(dc, L"Control Center", title.get(), R(ox + start::kRightPad * s, oy + 24 * s - m_rightScroll,
+                 ox + m_w - m_lw - start::kRightPad * s, oy + 48 * s - m_rightScroll), c.ink.get());
+    }
     const float tileR = ui::kRadiusLarge * s;
     for (size_t i = 0; i < m_ccHits.size(); i++) {
         auto const& h = m_ccHits[i];
@@ -2508,6 +2553,23 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
         const bool hot = static_cast<int>(i) == m_ccHover;
         const float h2 = (r.bottom - r.top) / 2;
         switch (h.kind) {
+            case Kind::CcQuick: {
+                static const wchar_t* labels[] = {L"Airplane mode", L"Hotspot", L"Do not disturb", L"Night light", L"Dark mode", L"Sound output"};
+                static const wchar_t icons[] = {0xE709, 0xECF0, 0xE708, 0xF08C, 0xE708, 0xE767};
+                const bool on = h.index == 2 ? m_dnd : h.index == 3 ? m_night : h.index == 4 ? m_dark : false;
+                pill(r, ui::kRadiusSmall * s, on ? c.accent.get() : hot ? c.hover.get() : c.fill.get());
+                auto ink = on ? c.onAccent.get() : c.ink.get();
+                glyph(icons[h.index], R(r.left + 8 * s, r.top, r.left + 36 * s, r.bottom), ink, fIcon.get());
+                txt.Draw(dc, labels[h.index], fSub.get(), R(r.left + 40 * s, r.top, r.right - 8 * s, r.bottom), ink,
+                         DWRITE_TEXT_ALIGNMENT_LEADING, true);
+                break;
+            }
+            case Kind::CcAction: {
+                static const wchar_t icons[] = {0xE720, 0xE8A7, 0xE95A, 0xE713, 0xE72E, 0xE7E8};
+                if (hot) pill(r, ui::kRadiusSmall * s, c.hover.get());
+                glyph(icons[h.index], r, c.soft.get(), fIcon.get());
+                break;
+            }
             case Kind::CcWifi:
             case Kind::CcBt: {
                 const bool wifi = h.kind == Kind::CcWifi;
@@ -2608,7 +2670,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
 
     if (m_detail == Detail::None) {  // the now-playing card sits under the sliders
         const float x0 = m_lw + start::kRightPad * s, x1 = m_w - start::kRightPad * s;
-        auto r = at(R(x0, m_rplan.mediaY * s, x1, (m_rplan.mediaY + m_rplan.mediaH) * s));
+        auto r = at(R(x0, m_rplan.mediaY * s - m_rightScroll, x1, (m_rplan.mediaY + m_rplan.mediaH) * s - m_rightScroll));
         pill(r, tileR, c.fill.get());
         dc->DrawRoundedRectangle(D2D1::RoundedRect(R(r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f), tileR, tileR), c.line.get(), 1.0f);
         auto const& ms = m_media.State();
@@ -2648,6 +2710,13 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
         const float mid = Mid(tr.top, tr.bottom);
         txt.Draw(dc, title, fName.get(), R(tr.left, mid - 18 * s, tr.right, mid), ms.has ? c.ink.get() : c.soft.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
         txt.Draw(dc, artist, fSub.get(), R(tr.left, mid, tr.right, mid + 18 * s), c.dim.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        // Paint transport controls above the media plate.
+        for (auto const& hit : m_ccHits) {
+            if (hit.kind != Kind::CcPrev && hit.kind != Kind::CcPlay && hit.kind != Kind::CcNext) continue;
+            auto button = at(hit.r);
+            const wchar_t icon = hit.kind == Kind::CcPrev ? 0xE892 : hit.kind == Kind::CcNext ? 0xE893 : ms.playing ? 0xE769 : 0xE768;
+            glyph(icon, button, ms.has ? c.ink.get() : c.dim.get(), fIcon.get());
+        }
     } else {  // the list's message when it has no rows
         const bool wifi = m_detail == Detail::Wifi;
         const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
@@ -2692,9 +2761,10 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
         else if (h.kind == Kind::CcBack || h.kind == Kind::CcRefresh || h.kind == Kind::CcRow) rad = ui::kRadiusSmall * s;
         dc->DrawRoundedRectangle(D2D1::RoundedRect(Inflate(r, 2 * s), rad + 2 * s, rad + 2 * s), c.accent.get(), 2.0f * s);
     }
+    dc->PopAxisAlignedClip();
 }
 
-// RAM, CPU, GPU, disk: a percentage and a thin bar each. A 2 x 2 grid, or four rows when the panel is tall.
+// Concise RAM, CPU, GPU and disk percentages in a fixed 2 x 2 grid.
 void Launcher::DrawUsage(ID2D1DeviceContext* dc, float ox, float oy) {
     const float s = m_s;
     Text txt{m_dwrite};
@@ -2716,17 +2786,10 @@ void Launcher::DrawUsage(ID2D1DeviceContext* dc, float ox, float oy) {
         txt.Draw(dc, row.name, fRow.get(), R(x, y, x + cw, y + 14 * s), c.soft.get());
         txt.Draw(dc, row.has ? std::to_wstring(static_cast<int>(std::lround(row.value))) + L"%" : std::wstring(L"—"), fLabel.get(),
                  R(x, y, x + cw, y + 14 * s), c.ink.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
-        const float by = y + 18 * s, bh = 4 * s;
-        dc->FillRoundedRectangle(D2D1::RoundedRect(R(x, by, x + cw, by + bh), bh / 2, bh / 2), c.track.get());
-        if (row.has && row.value > 0)
-            dc->FillRoundedRectangle(D2D1::RoundedRect(R(x, by, x + std::max(bh, cw * row.value / 100.0f), by + bh), bh / 2, bh / 2), c.accent.get());
     };
-    if (m_rplan.roomy) {
-        for (int i = 0; i < 4; i++) one(rows[i], ox, top + i * 28 * s, w);
-    } else {
-        const float gap = ui::kS3 * s, cw = (w - gap) / 2;
-        for (int i = 0; i < 4; i++) one(rows[i], ox + (i % 2) * (cw + gap), top + (i / 2) * 28 * s, cw);
-    }
+    const float gap = ui::kS4 * s, cw = (w - gap) / 2;
+    for (int i = 0; i < 4; i++) one(rows[i], ox + (i % 2) * (cw + gap), top + (i / 2) * ui::kS6 * s, cw);
+
 }
 
 // ---- Right: input ---------------------------------------------------------------------------------------------------
@@ -2756,7 +2819,32 @@ void Launcher::ToggleDetail(Detail d) {
 }
 
 void Launcher::CcClick(Hit const& hit) {
+    if ((hit.kind == Kind::CcQuick || hit.kind == Kind::CcAction) && (m_dryRun || svc::DryRun())) {
+        Log(L"control action: DRY RUN");
+        return;
+    }
     switch (hit.kind) {
+        case Kind::CcQuick:
+            switch (hit.index) {
+                case 0: Hide(); OpenQuietly(L"ms-settings:network-airplanemode"); return;
+                case 1: Hide(); OpenQuietly(L"ms-settings:network-mobilehotspot"); return;
+                case 2: svc::SetDnd(!m_dnd); m_dnd = svc::ReadDnd(); break;
+                case 3: svc::SetNightLight(!m_night); m_night = svc::ReadNightLight(); break;
+                case 4: svc::SetDarkMode(!m_dark); m_dark = svc::ReadDarkMode(); break;
+                case 5: Hide(); OpenQuietly(L"ms-settings:sound"); return;
+            }
+            break;
+        case Kind::CcAction:
+            if (hit.index == 5) { ToggleMenu(true); return; }
+            Hide();
+            switch (hit.index) {
+                case 0: OpenQuietly(L"ms-settings:sound"); break;
+                case 1: OpenQuietly(L"ms-screenclip:"); break;
+                case 2: OpenQuietly(L"ms-settings-connectabledevices:devicediscovery"); break;
+                case 3: OpenQuietly(L"ms-settings:"); break;
+                case 4: if (!m_dryRun && !svc::DryRun()) LockWorkStation(); break;
+            }
+            return;
         case Kind::CcWifi:
             if (!m_radios.HasWifi()) return;
             m_wifiOn = !m_wifiOn;
@@ -2899,6 +2987,12 @@ void Launcher::CcKey(WPARAM vk) {
     }
     if (best >= 0) {
         m_ccFocus = best;
+        if (m_detail == Detail::None) {
+            const auto r = m_ccHits[best].r;
+            const float pad = start::kRightPad * m_s;
+            if (r.top < pad) ScrollRight(r.top - pad);
+            else if (r.bottom > m_h - pad) ScrollRight(r.bottom - m_h + pad);
+        }
         if (m_ccHits[best].kind == Kind::CcRow) {  // keep a row off the edge of what shows
         }
         RedrawRight();
