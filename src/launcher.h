@@ -30,6 +30,9 @@
 #include <vector>
 
 #include "icons.h"
+#include "services.h"
+#include "start_widgets.h"
+#include "usage.h"
 #include "settings.h"
 
 namespace halo {
@@ -80,7 +83,8 @@ public:
     void Raise();                // back to the top of the topmost band
 
 private:
-    enum class Kind { App, File, Result, Settings, Power, MenuItem, AllApps };
+    enum class Kind { App, File, Result, Settings, Power, MenuItem, AllApps,
+                      PowerMode, CcWifi, CcWifiMore, CcBt, CcBtMore, CcBright, CcVol, CcMute, CcPrev, CcPlay, CcNext, CcBack, CcRefresh, CcRow };
     struct Hit {
         D2D1_RECT_F r;
         Kind kind;
@@ -130,6 +134,7 @@ private:
     bool ListHeader() const { return m_allApps && m_query.empty(); }
     float ListTop() const;
     int ListRows() const;
+    void LayoutRight();  // the right column's hit rects for the current state (home or a radio list)
     void QueryChanged();
     void SearchDraw();  // search bar text + caret
     void Activate(Kind kind, int index);
@@ -150,6 +155,63 @@ private:
     void RunPower(int item);
     void Close();  // after the fade
     void ShowDim(bool on);
+
+    // ---- HALO 2.0 (settings.halo2): the wider two-column panel. Left = Start plus a widget strip; right = a compact
+    // control centre on the same services the Control Center uses. With halo2 off none of this runs. ----
+    enum class Detail { None, Wifi, Bt };
+    float PanelX() const;                  // the panel's left edge in screen px (halo2 sits on the left of the screen)
+    float CornerX() const;                 // where along the panel the swoop grows from (the dock is under it)
+    void BuildRight(float rightW);         // the right column's visuals, hit rects and first paint
+    void DrawWidgets(ID2D1DeviceContext* dc, float ox, float oy);  // greeting, quote, clock, month, battery, power mode
+    void DrawRight(ID2D1DeviceContext* dc, float ox, float oy);    // tiles, sliders, now playing / the radio list
+    void DrawUsage(ID2D1DeviceContext* dc, float ox, float oy);    // the usage monitor
+    void RedrawRight();
+    void RedrawUsage();
+    void RedrawBody();
+    void StartServices();                  // on Show: bind audio, radios, media, brightness; start the 1 Hz sampler
+    void StopServices();                   // on Close: nothing runs while Start is closed
+    void RefreshWidgets();                 // time, battery, power mode; re-armed once a minute while open
+    void ArmClock();
+    void CycleMode();
+    void ToggleDetail(Detail d);
+    void CcClick(Hit const& hit);
+    void CcDrag(float x);                  // slider drag (panel coords)
+    void CcKey(WPARAM vk);                 // keys while the right column has focus
+    void SetCol(int col);
+    Hit const* CcHitAt(float x, float y) const;
+    int CcIndexOf(Kind kind, int index) const;
+    void OnServiceMessage(UINT m);
+
+    bool m_h2 = false;
+    float m_lw = 0;                        // the left column's width (== m_w without halo2)
+    start::LeftPlan m_plan;
+    start::RightPlan m_rplan;
+    D2D1_RECT_F m_greetRect{}, m_cardRect{}, m_calRect{}, m_modeRect{}, m_rightRect{};
+    float m_rightW = 0;
+    svc::Battery m_battery;
+    svc::PowerMode m_mode = svc::PowerMode::Unknown;
+    svc::AudioEndpoint m_speaker;
+    svc::Radios m_radios;
+    svc::Media m_media;
+    usage::Sampler m_sampler;
+    usage::Sample m_use;
+    bool m_wifiOn = false, m_btOn = false, m_muted = false, m_servicesOn = false;
+    std::wstring m_ssid;
+    float m_vol = 0;
+    int m_bright = -1;
+    Detail m_detail = Detail::None;
+    std::vector<svc::WifiNet> m_wifiRows;
+    std::vector<svc::BtDevice> m_btRows;
+    int m_ccScroll = 0;                    // first visible row of the radio list
+    int m_ccRowsFit = 0;
+    std::vector<Hit> m_ccHits;             // the right column's controls (panel coords), in tab order
+    wuc::CompositionDrawingSurface m_ccSurface{nullptr}, m_usageSurface{nullptr};
+    wuc::SpriteVisual m_usageVisual{nullptr};
+    D2D1_RECT_F m_usageRect{};             // panel coords
+    int m_ccHover = -1, m_ccFocus = -1;    // indices into m_ccHits
+    int m_col = 0;                         // 0 = left (search), 1 = right (controls); Tab switches
+    int m_drag = 0;                        // 0 none, else the Kind of the slider being dragged
+    ULONGLONG m_lastBrightSet = 0;
 
     wuc::Compositor m_comp;
     wuc::CompositionGraphicsDevice m_gdev;
