@@ -1,10 +1,9 @@
 // System services behind the Control Center: audio endpoints, battery and power mode,
 // brightness (WMI), Wi-Fi / Bluetooth radios, Do Not Disturb, and Now Playing.
 //
-// Threading: everything here is called on the UI thread. Anything that fires on a foreign
-// thread (audio callbacks, radio and GSMTC events) only PostMessages to the HWND it was
-// given and touches no shared state, so there are no locks and no listener runs while the
-// panel is closed: the panel binds on open and unbinds on close.
+// UI clients own audio/radio/media objects. Discovery workers and watcher callbacks publish
+// mutex-protected value snapshots and PostMessage their updates; callers copy those snapshots
+// on the UI thread. Generation/session guards discard work after discovery is stopped.
 #pragma once
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -12,6 +11,7 @@
 #include <winrt/base.h>
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Media.Control.h>
+#include "radio_policy.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -119,18 +119,27 @@ struct WifiNet {
     std::wstring ssid;
     int bars = 0;
     bool secure = true, connected = false;
+    std::wstring profileName;
+    GUID interfaceId{};
 };
 struct BtDevice {
     std::wstring name;
     bool connected = false;
 };
-void WifiRefresh(HWND notify, UINT msg);  // posts `msg` twice: the cached report, then the scan
+using DiscoveryPhase = radio_policy::DiscoveryPhase;
+struct DiscoveryStatus {
+    DiscoveryPhase phase = DiscoveryPhase::Idle;
+    DWORD error = ERROR_SUCCESS;
+};
+void WifiRefresh(HWND notify, UINT msg);  // async scan; one final status/list notification
 void WifiStop();
-std::vector<WifiNet> const& WifiNets();
-void WifiConnect(std::wstring const& ssid);
+std::vector<WifiNet> WifiNets();
+DiscoveryStatus WifiStatus();
+bool WifiConnect(WifiNet const& network);  // true means accepted; unknown profiles open Windows Wi-Fi Settings
 void BtRefresh(HWND notify, UINT msg);
 void BtStop();
-std::vector<BtDevice> const& BtDevices();
+std::vector<BtDevice> BtDevices();
+DiscoveryStatus BtStatus();
 
 // ---- Now Playing (GSMTC) ------------------------------------------------------------------
 struct MediaState {

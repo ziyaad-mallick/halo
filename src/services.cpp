@@ -12,13 +12,17 @@
 #include <wlanapi.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
 #include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <wincodec.h>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace halo::svc {
 namespace {
@@ -407,8 +411,19 @@ winrt::fire_and_forget Radios::Set(wdr::Radio radio, bool on, HWND notify, UINT 
 
 std::wstring ConnectedSsid() {
     try {
-        auto profile = winrt::Windows::Networking::Connectivity::NetworkInformation::GetInternetConnectionProfile();
-        if (profile && profile.IsWlanConnectionProfile()) return profile.ProfileName().c_str();
+        namespace wnc = winrt::Windows::Networking::Connectivity;
+        for (auto const& profile : wnc::NetworkInformation::GetConnectionProfiles()) {
+            try {
+                if (profile.IsWlanConnectionProfile() &&
+                    profile.GetNetworkConnectivityLevel() != wnc::NetworkConnectivityLevel::None) {
+                    auto details = profile.WlanConnectionProfileDetails();
+                    if (details) {
+                        std::wstring ssid = details.GetConnectedSsid().c_str();
+                        if (!ssid.empty()) return ssid;
+                    }
+                }
+            } catch (...) {}  // an unavailable adapter must not hide another adapter's connection
+        }
     } catch (...) {}
     return {};
 }
@@ -544,85 +559,648 @@ void SetHotspot(bool on) {
     HotspotSet(on);
 }
 
-// ---- Wi-Fi networks and paired Bluetooth devices -----------------------------------------------------
+// ---- Wi-Fi discovery and paired Bluetooth devices -----------------------------------------------
 namespace {
-std::vector<WifiNet> g_nets;
-std::vector<BtDevice> g_bt;
+using radio_policy::DiscoveryPhase;
+
+std::mutex g_wifiMutex, g_wifiScanMutex;
+std::vector<WifiNet> g_wifiNets;
+DiscoveryStatus g_wifiStatus;
+std::atomic<unsigned> g_wifiGen{0};
+HWND g_wifiNotify{};
+UINT g_wifiMsg{};
+
+struct ScanSignal {
+    std::mutex mutex;
+    std::condition_variable changed;
+    GUID interfaceId{};
+    bool complete = false, cancelled = false;
+    DWORD result = ERROR_SUCCESS;
+};
+std::weak_ptr<ScanSignal> g_activeWifiScan;
+std::mutex g_scanRegistryMutex;
+std::unordered_map<void*, std::weak_ptr<ScanSignal>> g_scanRegistry;
+
+VOID WINAPI WlanNotify(PWLAN_NOTIFICATION_DATA data, PVOID context) {
+    if (!data || data->NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM ||
+        (data->NotificationCode != wlan_notification_acm_scan_complete &&
+         data->NotificationCode != wlan_notification_acm_scan_fail)) return;
+    std::shared_ptr<ScanSignal> signal;
+    {
+        std::lock_guard lock(g_scanRegistryMutex);
+        auto it = g_scanRegistry.find(context);
+        if (it != g_scanRegistry.end()) signal = it->second.lock();
+    }
+    if (!signal) return;
+    std::lock_guard lock(signal->mutex);
+    if (!IsEqualGUID(signal->interfaceId, data->InterfaceGuid)) return;
+    signal->complete = true;
+    signal->result = data->NotificationCode == wlan_notification_acm_scan_complete ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+    signal->changed.notify_all();
+}
+
+struct WlanNotificationRegistration {
+    HANDLE handle{};
+    std::shared_ptr<ScanSignal> signal;
+    bool active = false;
+    void Reset() {
+        if (!active) return;
+        WlanRegisterNotification(handle, WLAN_NOTIFICATION_SOURCE_NONE, TRUE, nullptr, nullptr, nullptr, nullptr);
+        {
+            std::lock_guard lock(g_scanRegistryMutex);
+            g_scanRegistry.erase(signal.get());
+        }
+        active = false;
+    }
+    ~WlanNotificationRegistration() { Reset(); }
+};
+
+struct WlanHandle {
+    HANDLE value{};
+    ~WlanHandle() { if (value) WlanCloseHandle(value, nullptr); }
+    DWORD Open() {
+        DWORD version = 0;
+        return WlanOpenHandle(2, nullptr, &version, &value);
+    }
+};
+
+struct WlanMemory {
+    void* value{};
+    ~WlanMemory() { if (value) WlanFreeMemory(value); }
+    template<typename T> T* as() const { return static_cast<T*>(value); }
+};
+
+bool WlanProfileConnected(GUID const& interfaceId, std::wstring const& profileName, DWORD& error) {
+    WlanHandle wlan;
+    error = wlan.Open();
+    if (error != ERROR_SUCCESS) return false;
+    WlanMemory connection;
+    DWORD bytes = 0;
+    error = WlanQueryInterface(wlan.value, &interfaceId, wlan_intf_opcode_current_connection, nullptr,
+                               &bytes, &connection.value, nullptr);
+    if (error != ERROR_SUCCESS) return false;
+    auto attributes = connection.as<WLAN_CONNECTION_ATTRIBUTES>();
+    return attributes && attributes->isState == wlan_interface_state_connected &&
+           profileName == attributes->strProfileName;
+}
+
+void WifiConnectionReadback(unsigned gen, HWND notify, UINT msg, std::wstring profileName, GUID interfaceId) {
+    try {
+        for (int attempt = 0; attempt < 10 && gen == g_wifiGen.load(); ++attempt) {
+            Sleep(1000);
+            if (gen != g_wifiGen.load()) return;
+            DWORD error = ERROR_SUCCESS;
+            if (!WlanProfileConnected(interfaceId, profileName, error)) {
+                if (error == ERROR_ACCESS_DENIED) {
+                    {
+                        std::lock_guard lock(g_wifiMutex);
+                        if (gen == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::AccessDenied, error};
+                    }
+                    if (notify) PostMessageW(notify, msg, 0, 0);
+                    return;
+                }
+                continue;
+            }
+            {
+                std::lock_guard lock(g_wifiMutex);
+                if (gen != g_wifiGen.load()) return;
+                for (auto& net : g_wifiNets)
+                    net.connected = net.interfaceId == interfaceId && net.profileName == profileName;
+                g_wifiStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
+            }
+            if (notify) PostMessageW(notify, msg, 0, 0);
+            return;
+        }
+        {
+            std::lock_guard lock(g_wifiMutex);
+            if (gen != g_wifiGen.load()) return;
+            g_wifiStatus = {DiscoveryPhase::Failed, ERROR_TIMEOUT};
+        }
+        if (notify) PostMessageW(notify, msg, 0, 0);
+    } catch (...) {
+        std::lock_guard lock(g_wifiMutex);
+        if (gen == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
+        if (notify) PostMessageW(notify, msg, 0, 0);
+    }
+}
+
+std::wstring SsidText(DOT11_SSID const& ssid) {
+    if (!ssid.uSSIDLength || ssid.uSSIDLength > DOT11_SSID_MAX_LENGTH) return {};
+    auto bytes = reinterpret_cast<char const*>(ssid.ucSSID);
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, static_cast<int>(ssid.uSSIDLength), nullptr, 0);
+    if (n > 0) {
+        std::wstring out(static_cast<size_t>(n), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, static_cast<int>(ssid.uSSIDLength), out.data(), n);
+        return out;
+    }
+    // SSIDs are octet strings, not required to be UTF-8. Preserve every byte for display/matching.
+    std::wstring out;
+    out.reserve(ssid.uSSIDLength);
+    for (ULONG i = 0; i < ssid.uSSIDLength; ++i) out.push_back(static_cast<wchar_t>(ssid.ucSSID[i]));
+    return out;
+}
+
+void FinishWifi(unsigned gen, HWND notify, UINT msg, std::vector<WifiNet> nets, DWORD error, bool hadAdapter, bool hadSuccess = false) {
+    if (gen != g_wifiGen.load()) return;
+    std::stable_sort(nets.begin(), nets.end(), [](WifiNet const& a, WifiNet const& b) {
+        return a.connected > b.connected;
+    });
+    {
+        std::lock_guard lock(g_wifiMutex);
+        if (gen != g_wifiGen.load()) return;
+        g_wifiNets = std::move(nets);
+        g_wifiStatus = {hadSuccess || error == ERROR_SUCCESS ? DiscoveryPhase::Ready :
+                        !hadAdapter && error == ERROR_NOT_FOUND ? DiscoveryPhase::Unavailable :
+                        radio_policy::PhaseForWlanError(error), error};
+        g_activeWifiScan.reset();
+    }
+    if (notify) PostMessageW(notify, msg, 0, 0);
+}
+
+void WifiScanTaskBody(unsigned gen, HWND notify, UINT msg, std::shared_ptr<ScanSignal> signal) {
+    std::unique_lock scanLock(g_wifiScanMutex);
+    auto cancelled = [&] { return gen != g_wifiGen.load(); };
+    if (cancelled()) return;
+
+    std::vector<WifiNet> nets;
+    DWORD firstError = ERROR_SUCCESS;
+    bool hadAdapter = false, hadSuccess = false;
+    WlanHandle wlan;
+    DWORD error = wlan.Open();
+    if (error != ERROR_SUCCESS) {
+        FinishWifi(gen, notify, msg, {}, error, false);
+        return;
+    }
+    WlanMemory interfaces;
+    error = WlanEnumInterfaces(wlan.value, nullptr, reinterpret_cast<PWLAN_INTERFACE_INFO_LIST*>(&interfaces.value));
+    auto list = interfaces.as<WLAN_INTERFACE_INFO_LIST>();
+    if (error != ERROR_SUCCESS) {
+        FinishWifi(gen, notify, msg, {}, error, false);
+        return;
+    }
+    if (!list || !list->dwNumberOfItems) {
+        FinishWifi(gen, notify, msg, {}, ERROR_NOT_FOUND, false);
+        return;
+    }
+    hadAdapter = true;
+    {
+        std::lock_guard lock(g_scanRegistryMutex);
+        g_scanRegistry[signal.get()] = signal;
+    }
+    DWORD previousSources = 0;
+    error = WlanRegisterNotification(wlan.value, WLAN_NOTIFICATION_SOURCE_ACM, TRUE, WlanNotify,
+                                     signal.get(), nullptr, &previousSources);
+    if (error != ERROR_SUCCESS) {
+        { std::lock_guard lock(g_scanRegistryMutex); g_scanRegistry.erase(signal.get()); }
+        FinishWifi(gen, notify, msg, {}, error, hadAdapter);
+        return;
+    }
+    WlanNotificationRegistration registration{wlan.value, signal, true};
+
+    for (DWORD i = 0; i < list->dwNumberOfItems && !cancelled(); ++i) {
+        auto const& iface = list->InterfaceInfo[i];
+        {
+            std::lock_guard lock(signal->mutex);
+            signal->interfaceId = iface.InterfaceGuid;
+            signal->complete = false;
+            signal->cancelled = false;
+            signal->result = ERROR_SUCCESS;
+        }
+        error = WlanScan(wlan.value, &iface.InterfaceGuid, nullptr, nullptr, nullptr);
+        if (error == ERROR_SUCCESS) {
+            std::unique_lock lock(signal->mutex);
+            bool ended = signal->changed.wait_for(lock, std::chrono::seconds(4), [&] {
+                return signal->complete || signal->cancelled || cancelled();
+            });
+            if (signal->cancelled || cancelled()) break;
+            error = ended ? signal->result : ERROR_TIMEOUT;
+        }
+        if (error == ERROR_SUCCESS) {
+            WlanMemory available;
+            auto status = WlanGetAvailableNetworkList(wlan.value, &iface.InterfaceGuid, 0, nullptr,
+                    reinterpret_cast<PWLAN_AVAILABLE_NETWORK_LIST*>(&available.value));
+            if (status == ERROR_SUCCESS) {
+                hadSuccess = true;
+                auto networks = available.as<WLAN_AVAILABLE_NETWORK_LIST>();
+                for (DWORD j = 0; networks && j < networks->dwNumberOfItems; ++j) {
+                    auto const& item = networks->Network[j];
+                    auto ssid = SsidText(item.dot11Ssid);
+                    if (ssid.empty()) continue;
+                    std::wstring profile = item.strProfileName;
+                    nets.push_back({std::move(ssid), radio_policy::SignalBars(item.wlanSignalQuality),
+                                    item.bSecurityEnabled != FALSE,
+                                    (item.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) != 0,
+                                    std::move(profile), iface.InterfaceGuid});
+                }
+                error = ERROR_SUCCESS;
+            } else error = status;
+        }
+        if (error != ERROR_SUCCESS && firstError == ERROR_SUCCESS) firstError = error;
+    }
+
+    registration.Reset();
+    if (!cancelled()) {
+        DWORD result = hadSuccess ? firstError : firstError == ERROR_SUCCESS ? ERROR_GEN_FAILURE : firstError;
+        FinishWifi(gen, notify, msg, std::move(nets), result, hadAdapter, hadSuccess);
+    }
+}
+
+void WifiScanTask(unsigned gen, HWND notify, UINT msg, std::shared_ptr<ScanSignal> signal) {
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (winrt::hresult_error const& e) {
+        FinishWifi(gen, notify, msg, {}, static_cast<DWORD>(e.code()), false);
+        return;
+    } catch (...) {
+        FinishWifi(gen, notify, msg, {}, ERROR_GEN_FAILURE, false);
+        return;
+    }
+    struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
+    try {
+        WifiScanTaskBody(gen, notify, msg, std::move(signal));
+    } catch (winrt::hresult_error const& e) {
+        FinishWifi(gen, notify, msg, {}, static_cast<DWORD>(e.code()), true);
+    } catch (...) {
+        FinishWifi(gen, notify, msg, {}, ERROR_GEN_FAILURE, true);
+    }
+}
+
+std::mutex g_btMutex;
+std::vector<BtDevice> g_btDevices;
+DiscoveryStatus g_btStatus;
 unsigned g_btGen = 0;
 
-// Saved Wi-Fi profiles via the WLAN API. Scanning for new networks needs location permission since
-// Windows 11 24H2 (WiFiAdapter answers "Access is denied" for an unpackaged app), so the list is the
-// networks this PC already knows; joining one is WlanConnect on its profile.
-GUID g_iface{};
-bool OpenWlan(HANDLE& h) {
-    DWORD ver = 0;
-    return WlanOpenHandle(2, nullptr, &ver, &h) == ERROR_SUCCESS;
+struct BtEntry {
+    std::wstring name;
+    bool connected = false;
+    winrt::Windows::Devices::Bluetooth::BluetoothDevice device{nullptr};
+    winrt::Windows::Devices::Bluetooth::BluetoothDevice::ConnectionStatusChanged_revoker connectionRev;
+};
+struct BtSession {
+    using Watcher = winrt::Windows::Devices::Enumeration::DeviceWatcher;
+    std::atomic<bool> live{true};
+    unsigned gen = 0;
+    HWND notify{};
+    UINT msg{};
+    Watcher watcher{nullptr};
+    Watcher::Added_revoker addedRev;
+    Watcher::Updated_revoker updatedRev;
+    Watcher::Removed_revoker removedRev;
+    Watcher::EnumerationCompleted_revoker completedRev;
+    Watcher::Stopped_revoker stoppedRev;
+    std::unordered_map<std::wstring, unsigned> serials;
+    std::unordered_map<std::wstring, BtEntry> entries;
+    unsigned pending = 0;
+    bool enumerated = false;
+};
+std::shared_ptr<BtSession> g_btSession;
+
+void PostBt(std::shared_ptr<BtSession> const& session) {
+    if (session && session->live.load() && session->notify) PostMessageW(session->notify, session->msg, 0, 0);
 }
-void BuildNets() {
-    g_nets.clear();
-    HANDLE h;
-    if (!OpenWlan(h)) return;
-    PWLAN_INTERFACE_INFO_LIST il = nullptr;
-    if (WlanEnumInterfaces(h, nullptr, &il) == ERROR_SUCCESS && il && il->dwNumberOfItems) {
-        g_iface = il->InterfaceInfo[0].InterfaceGuid;
-        PWLAN_PROFILE_INFO_LIST pl = nullptr;
-        if (WlanGetProfileList(h, &g_iface, nullptr, &pl) == ERROR_SUCCESS && pl) {
-            auto connected = ConnectedSsid();
-            for (DWORD i = 0; i < pl->dwNumberOfItems && g_nets.size() < 8; i++) {
-                std::wstring name = pl->ProfileInfo[i].strProfileName;
-                g_nets.push_back({name, 0, true, name == connected});
-            }
-            WlanFreeMemory(pl);
-        }
+bool IsCurrentBt(std::shared_ptr<BtSession> const& session) {
+    return session && session->live.load() && g_btSession == session && g_btGen == session->gen;
+}
+void SortBt() {
+    std::stable_sort(g_btDevices.begin(), g_btDevices.end(), [](BtDevice const& a, BtDevice const& b) {
+        if (a.connected != b.connected) return a.connected > b.connected;
+        return a.name < b.name;
+    });
+}
+void RebuildBt(std::shared_ptr<BtSession> const& session) {
+    g_btDevices.clear();
+    for (auto const& [_, entry] : session->entries)
+        g_btDevices.push_back({entry.name, entry.connected});
+    SortBt();
+}
+void BtConnectionChanged(std::weak_ptr<BtSession> weak, std::wstring id, unsigned serial,
+                         winrt::Windows::Devices::Bluetooth::BluetoothConnectionStatus status) {
+    auto session = weak.lock();
+    if (!session) return;
+    {
+        std::lock_guard lock(g_btMutex);
+        if (!IsCurrentBt(session)) return;
+        auto current = session->serials.find(id);
+        if (current == session->serials.end() || current->second != serial) return;
+        auto entry = session->entries.find(id);
+        if (entry == session->entries.end()) return;
+        entry->second.connected = status == winrt::Windows::Devices::Bluetooth::BluetoothConnectionStatus::Connected;
+        RebuildBt(session);
     }
-    if (il) WlanFreeMemory(il);
-    WlanCloseHandle(h, nullptr);
-    std::stable_sort(g_nets.begin(), g_nets.end(), [](WifiNet const& a, WifiNet const& b) { return a.connected > b.connected; });
+    PostBt(session);
 }
 
-winrt::fire_and_forget BtTask(HWND notify, UINT msg, unsigned gen) {
+winrt::fire_and_forget ResolveBt(std::weak_ptr<BtSession> weak, std::wstring id, std::wstring name, unsigned serial) {
     namespace wdb = winrt::Windows::Devices::Bluetooth;
+    auto session = weak.lock();
+    if (!session || !session->live.load()) co_return;
     try {
-        auto found = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::FindAllAsync(
-            wdb::BluetoothDevice::GetDeviceSelectorFromPairingState(true));
-        std::vector<BtDevice> out;
-        for (auto const& d : found) {
-            if (out.size() >= 6) break;
-            BtDevice b{d.Name().c_str(), false};
-            try {
-                auto dev = co_await wdb::BluetoothDevice::FromIdAsync(d.Id());
-                b.connected = dev && dev.ConnectionStatus() == wdb::BluetoothConnectionStatus::Connected;
-            } catch (...) {}
-            if (!b.name.empty()) out.push_back(std::move(b));
+        auto device = co_await wdb::BluetoothDevice::FromIdAsync(id);
+        if (!device) throw winrt::hresult_error(E_FAIL, L"Bluetooth device lookup returned no device");
+        if (name.empty()) name = device.Name().c_str();
+        {
+            std::lock_guard lock(g_btMutex);
+            if (!IsCurrentBt(session)) co_return;
+            auto current = session->serials.find(id);
+            if (current != session->serials.end() && current->second == serial) {
+                BtEntry entry;
+                entry.name = name;
+                entry.device = device;
+                entry.connectionRev = device.ConnectionStatusChanged(winrt::auto_revoke,
+                    [weak, id, serial](auto const& sender, auto const&) {
+                        try { BtConnectionChanged(weak, id, serial, sender.ConnectionStatus()); } catch (...) {}
+                    });
+                entry.connected = device.ConnectionStatus() == wdb::BluetoothConnectionStatus::Connected;
+                session->entries[id] = std::move(entry);
+                RebuildBt(session);
+            }
+            if (session->pending) --session->pending;
+            if (session->enumerated && !session->pending && g_btStatus.phase == DiscoveryPhase::Loading)
+                g_btStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
         }
-        if (gen != g_btGen) co_return;
-        std::sort(out.begin(), out.end(), [](BtDevice const& a, BtDevice const& b) { return a.connected > b.connected; });
-        g_bt = std::move(out);
-        PostMessageW(notify, msg, 0, 0);
-    } catch (...) {}
+        PostBt(session);
+    } catch (winrt::hresult_error const& e) {
+        {
+            std::lock_guard lock(g_btMutex);
+            if (!IsCurrentBt(session)) co_return;
+            HRESULT hr = e.code();
+            DWORD error = static_cast<DWORD>(hr);
+            auto current = session->serials.find(id);
+            if (current != session->serials.end() && current->second == serial && !name.empty()) {
+                g_btStatus = {hr == E_ACCESSDENIED ? DiscoveryPhase::AccessDenied : DiscoveryPhase::Failed, error};
+                session->entries[id].name = name;
+                session->entries[id].connected = false;
+                RebuildBt(session);
+            }
+            if (session->pending) --session->pending;
+            if (session->enumerated && !session->pending && g_btStatus.phase == DiscoveryPhase::Loading)
+                g_btStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
+        }
+        PostBt(session);
+    } catch (...) {
+        {
+            std::lock_guard lock(g_btMutex);
+            if (!IsCurrentBt(session)) co_return;
+            auto current = session->serials.find(id);
+            if (current != session->serials.end() && current->second == serial)
+                g_btStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
+            if (session->pending) --session->pending;
+            if (session->enumerated && !session->pending && g_btStatus.phase == DiscoveryPhase::Loading)
+                g_btStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
+        }
+        PostBt(session);
+    }
 }
+
+void StopBtSession(std::shared_ptr<BtSession> session) {
+    if (!session) return;
+    session->live = false;
+    session->addedRev.revoke();
+    session->updatedRev.revoke();
+    session->removedRev.revoke();
+    session->completedRev.revoke();
+    session->stoppedRev.revoke();
+    std::unordered_map<std::wstring, BtEntry> entries;
+    {
+        std::lock_guard lock(g_btMutex);
+        entries.swap(session->entries);
+        session->serials.clear();
+    }
+    for (auto& [_, entry] : entries) entry.connectionRev.revoke();
+    try { if (session->watcher) session->watcher.Stop(); } catch (...) {}
+}
+
+void BtResolveEvent(std::weak_ptr<BtSession> weak, std::wstring id, std::wstring name) {
+    auto session = weak.lock();
+    if (!session) return;
+    unsigned serial;
+    {
+        std::lock_guard lock(g_btMutex);
+        if (!IsCurrentBt(session)) return;
+        serial = ++session->serials[id];
+        ++session->pending;
+        g_btStatus = {DiscoveryPhase::Loading, ERROR_SUCCESS};
+    }
+    ResolveBt(weak, std::move(id), std::move(name), serial);
+}
+
 }  // namespace
 
 void WifiRefresh(HWND notify, UINT msg) {
-    BuildNets();
-    PostMessageW(notify, msg, 0, 0);
+    const unsigned gen = ++g_wifiGen;
+    auto signal = std::make_shared<ScanSignal>();
+    std::shared_ptr<ScanSignal> old;
+    {
+        std::lock_guard lock(g_wifiMutex);
+        old = g_activeWifiScan.lock();
+        g_activeWifiScan = signal;
+        g_wifiNets.clear();
+        g_wifiStatus = {DiscoveryPhase::Loading, ERROR_SUCCESS};
+        g_wifiNotify = notify;
+        g_wifiMsg = msg;
+    }
+    if (old) {
+        std::lock_guard lock(old->mutex);
+        old->cancelled = true;
+        old->changed.notify_all();
+    }
+    try {
+        std::thread(WifiScanTask, gen, notify, msg, std::move(signal)).detach();
+    } catch (...) {
+        {
+            std::lock_guard lock(g_wifiMutex);
+            if (gen == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Failed, ERROR_NOT_ENOUGH_MEMORY};
+        }
+        if (notify) PostMessageW(notify, msg, 0, 0);
+    }
 }
-void WifiStop() { g_nets.clear(); }
-std::vector<WifiNet> const& WifiNets() { return g_nets; }
-void WifiConnect(std::wstring const& ssid) {
-    if (DryRun()) return Log(L"DRYRUN join Wi-Fi " + ssid);
-    HANDLE h;
-    if (!OpenWlan(h)) return;
-    WLAN_CONNECTION_PARAMETERS cp{};
-    cp.wlanConnectionMode = wlan_connection_mode_profile;
-    cp.strProfile = ssid.c_str();
-    cp.dot11BssType = dot11_BSS_type_any;
-    WlanConnect(h, &g_iface, &cp, nullptr);
-    WlanCloseHandle(h, nullptr);
+
+void WifiStop() {
+    ++g_wifiGen;
+    std::shared_ptr<ScanSignal> active;
+    {
+        std::lock_guard lock(g_wifiMutex);
+        active = g_activeWifiScan.lock();
+        g_activeWifiScan.reset();
+        g_wifiNets.clear();
+        g_wifiStatus = {};
+        g_wifiNotify = nullptr;
+        g_wifiMsg = 0;
+    }
+    if (active) {
+        std::lock_guard lock(active->mutex);
+        active->cancelled = true;
+        active->changed.notify_all();
+    }
 }
-void BtRefresh(HWND notify, UINT msg) { BtTask(notify, msg, ++g_btGen); }
-void BtStop() { g_btGen++; g_bt.clear(); }
-std::vector<BtDevice> const& BtDevices() { return g_bt; }
+
+std::vector<WifiNet> WifiNets() {
+    std::lock_guard lock(g_wifiMutex);
+    return g_wifiNets;
+}
+DiscoveryStatus WifiStatus() {
+    std::lock_guard lock(g_wifiMutex);
+    return g_wifiStatus;
+}
+
+bool WifiConnect(WifiNet const& network) {
+    WifiNet net = network;
+    unsigned generation;
+    HWND notify;
+    UINT msg;
+    {
+        std::lock_guard lock(g_wifiMutex);
+        generation = g_wifiGen.load();
+        notify = g_wifiNotify;
+        msg = g_wifiMsg;
+    }
+    if (DryRun()) {
+        Log(radio_policy::HasSavedProfile(net.profileName.c_str())
+                ? L"DRYRUN join Wi-Fi profile " + net.profileName
+                : L"DRYRUN open Windows Wi-Fi Settings for unprofiled network");
+        return true;
+    }
+    if (!radio_policy::HasSavedProfile(net.profileName.c_str())) {
+        HINSTANCE result = ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) > 32) return true;
+        {
+            std::lock_guard lock(g_wifiMutex);
+            if (generation == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
+        }
+        if (notify) PostMessageW(notify, msg, 0, 0);
+        return false;
+    }
+    WlanHandle wlan;
+    DWORD error = wlan.Open();
+    if (error == ERROR_SUCCESS) {
+        WLAN_CONNECTION_PARAMETERS cp{};
+        cp.wlanConnectionMode = wlan_connection_mode_profile;
+        cp.strProfile = net.profileName.c_str();
+        cp.dot11BssType = dot11_BSS_type_any;
+        error = WlanConnect(wlan.value, &net.interfaceId, &cp, nullptr);
+    }
+    if (error != ERROR_SUCCESS) {
+        {
+            std::lock_guard lock(g_wifiMutex);
+            if (generation == g_wifiGen.load()) g_wifiStatus = {radio_policy::PhaseForWlanError(error), error};
+        }
+        if (notify) PostMessageW(notify, msg, 0, 0);
+        return false;
+    }
+    try {
+        {
+            std::lock_guard lock(g_wifiMutex);
+            if (generation == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Connecting, ERROR_SUCCESS};
+        }
+        if (notify) PostMessageW(notify, msg, 0, 0);
+        std::thread(WifiConnectionReadback, generation, notify, msg, std::move(net.profileName), net.interfaceId).detach();
+    } catch (...) {
+        {
+            std::lock_guard lock(g_wifiMutex);
+            if (generation == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Failed, ERROR_NOT_ENOUGH_MEMORY};
+        }
+        if (notify) PostMessageW(notify, msg, 0, 0);
+    }
+    return true;
+}
+
+void BtRefresh(HWND notify, UINT msg) {
+    auto session = std::make_shared<BtSession>();
+    std::shared_ptr<BtSession> old;
+    {
+        std::lock_guard lock(g_btMutex);
+        old = std::move(g_btSession);
+        if (old) old->live = false;
+        session->gen = ++g_btGen;
+        session->notify = notify;
+        session->msg = msg;
+        g_btSession = session;
+        g_btDevices.clear();
+        g_btStatus = {DiscoveryPhase::Loading, ERROR_SUCCESS};
+    }
+    StopBtSession(std::move(old));
+    try {
+        namespace wdb = winrt::Windows::Devices::Bluetooth;
+        namespace wde = winrt::Windows::Devices::Enumeration;
+        auto selector = wdb::BluetoothDevice::GetDeviceSelectorFromPairingState(true);
+        session->watcher = wde::DeviceInformation::CreateWatcher(selector);
+        std::weak_ptr<BtSession> weak = session;
+        session->addedRev = session->watcher.Added(winrt::auto_revoke, [weak](auto const&, auto const& info) {
+            BtResolveEvent(weak, info.Id().c_str(), info.Name().c_str());
+        });
+        session->updatedRev = session->watcher.Updated(winrt::auto_revoke, [weak](auto const&, auto const& update) {
+            BtResolveEvent(weak, update.Id().c_str(), {});
+        });
+        session->removedRev = session->watcher.Removed(winrt::auto_revoke, [weak](auto const&, auto const& update) {
+            auto current = weak.lock();
+            if (!current) return;
+            {
+                std::lock_guard lock(g_btMutex);
+                if (!IsCurrentBt(current)) return;
+                ++current->serials[update.Id().c_str()];
+                current->entries.erase(update.Id().c_str());
+                RebuildBt(current);
+            }
+            PostBt(current);
+        });
+        session->completedRev = session->watcher.EnumerationCompleted(winrt::auto_revoke, [weak](auto const&, auto const&) {
+            auto current = weak.lock();
+            if (!current) return;
+            {
+                std::lock_guard lock(g_btMutex);
+                if (!IsCurrentBt(current)) return;
+                current->enumerated = true;
+                if (!current->pending && g_btStatus.phase == DiscoveryPhase::Loading)
+                    g_btStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
+            }
+            PostBt(current);
+        });
+        session->stoppedRev = session->watcher.Stopped(winrt::auto_revoke, [weak](auto const&, auto const&) {
+            auto current = weak.lock();
+            if (!current) return;
+            {
+                std::lock_guard lock(g_btMutex);
+                if (!IsCurrentBt(current)) return;
+                if (g_btStatus.phase == DiscoveryPhase::Loading) g_btStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
+            }
+            PostBt(current);
+        });
+        session->watcher.Start();
+    } catch (winrt::hresult_error const& e) {
+        std::lock_guard lock(g_btMutex);
+        if (IsCurrentBt(session)) {
+            HRESULT hr = e.code();
+            g_btStatus = {hr == E_ACCESSDENIED ? DiscoveryPhase::AccessDenied : DiscoveryPhase::Failed, static_cast<DWORD>(hr)};
+        }
+        PostBt(session);
+    } catch (...) {
+        std::lock_guard lock(g_btMutex);
+        if (IsCurrentBt(session)) g_btStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
+        PostBt(session);
+    }
+}
+
+void BtStop() {
+    std::shared_ptr<BtSession> old;
+    {
+        std::lock_guard lock(g_btMutex);
+        ++g_btGen;
+        old = std::move(g_btSession);
+        if (old) old->live = false;
+        g_btDevices.clear();
+        g_btStatus = {};
+    }
+    StopBtSession(std::move(old));
+}
+
+std::vector<BtDevice> BtDevices() {
+    std::lock_guard lock(g_btMutex);
+    return g_btDevices;
+}
+DiscoveryStatus BtStatus() {
+    std::lock_guard lock(g_btMutex);
+    return g_btStatus;
+}
 
 // ---- Now Playing ------------------------------------------------------------------------------
 void Media::Start(HWND notify, UINT event, std::function<void()> changed) {

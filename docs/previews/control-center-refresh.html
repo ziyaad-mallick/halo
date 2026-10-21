@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Halo Control Center — refresh preview</title>
+<style>
+/* Halo token translation: 4px spacing, 12/14/18/28px type, 12/20px radii,
+   Segoe UI Variable, teal accent. Preview-only responsive canvas. */
+:root {
+  color-scheme: light;
+  --page:#e9edf0; --wallpaper:#cbd8d9;
+  --glass:rgba(248,249,251,.94); --surface:rgba(255,255,255,.76);
+  --ink:#1c1c1f; --muted:rgba(28,28,31,.62); --faint:rgba(28,28,31,.38);
+  --accent:#12857b; --on-accent:#fff; --line:rgba(28,28,31,.09);
+  --off:rgba(28,28,31,.09); --fill:rgba(255,255,255,.92); --hover:rgba(255,255,255,.99);
+  --shadow:0 26px 64px rgba(14,25,31,.23),0 4px 12px rgba(14,25,31,.12);
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s6:24px;
+  --r-small:12px; --r-large:20px; --r-panel:36px;
+  --caption:12px; --body:14px; --heading:18px; --display:28px;
+  --ease-in:cubic-bezier(0,0,.2,1); --ease-out:cubic-bezier(.5,0,.9,.5);
+  --fast:120ms; --slow:280ms;
+  font-family:"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
+  color:var(--ink); background:var(--page); font-synthesis:none;
+}
+:root[data-theme="dark"] {
+  color-scheme:dark; --page:#18191e; --wallpaper:#25272d;
+  --glass:rgba(28,29,34,.94); --surface:rgba(255,255,255,.10);
+  --ink:#fff; --muted:rgba(255,255,255,.68); --faint:rgba(255,255,255,.42);
+  --accent:#14a394; --on-accent:#fff; --line:rgba(255,255,255,.10);
+  --off:rgba(255,255,255,.13); --fill:rgba(255,255,255,.92); --hover:rgba(255,255,255,.16);
+  --shadow:0 26px 64px rgba(0,0,0,.44),0 4px 12px rgba(0,0,0,.25);
+}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:
+  radial-gradient(ellipse at 78% 18%,rgba(110,169,160,.35),transparent 38%),
+  radial-gradient(ellipse at 10% 88%,rgba(103,133,151,.22),transparent 35%),var(--page);}
+button{font:inherit;color:inherit}
+.stage{min-height:100vh;display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,440px);gap:clamp(28px,7vw,100px);align-items:center;padding:clamp(24px,6vw,84px);max-width:1250px;margin:auto}
+.intro{max-width:490px}.eyebrow{font-size:var(--caption);font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--accent)}
+h1{font-size:clamp(34px,5vw,56px);line-height:1.02;letter-spacing:-.045em;margin:14px 0 18px;font-weight:650}
+.lede{font-size:16px;line-height:1.6;color:var(--muted);max-width:42ch;margin:0}
+.state-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:28px 0 0}
+.state-tabs button,.theme-toggle{border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:9px 13px;color:var(--muted);font-size:13px;cursor:pointer;transition:background var(--fast) var(--ease-in),color var(--fast) var(--ease-in),transform var(--fast) var(--ease-in)}
+.state-tabs button:hover,.theme-toggle:hover{background:var(--hover);color:var(--ink)}
+.state-tabs button[aria-pressed="true"]{background:var(--ink);color:var(--glass);border-color:transparent}
+button:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 70%,transparent);outline-offset:3px}
+.design-notes{margin-top:34px;border-top:1px solid var(--line);padding-top:20px;color:var(--muted);font-size:13px;line-height:1.55}
+.design-notes h2{font-size:var(--body);color:var(--ink);margin:0 0 8px}
+.design-notes ul{padding-left:18px;margin:0 0 12px}.design-notes li+li{margin-top:5px}
+.design-notes a{color:var(--accent);text-underline-offset:3px}
+.source-note{font-size:12px;color:var(--faint)}
+.demo-wrap{display:grid;justify-items:center;gap:20px}
+.demo-label{width:min(100%,380px);display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:12px;letter-spacing:.04em}
+.theme-toggle{padding:7px 11px;font-size:12px}
+.panel{width:min(100%,380px);height:min(750px,calc(100vh - 100px));min-height:610px;max-height:750px;border-radius:var(--r-panel);padding:16px;background:var(--glass);border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(28px);display:flex;flex-direction:column;overflow:hidden;transition:background var(--slow) var(--ease-in),color var(--slow) var(--ease-in)}
+.panel-head{height:72px;flex:0 0 72px;display:flex;align-items:center;justify-content:space-between;padding:0 4px 12px}
+.head-title{min-width:0}.head-title .time{font-size:28px;font-weight:650;letter-spacing:-.04em;line-height:1.05}.head-title .date{font-size:12px;color:var(--muted);margin-top:4px}
+.battery{border:1px solid var(--line);background:var(--surface);border-radius:12px;padding:8px 10px;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600}.battery-mark{width:20px;height:10px;border:1.5px solid currentColor;border-radius:3px;position:relative}.battery-mark:after{content:"";position:absolute;right:-4px;top:2px;width:2px;height:4px;background:currentColor;border-radius:0 2px 2px 0}.battery-mark:before{content:"";position:absolute;inset:1px 4px 1px 1px;background:var(--accent);border-radius:1px}
+.panel-main{min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--faint) transparent;padding:0 2px 4px;flex:1}
+.panel-main::-webkit-scrollbar{width:5px}.panel-main::-webkit-scrollbar-thumb{background:var(--faint);border-radius:8px}
+.section-kicker{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin:6px 2px 10px}
+.section-kicker:after{content:"";height:1px;background:var(--line);flex:1}
+.radio-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.radio-card,.toggle-card,.slider-card,.detail-card,.media-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-large)}
+.radio-card{min-height:74px;padding:10px;display:grid;grid-template-columns:40px minmax(0,1fr) 16px;align-items:center;gap:10px;text-align:left;cursor:pointer;transition:transform var(--fast) var(--ease-in),background var(--fast) var(--ease-in),border-color var(--fast) var(--ease-in)}
+.radio-card:hover,.toggle-card:hover,.action:hover{background:var(--hover);transform:translateY(-1px)}
+.radio-icon{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;background:var(--off);color:var(--ink);font-size:18px;font-weight:500}
+.radio-card.on .radio-icon{background:var(--accent);color:var(--on-accent)}
+.radio-copy{display:block;min-width:0;overflow:hidden}.radio-name{display:block;font-size:14px;font-weight:650;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.radio-status{display:block;min-width:0;font-size:12px;line-height:1.3;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}
+.chevron{color:var(--faint);font-size:18px;text-align:center}
+.mini-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.mini-row.compact{grid-template-columns:repeat(3,minmax(0,1fr))}
+.toggle-card{min-width:0;min-height:60px;padding:10px;display:flex;gap:9px;align-items:center;text-align:left;cursor:pointer}
+.toggle-card.compact{min-height:52px;padding:8px;gap:7px}
+.toggle-mark{height:28px;width:28px;flex:0 0 28px;border-radius:50%;background:var(--off);display:grid;place-items:center;font-size:13px;color:var(--muted)}
+.toggle-card[aria-pressed="true"] .toggle-mark{background:var(--accent);color:var(--on-accent)}
+.toggle-copy{display:block;min-width:0;overflow:hidden}.toggle-name{display:block;font-size:12px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toggle-state{display:block;font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.section-space{margin-top:18px}
+.slider-card{padding:11px 12px 12px;margin-top:8px}
+.slider-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px;font-size:13px}.slider-title{font-weight:650;display:flex;gap:8px;align-items:center}.slider-value{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.track{position:relative;height:28px;border-radius:999px;background:var(--off);overflow:hidden;cursor:pointer;touch-action:none;outline:none}
+.track:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 70%,transparent);outline-offset:3px}
+.track-fill{height:100%;width:var(--value);background:var(--accent);border-radius:inherit;display:flex;align-items:center;padding-left:7px;color:var(--on-accent);transition:width 80ms linear}
+.track-thumb{position:absolute;top:50%;left:var(--value);transform:translate(-50%,-50%);width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.25);border:1px solid rgba(0,0,0,.08);transition:left 80ms linear}
+.slider-symbol{font-size:14px;font-weight:700;line-height:1}
+.output-row{display:flex;align-items:center;justify-content:space-between;margin-top:9px;padding:2px 3px 0;font-size:12px;color:var(--muted)}.output-row strong{color:var(--ink);font-size:12px;font-weight:550}.output-button{border:0;background:transparent;border-radius:8px;padding:6px 7px;display:flex;gap:8px;align-items:center;cursor:pointer}.output-button:hover{background:var(--hover)}
+.detail-view{display:none;min-height:310px;flex-direction:column;animation:arrive 180ms var(--ease-in) both}.detail-view.active{display:flex}
+.detail-head{display:flex;align-items:center;gap:10px;padding:4px 2px 12px}.back{width:32px;height:32px;border:1px solid var(--line);border-radius:10px;background:var(--surface);cursor:pointer;font-size:18px}.detail-title{font-size:18px;font-weight:650}.detail-subtitle{font-size:12px;color:var(--muted);margin-top:3px}
+.detail-card{padding:4px 8px}.detail-scroll{max-height:260px;min-height:176px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--faint) transparent}.detail-scroll::-webkit-scrollbar{width:5px}.detail-scroll::-webkit-scrollbar-thumb{background:var(--faint);border-radius:8px}
+.network,.device{min-height:46px;width:100%;display:flex;align-items:center;gap:10px;padding:6px 8px;text-align:left;background:transparent;border:0;border-bottom:1px solid var(--line);cursor:pointer}.network:last-child,.device:last-child{border-bottom:0}.network:hover,.device:hover{background:var(--hover);border-radius:9px}.net-icon{width:28px;height:28px;display:grid;place-items:center;background:var(--off);border-radius:9px;font-size:13px}.net-main{min-width:0;flex:1}.net-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.net-meta{font-size:11px;color:var(--muted);margin-top:2px}.check{color:var(--accent);font-weight:700}.footer{height:54px;flex:0 0 54px;border-top:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:9px 0 0;margin-top:8px}
+.footer-actions{width:100%;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}.action{height:36px;min-width:0;padding:0 6px;border:1px solid var(--line);background:var(--surface);border-radius:12px;cursor:pointer;transition:background var(--fast) var(--ease-in),transform var(--fast) var(--ease-in);font-size:13px}.action:hover{background:var(--hover);transform:translateY(-1px)}.action.icon{font-size:16px}
+.media-card{margin-top:8px;display:flex;align-items:center;gap:10px;padding:9px}.album{width:36px;height:36px;border-radius:9px;background:linear-gradient(145deg,#498e87,#c7b38c);flex:0 0 auto}.track-meta{min-width:0;flex:1}.track-name{font-size:12px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.artist{font-size:11px;color:var(--muted);margin-top:2px}.media-actions{display:flex;gap:2px}.media-actions button{border:0;background:transparent;border-radius:8px;height:30px;width:30px;cursor:pointer}.media-actions button:hover{background:var(--hover)}
+.show-home{display:flex;flex-direction:column;gap:0}.home-view{animation:arrive 180ms var(--ease-in) both}.home-view[hidden]{display:none}
+.detail-mini{font-size:12px;color:var(--muted);margin-top:8px;padding:0 2px}
+@keyframes arrive{from{opacity:0;transform:translateX(5px)}to{opacity:1;transform:translateX(0)}}
+@media(max-width:800px){.stage{grid-template-columns:1fr;justify-items:center;gap:28px;padding:28px 18px}.intro{max-width:520px}.design-notes{margin-top:22px}.demo-wrap{width:100%}.panel{height:min(720px,calc(100vh - 80px));min-height:590px}}
+@media(max-width:420px){.stage{padding:20px 10px}.panel{width:100%;min-height:580px;height:calc(100vh - 40px);padding:12px;border-radius:28px}.radio-card{padding:8px;gap:8px;grid-template-columns:36px minmax(0,1fr) 12px}.radio-icon{width:36px;height:36px}.radio-name{font-size:13px}.mini-row{gap:6px}.toggle-card{padding:8px;gap:7px}.toggle-name{font-size:11px}.mini-row.compact .toggle-card{padding:7px 5px;gap:5px}.mini-row.compact .toggle-mark{width:24px;height:24px;flex-basis:24px}.mini-row.compact .toggle-name{font-size:10px}.footer-actions{gap:5px}.action{padding:0 3px}}
+.mini-row.compact .toggle-card{padding:8px;gap:4px}
+.mini-row.compact .toggle-mark{width:20px;height:20px;flex-basis:20px}
+.mini-row.compact .toggle-name{font-size:12px;white-space:normal;line-height:1.1;overflow:visible;text-overflow:clip}
+.net-name,.net-meta,.track-name,.artist{display:block;min-width:0}
+.net-name,.net-meta,.track-name,.artist{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<main class="stage">
+  <section class="intro" aria-labelledby="page-title">
+    <div class="eyebrow">Halo · Control Center</div>
+    <h1 id="page-title">A quieter surface for quick changes.</h1>
+    <p class="lede">Keep the controls people reach for up front. Give network and audio details a bounded place to open, while the bottom actions stay put.</p>
+    <nav class="state-tabs" aria-label="Preview states">
+      <button type="button" data-view="home" aria-pressed="true">Home</button>
+      <button type="button" data-view="wifi" aria-pressed="false">Wi‑Fi details</button>
+      <button type="button" data-view="audio" aria-pressed="false">Audio details</button>
+    </nav>
+    <aside class="design-notes">
+      <h2>Design notes</h2>
+      <ul>
+        <li>Wi‑Fi, Bluetooth, Airplane, and Focus sit in one compact group with a written state; details open from their card.</li>
+        <li>Display and sound get wide, 28 px tracks with a clear thumb. The selected endpoint is a secondary row below Sound.</li>
+        <li>Detail lists have their own scroll viewport; panel height and footer actions remain stable as rows scroll.</li>
+        <li>Uses Halo's existing 4 px spacing, Segoe UI Variable, teal accent, 12/20 px radii, and light/dark palette direction.</li>
+      </ul>
+      <p class="source-note">Guidance: <a href="https://developer.apple.com/design/human-interface-guidelines/toggles?changes=l_1">Apple toggles</a> calls for clear labels and visually distinct states; <a href="https://learn.microsoft.com/en-us/windows/apps/design/motion/">Microsoft motion</a> calls for connected transitions and consistent flyout behavior. Example data is illustrative; this preview does not change system settings.</p>
+    </aside>
+  </section>
+  <section class="demo-wrap" aria-label="Interactive Control Center mockup">
+    <div class="demo-label"><span>INTERACTIVE MOCK</span><button class="theme-toggle" id="themeToggle" type="button" aria-pressed="false">Switch to dark</button></div>
+    <div class="panel" id="panel">
+      <header class="panel-head">
+        <div class="head-title"><div class="time">9:41</div><div class="date">Tuesday, 21 October</div></div>
+        <div class="battery" aria-label="Battery 87 percent"><span class="battery-mark" aria-hidden="true"></span>87%</div>
+      </header>
+      <div class="panel-main" id="panelMain">
+        <div class="home-view" id="homeView">
+          <div class="section-kicker">Connections</div>
+          <div class="radio-grid">
+            <button class="radio-card on" data-toggle="wifi" aria-pressed="true" type="button"><span class="radio-icon" aria-hidden="true">⌁</span><span class="radio-copy"><span class="radio-name">Wi‑Fi</span><span class="radio-status" id="wifiStatus">Halo Home</span></span><span class="chevron" aria-hidden="true">›</span></button>
+            <button class="radio-card on" data-toggle="bluetooth" aria-pressed="true" type="button"><span class="radio-icon" aria-hidden="true">ᛒ</span><span class="radio-copy"><span class="radio-name">Bluetooth</span><span class="radio-status">Headphones</span></span><span class="chevron" aria-hidden="true">›</span></button>
+          </div>
+          <div class="mini-row">
+            <button class="toggle-card" data-toggle="airplane" aria-pressed="false" type="button"><span class="toggle-mark" aria-hidden="true">✈</span><span class="toggle-copy"><span class="toggle-name">Airplane</span><span class="toggle-state">Off</span></span></button>
+            <button class="toggle-card" data-toggle="focus" aria-pressed="false" type="button"><span class="toggle-mark" aria-hidden="true">◉</span><span class="toggle-copy"><span class="toggle-name">Focus</span><span class="toggle-state">Off</span></span></button>
+          </div>
+          <div class="mini-row compact" aria-label="More quick toggles">
+            <button class="toggle-card compact" data-toggle="hotspot" aria-pressed="false" type="button"><span class="toggle-mark" aria-hidden="true">⌁</span><span class="toggle-copy"><span class="toggle-name">Hotspot</span><span class="toggle-state">Off</span></span></button>
+            <button class="toggle-card compact" data-toggle="night" aria-pressed="false" type="button"><span class="toggle-mark" aria-hidden="true">☾</span><span class="toggle-copy"><span class="toggle-name">Night light</span><span class="toggle-state">Off</span></span></button>
+            <button class="toggle-card compact" data-toggle="darkmode" aria-pressed="false" type="button"><span class="toggle-mark" aria-hidden="true">◐</span><span class="toggle-copy"><span class="toggle-name">Dark mode</span><span class="toggle-state">Off</span></span></button>
+          </div>
+          <div class="section-kicker section-space">Display &amp; sound</div>
+          <div class="slider-card">
+            <div class="slider-head"><span class="slider-title"><span aria-hidden="true">☼</span> Brightness</span><span class="slider-value" data-value-label="brightness">72%</span></div>
+            <div class="track" role="slider" tabindex="0" aria-label="Brightness" aria-valuemin="0" aria-valuemax="100" aria-valuenow="72" data-slider="brightness" style="--value:72%"><div class="track-fill" style="--value:72%"><span class="slider-symbol">☼</span></div><span class="track-thumb" style="--value:72%"></span></div>
+          </div>
+          <div class="slider-card">
+            <div class="slider-head"><span class="slider-title"><span aria-hidden="true">◖</span> Volume</span><span class="slider-value" data-value-label="volume">46%</span></div>
+            <div class="track" role="slider" tabindex="0" aria-label="Volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="46" data-slider="volume" style="--value:46%"><div class="track-fill" style="--value:46%"><span class="slider-symbol">◖</span></div><span class="track-thumb" style="--value:46%"></span></div>
+            <div class="output-row"><span>Output</span><button class="output-button" type="button" data-open="audio"><strong>Studio Headphones</strong><span class="chevron" aria-hidden="true">›</span></button></div>
+          </div>
+          <div class="section-kicker section-space">Now playing</div>
+          <div class="media-card"><div class="album" aria-hidden="true"></div><div class="track-meta"><div class="track-name">Weightless</div><div class="artist">Marconi Union</div></div><div class="media-actions"><button aria-label="Previous track" type="button">‹</button><button aria-label="Pause" type="button">Ⅱ</button><button aria-label="Next track" type="button">›</button></div></div>
+        </div>
+        <section class="detail-view" id="wifiView" aria-label="Wi-Fi details">
+          <div class="detail-head"><button class="back" type="button" aria-label="Back to Control Center">‹</button><div><div class="detail-title">Wi‑Fi</div><div class="detail-subtitle">Connected to Halo Home</div></div><span class="radio-icon" style="margin-left:auto;background:var(--accent);color:var(--on-accent)" aria-hidden="true">⌁</span></div>
+          <div class="section-kicker">Available networks</div>
+          <div class="detail-card"><div class="detail-scroll" tabindex="0" aria-label="Available Wi-Fi networks">
+            <button class="network" type="button"><span class="net-icon">⌁</span><span class="net-main"><span class="net-name">Halo Home</span><span class="net-meta">Connected · Secured</span></span><span class="check">✓</span></button>
+            <button class="network" type="button"><span class="net-icon">⌁</span><span class="net-main"><span class="net-name">Studio-5G</span><span class="net-meta">Secured · Strong signal</span></span><span class="chevron">›</span></button>
+            <button class="network" type="button"><span class="net-icon">⌁</span><span class="net-main"><span class="net-name">Phone hotspot</span><span class="net-meta">Personal hotspot</span></span><span class="chevron">›</span></button>
+            <button class="network" type="button"><span class="net-icon">⌁</span><span class="net-main"><span class="net-name">Guest Wi-Fi</span><span class="net-meta">Secured</span></span><span class="chevron">›</span></button>
+            <button class="network" type="button"><span class="net-icon">⌁</span><span class="net-main"><span class="net-name">TP-Link_84F2</span><span class="net-meta">Secured · Moderate signal</span></span><span class="chevron">›</span></button>
+            <button class="network" type="button"><span class="net-icon">⌁</span><span class="net-main"><span class="net-name">Coffee House Public Wi‑Fi</span><span class="net-meta">Open network</span></span><span class="chevron">›</span></button>
+            <button class="network" type="button"><span class="net-icon">⌁</span><span class="net-main"><span class="net-name">Building-Guest-2</span><span class="net-meta">Secured</span></span><span class="chevron">›</span></button>
+          </div></div>
+          <div class="detail-mini">New networks finish setup in Windows Settings.</div>
+        </section>
+        <section class="detail-view" id="audioView" aria-label="Audio details">
+          <div class="detail-head"><button class="back" type="button" aria-label="Back to Control Center">‹</button><div><div class="detail-title">Sound output</div><div class="detail-subtitle">Choose where audio plays</div></div></div>
+          <div class="section-kicker">Output devices</div>
+          <div class="detail-card"><div class="detail-scroll" tabindex="0" aria-label="Audio output devices">
+            <button class="device" type="button"><span class="net-icon">◖</span><span class="net-main"><span class="net-name">Studio Headphones</span><span class="net-meta">Bluetooth · Connected</span></span><span class="check">✓</span></button>
+            <button class="device" type="button"><span class="net-icon">◖</span><span class="net-main"><span class="net-name">Speakers (Realtek(R) Audio)</span><span class="net-meta">Built-in output</span></span><span class="chevron">›</span></button>
+            <button class="device" type="button"><span class="net-icon">▣</span><span class="net-main"><span class="net-name">DELL U2723QE (NVIDIA High Definition Audio)</span><span class="net-meta">Display audio</span></span><span class="chevron">›</span></button>
+            <button class="device" type="button"><span class="net-icon">◖</span><span class="net-main"><span class="net-name">USB Audio DAC</span><span class="net-meta">USB · Available</span></span><span class="chevron">›</span></button>
+            <button class="device" type="button"><span class="net-icon">◖</span><span class="net-main"><span class="net-name">Wireless Display Audio</span><span class="net-meta">Available</span></span><span class="chevron">›</span></button>
+          </div></div>
+          <div class="detail-mini">The current output is marked with a check.</div>
+        </section>
+      </div>
+      <footer class="footer" aria-label="Quick actions">
+        <div class="footer-actions">
+          <button class="action icon" type="button" aria-label="Microphone" title="Microphone">♩</button>
+          <button class="action icon" type="button" aria-label="Capture screen" title="Capture">⌗</button>
+          <button class="action icon" type="button" aria-label="Cast" title="Cast">▣</button>
+          <button class="action icon" type="button" aria-label="Settings" title="Settings">⚙</button>
+          <button class="action icon" type="button" aria-label="Lock" title="Lock">▣</button>
+          <button class="action icon" type="button" aria-label="Power" title="Power">⏻</button>
+        </div>
+      </footer>
+    </div>
+  </section>
+</main>
+<script>
+(() => {
+  const root = document.documentElement;
+  const home = document.getElementById('homeView');
+  const details = { wifi: document.getElementById('wifiView'), audio: document.getElementById('audioView') };
+  const tabs = [...document.querySelectorAll('[data-view]')];
+  function setView(name) {
+    home.hidden = name !== 'home';
+    Object.entries(details).forEach(([key, view]) => view.classList.toggle('active', key === name));
+    tabs.forEach(tab => tab.setAttribute('aria-pressed', String(tab.dataset.view === name)));
+    document.getElementById('panelMain').scrollTop = 0;
+  }
+  tabs.forEach(tab => tab.addEventListener('click', () => setView(tab.dataset.view)));
+  document.querySelectorAll('[data-open="audio"]').forEach(button => button.addEventListener('click', () => setView('audio')));
+  document.querySelectorAll('.back').forEach(button => button.addEventListener('click', () => setView('home')));
+  document.querySelectorAll('[data-toggle]').forEach(button => {
+    button.addEventListener('click', () => {
+      const on = button.getAttribute('aria-pressed') !== 'true';
+      button.setAttribute('aria-pressed', String(on));
+      button.classList.toggle('on', on);
+      const state = button.querySelector('.toggle-state');
+      if (state) state.textContent = on ? 'On' : 'Off';
+      if (button.dataset.toggle === 'wifi') document.getElementById('wifiStatus').textContent = on ? 'Halo Home' : 'Off';
+    });
+  });
+  const themeButton = document.getElementById('themeToggle');
+  themeButton.addEventListener('click', () => {
+    const dark = root.dataset.theme !== 'dark';
+    root.dataset.theme = dark ? 'dark' : 'light';
+    themeButton.setAttribute('aria-pressed', String(dark));
+    themeButton.textContent = dark ? 'Switch to light' : 'Switch to dark';
+  });
+  document.querySelectorAll('[data-slider]').forEach(track => {
+    let dragging = false;
+    const update = (value) => {
+      value = Math.max(0, Math.min(100, Math.round(value)));
+      track.style.setProperty('--value', value + '%');
+      track.querySelector('.track-fill').style.setProperty('--value', value + '%');
+      track.querySelector('.track-thumb').style.setProperty('--value', value + '%');
+      track.setAttribute('aria-valuenow', value);
+      document.querySelector(`[data-value-label="${track.dataset.slider}"]`).textContent = value + '%';
+    };
+    const at = event => { const rect = track.getBoundingClientRect(); update((event.clientX - rect.left) / rect.width * 100); };
+    track.addEventListener('pointerdown', event => { dragging = true; track.setPointerCapture(event.pointerId); at(event); });
+    track.addEventListener('pointermove', event => { if (dragging) at(event); });
+    track.addEventListener('pointerup', () => { dragging = false; });
+    track.addEventListener('pointercancel', () => { dragging = false; });
+    track.addEventListener('keydown', event => {
+      const current = Number(track.getAttribute('aria-valuenow'));
+      if (event.key === 'ArrowRight' || event.key === 'ArrowUp') { event.preventDefault(); update(current + 5); }
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') { event.preventDefault(); update(current - 5); }
+      if (event.key === 'Home') { event.preventDefault(); update(0); }
+      if (event.key === 'End') { event.preventDefault(); update(100); }
+    });
+  });
+})();
+</script>
+</body>
+</html>

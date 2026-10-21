@@ -57,7 +57,6 @@ namespace {
 constexpr float kW = 380, kInset = ui::kPanelInset, kGap = ui::kS3, kRadius = ui::kPanelRadius;
 constexpr float kHeaderH = 56, kTitleLine = 20, kCaptionLine = 16, kListRowH = 36, kMediaH = 76, kPowH = 52;
 constexpr float kMaxH = 900, kMargin = ui::kS2;
-constexpr int kMaxOutputs = 6;
 
 constexpr UINT kMsgAudio = WM_APP + 1, kMsgMic = WM_APP + 2, kMsgRadios = WM_APP + 3, kMsgBright = WM_APP + 4,
                kMsgMedia = WM_APP + 5, kMsgWifi = WM_APP + 6, kMsgBt = WM_APP + 7, kMsgLate = WM_APP + 8,
@@ -76,11 +75,11 @@ constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloCont
 enum class Id {
     None, WifiPill, BtPill, WifiText, BtText, Wifi, Bluetooth, RowTile, Airplane, Hotspot, Night, Dark, Dnd,
     DisplayTile, Bright, SoundTile, Vol, OutRow, OutDev, ListTile, WifiNet, BtDev, MediaTile, Prev, PlayPause, Next,
-    Snip, Cast, Settings, Battery, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut, Clock, Label
+    Snip, Cast, Settings, Battery, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut, Clock, Label, Back, DeviceListTile, DiscoveryAction
 };
 bool Passive(Id id) {
     return id == Id::WifiPill || id == Id::BtPill || id == Id::RowTile || id == Id::DisplayTile || id == Id::SoundTile ||
-           id == Id::ListTile || id == Id::MediaTile || id == Id::PowerTile || id == Id::Label;
+           id == Id::ListTile || id == Id::MediaTile || id == Id::PowerTile || id == Id::Label || id == Id::DeviceListTile;
 }
 // Controls that grow under the pointer and squash under the finger (each is drawn on its own little
 // surface, a chip).
@@ -206,10 +205,12 @@ struct ControlCenter::Impl {
     svc::Radios radios;
     svc::Media media;
     std::vector<svc::Device> outs;
+    std::vector<svc::WifiNet> wifiRows;
+    std::vector<svc::BtDevice> btRows;
     bool outsOpen = false;
     size_t outOffset = 0, outVisible = 0;
+    size_t listOffset = 0, listVisible = 0;
     Expand expand = Expand::None;
-    size_t listCap = SIZE_MAX;  // the most list rows Layout() may show (it lowers this when the panel would not fit)
     float volume = 0;
     bool muted = false, micMuted = false, dnd = false, wifiOn = false, btOn = false, dark = false, energy = false, night = false;
     bool hotspotAvail = false, hotspotOn = false, savedWifi = true, savedBt = true, btAsked = false, btDone = false;  // btDone: the paired-device read has answered
@@ -267,6 +268,7 @@ struct ControlCenter::Impl {
     void HoverChip(int i);
     void Squash(bool down);
     void Click(Item const& it);
+    void ScrollDetails(int rows);
     void LaunchAfterClose(wchar_t const* uri);
     void DeferChord(WORD key, bool shift);
     void DragTo(float x);
@@ -361,23 +363,23 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_KEYDOWN:
-            if (w == VK_ESCAPE) Close();
-            else if (outsOpen && (w == VK_UP || w == VK_DOWN)) {
-                if (w == VK_UP && outOffset) --outOffset;
-                if (w == VK_DOWN && outOffset + outVisible < outs.size()) ++outOffset;
-                Render();
-            }
+            if (w == VK_ESCAPE) {
+                if (outsOpen || expand != Expand::None) Click(Item{Id::Back});
+                else Close();
+            } else if (w == VK_UP || w == VK_DOWN) ScrollDetails(w == VK_UP ? -1 : 1);
             return 0;
-        case WM_MOUSEWHEEL:
-            if (st == St::Open && outsOpen && outVisible < outs.size()) {
+        case WM_MOUSEWHEEL: {
+            POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
+            ScreenToClient(h, &p);
+            const float px = p.x / s - motion::kPad, py = (p.y - TopPx()) / s;
+            auto tile = std::find_if(items.begin(), items.end(), [](auto const& item) { return item.id == Id::DeviceListTile; });
+            if (st == St::Open && tile != items.end() && In(tile->r, px, py)) {
                 const int delta = GET_WHEEL_DELTA_WPARAM(w);
-                const size_t steps = static_cast<size_t>(std::max(1, std::abs(delta) / WHEEL_DELTA));
-                if (delta > 0) outOffset -= std::min(outOffset, steps);
-                else outOffset = std::min(outs.size() - outVisible, outOffset + steps);
-                Render();
+                if (delta) ScrollDetails((delta > 0 ? -1 : 1) * std::max(1, std::abs(delta) / WHEEL_DELTA));
                 return 0;
             }
             break;
+        }
         case WM_LBUTTONDOWN:
             if (st != St::Open) return 0;
             Settle();  // a click shows its result at once
@@ -441,15 +443,26 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case kMsgMic: SyncMic(); Render(); return 0;
         case kMsgRadios:
             SyncRadios();
-            if (btOn && !btAsked) { btAsked = true; svc::BtRefresh(hot, kMsgBt); }  // for "connected device" under Bluetooth
+            if (st == St::Open && btOn && !btAsked) { btAsked = true; svc::BtRefresh(hot, kMsgBt); }
+            else if (!btOn) { btAsked = false; svc::BtStop(); btRows.clear(); }
             Render();
             return 0;
         case kMsgBright:
             if (svc::brightness::Supported()) bright = svc::brightness::Level();
             Render();
             return 0;
-        case kMsgBt: btDone = true; Render(); return 0;
-        case kMsgWifi: Render(); return 0;
+        case kMsgBt:
+            pressed = {};
+            btDone = true;
+            btRows = svc::BtDevices();
+            Render();
+            return 0;
+        case kMsgWifi:
+            pressed = {};
+            wifiRows = svc::WifiNets();
+            ssid = wifiOn ? svc::ConnectedSsid() : std::wstring();
+            Render();
+            return 0;
         case kMsgLate: {
             std::unique_ptr<Late> r(reinterpret_cast<Late*>(l));
             if (st == St::Open && r) {
@@ -533,6 +546,7 @@ void ControlCenter::Impl::Open(bool pointer) {
         if (!pill) BuildVisuals();
         Resize(static_cast<float>(hPx), false);
         st = St::Open;
+        if (btOn) { btAsked = true; svc::BtRefresh(hot, kMsgBt); }
         Render();
         motion::In(comp, pill, {pad * 1.0f, TopPx(), 0}, Travel(), cfg(), Corner());  // before the show: no frame at rest first
         // From the edge the panel only shows (the app under the pointer keeps the keyboard, and nothing
@@ -579,6 +593,9 @@ void ControlCenter::Impl::Close() {
     // The scans stop; the radio and volume listeners stay, so the next open already shows the truth.
     svc::WifiStop();
     svc::BtStop();
+    btAsked = false;
+    wifiRows.clear();
+    btRows.clear();
     SetHover(nullptr);
     hover = pressed = {};
     drag = Id::None;
@@ -886,7 +903,6 @@ void ControlCenter::Impl::SyncAll() {
     SyncSpeaker();
     SyncMic();
     outs = svc::OutputDevices();
-    if (outs.size() > kMaxOutputs) outs.resize(kMaxOutputs);
     battery = svc::ReadBattery();
     mode = svc::ReadPowerMode();
     dnd = svc::ReadDnd();
@@ -1003,18 +1019,21 @@ void ControlCenter::Impl::Click(Item const& it) {
             break;
         case Id::WifiText:
             if (!radios.HasWifi()) return;  // no adapter (an Ethernet-only desktop): nothing to list
+            outsOpen = powerOpen = false;
+            listOffset = 0;
             expand = expand == Expand::Wifi ? Expand::None : Expand::Wifi;
-            if (expand == Expand::Wifi) svc::WifiRefresh(hwnd, kMsgWifi);
+            if (expand == Expand::Wifi) { wifiRows.clear(); svc::WifiRefresh(hwnd, kMsgWifi); }
             break;
         case Id::BtText:
             if (!radios.HasBluetooth()) return;
+            outsOpen = powerOpen = false;
+            listOffset = 0;
             expand = expand == Expand::Bluetooth ? Expand::None : Expand::Bluetooth;
-            if (expand == Expand::Bluetooth) { btDone = false; svc::BtRefresh(hwnd, kMsgBt); }
+            if (expand == Expand::Bluetooth) { btRows.clear(); btDone = false; svc::BtRefresh(hwnd, kMsgBt); }
             break;
         case Id::WifiNet:
-            if (static_cast<size_t>(it.arg) >= svc::WifiNets().size()) return;
-            svc::WifiConnect(svc::WifiNets()[it.arg].ssid);
-            expand = Expand::None;
+            if (static_cast<size_t>(it.arg) >= wifiRows.size()) return;
+            svc::WifiConnect(wifiRows[it.arg]);
             break;
         case Id::BtDev: svc::OpenSettings(L"ms-settings:bluetooth"); break;  // Windows has no public "connect" API
         case Id::Dnd:
@@ -1042,7 +1061,11 @@ void ControlCenter::Impl::Click(Item const& it) {
             Close();
             std::thread([] { Sleep(250); LockWorkStation(); }).detach();
             return;
-        case Id::Power: powerOpen = !powerOpen; break;
+        case Id::Power:
+            expand = Expand::None;
+            outsOpen = false;
+            powerOpen = !powerOpen;
+            break;
         case Id::PowSleep: RunPowerAfterClose(0); return;
         case Id::PowRestart: RunPowerAfterClose(1); return;
         case Id::PowShut: RunPowerAfterClose(2); return;
@@ -1053,9 +1076,26 @@ void ControlCenter::Impl::Click(Item const& it) {
             Pulse(it);
             break;
         case Id::OutRow:
+            expand = Expand::None;
+            powerOpen = false;
             outsOpen = !outsOpen;
-            if (!outsOpen) outOffset = 0;
+            outOffset = 0;
             break;
+        case Id::Back:
+            expand = Expand::None;
+            outsOpen = false;
+            listOffset = outOffset = 0;
+            break;
+        case Id::DiscoveryAction: {
+            const bool wifi = expand == Expand::Wifi;
+            const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
+            if (status.phase == svc::DiscoveryPhase::Loading || status.phase == svc::DiscoveryPhase::Connecting) return;
+            if (status.phase == svc::DiscoveryPhase::AccessDenied || status.phase == svc::DiscoveryPhase::Unavailable)
+                LaunchAfterClose(wifi ? (status.phase == svc::DiscoveryPhase::AccessDenied ? L"ms-settings:privacy-location" : L"ms-settings:network-wifi") : L"ms-settings:bluetooth");
+            else if (wifi) { wifiRows.clear(); svc::WifiRefresh(hwnd, kMsgWifi); }
+            else { btRows.clear(); svc::BtRefresh(hot, kMsgBt); }
+            break;
+        }
         case Id::OutDev: {
             auto id = outs[it.arg].id;
             svc::SetDefaultOutput(id);
@@ -1070,6 +1110,19 @@ void ControlCenter::Impl::Click(Item const& it) {
         case Id::Next: media.Next(); break;
         default: return;
     }
+    Render();
+}
+
+void ControlCenter::Impl::ScrollDetails(int rows) {
+    if (!outsOpen && expand == Expand::None) return;
+    const size_t total = outsOpen ? outs.size() : expand == Expand::Wifi ? wifiRows.size() : btRows.size();
+    const size_t visible = outsOpen ? outVisible : listVisible;
+    size_t& offset = outsOpen ? outOffset : listOffset;
+    const size_t limit = total - std::min(total, visible);
+    const size_t next = static_cast<size_t>(std::clamp<int64_t>(static_cast<int64_t>(offset) + rows, 0, limit));
+    if (next == offset) return;
+    offset = next;
+    pressed = hover = {};
     Render();
 }
 
@@ -1106,20 +1159,49 @@ void ControlCenter::Impl::Layout() {
     items.clear();
     const bool dense = Dense() ||
         636.0f + (outsOpen ? outs.size() * kListRowH + kS1 : 0) + (powerOpen ? kPowH + kGap : 0) > MaxH();
-    const float insetY = dense ? 8.0f : kInset;
-    const float gap = dense ? 2.0f : kGap;
-    const float headerH = dense ? 44.0f : kHeaderH;
-    const float pillH = dense ? 46.0f : kPillH;
-    const bool compactOutputs = dense && outsOpen;
-    const float mediaH = compactOutputs ? 0.0f : dense ? 56.0f : kMediaH;
-    const float actionD = dense ? 36.0f : kRoundAction;
-    const float powerH = dense ? 44.0f : kPowH;
+    const float insetY = dense ? kS2 : kInset;
+    const float gap = dense ? kS1 : kGap;
+    const float headerH = kHeaderH;
+    const float pillH = dense ? 4 * kS3 : kPillH;
+    const float mediaH = dense ? 4 * kS3 : kMediaH;
+    const float actionD = dense ? kRound : kRoundAction;
+    const float powerH = dense ? kRoundAction : kPowH;
     const float x0 = kInset, x1 = kW - kInset;
     float y = insetY;
     auto add = [&](Id id, D2D1_RECT_F r, int arg = 0, float rad = kRadiusSmall) { items.push_back({id, r, arg, rad}); };
 
+    // Details get their own bounded page: expanding devices must never bury the shell actions.
+    if (outsOpen || expand != Expand::None) {
+        height = std::min(MaxH(), 636.0f);
+        add(Id::Back, {x0, y, x1, y + headerH});
+        y += headerH + kS2;
+        const float footerTop = height - insetY - actionD;
+        const float bottom = footerTop - kS3;
+        add(Id::DeviceListTile, {x0, y, x1, bottom}, 0, kRadiusLarge);
+        if (!outsOpen) add(Id::DiscoveryAction, {x1 - 112, y + kS2, x1 - kS2, y + kS2 + kRound});
+        const float rowTop = y + kS4 + kTitleLine + kS2 + (outsOpen ? 0 : kListRowH);
+        const size_t capacity = static_cast<size_t>(std::max(0.0f, std::floor((bottom - kS2 - rowTop) / kListRowH)));
+        const size_t total = outsOpen ? outs.size() : expand == Expand::Wifi ? wifiRows.size() : btRows.size();
+        size_t& offset = outsOpen ? outOffset : listOffset;
+        size_t& visible = outsOpen ? outVisible : listVisible;
+        visible = std::min(total, capacity);
+        offset = std::min(offset, total - visible);
+        for (size_t row = 0; row < visible; ++row) {
+            const float top = rowTop + row * kListRowH;
+            add(outsOpen ? Id::OutDev : expand == Expand::Wifi ? Id::WifiNet : Id::BtDev,
+                {x0 + kS2, top, x1 - kS2, top + kListRowH}, static_cast<int>(offset + row));
+        }
+        Id ids[] = {Id::Mic, Id::Snip, Id::Cast, Id::Settings, Id::Lock, Id::Power};
+        const float step = (x1 - x0 - actionD) / 5;
+        for (int i = 0; i < 6; ++i) {
+            const float left = x0 + i * step;
+            add(ids[i], {left, footerTop, left + actionD, footerTop + actionD}, 0, actionD / 2);
+        }
+        return;
+    }
+
     // Header, on the glass itself: the time and date (opens the calendar), the battery chip (cycles the power mode).
-    add(Id::Clock, {x0, y, x0 + 220, y + headerH}, 0, kRadiusSmall);
+    add(Id::Clock, {x0, y, x1 - 136 - kGap, y + headerH}, 0, kRadiusSmall);
     add(Id::Battery, {x1 - 136, y + kS2, x1, y + headerH - kS2}, 0, kRadiusSmall);
     y += headerH + gap;
 
@@ -1127,7 +1209,7 @@ void ControlCenter::Impl::Layout() {
     //   Wi-Fi pill            | Bluetooth pill          (round toggle; the text side opens the list)
     //   Airplane | Hotspot    | Do not disturb pill     (icon-only tiles)
     //   Night light pill      | Dark mode pill
-    const float col = (x1 - x0 - gap) / 2, half = (col - gap) / 2, rx = x0 + col + gap;
+    const float col = (x1 - x0 - kGap) / 2, half = (col - kGap) / 2, rx = x0 + col + kGap;
     auto pill = [&](float l, float top, Id back, Id dot, Id text) {
         const float r = l + col, icx = l + kS3 + kRound / 2, icy = top + pillH / 2;
         add(back, {l, top, r, top + pillH}, 0, kRadiusLarge);
@@ -1138,60 +1220,34 @@ void ControlCenter::Impl::Layout() {
     pill(rx, y, Id::BtPill, Id::Bluetooth, Id::BtText);
     y += pillH + gap;
     add(Id::Airplane, {x0, y, x0 + half, y + pillH}, 0, kRadiusLarge);
-    add(Id::Hotspot, {x0 + half + gap, y, x0 + col, y + pillH}, 0, kRadiusLarge);
+    add(Id::Hotspot, {x0 + half + kGap, y, x0 + col, y + pillH}, 0, kRadiusLarge);
     add(Id::Dnd, {rx, y, x1, y + pillH}, 0, kRadiusLarge);
     y += pillH + gap;
     add(Id::Night, {x0, y, x0 + col, y + pillH}, 0, kRadiusLarge);
     add(Id::Dark, {rx, y, x1, y + pillH}, 0, kRadiusLarge);
     y += pillH + gap;
 
-    // The Wi-Fi / Bluetooth list, when one is open.
-    size_t listed = 0;
-    if (expand != Expand::None) {
-        bool wifi = expand == Expand::Wifi;
-        size_t n = std::min(wifi ? svc::WifiNets().size() : svc::BtDevices().size(), listCap);
-        listed = n;
-        float h = insetY + kTitleLine + kS1 + std::max<size_t>(1, n) * kListRowH + kS2;
-        add(Id::ListTile, {x0, y, x1, y + h}, 0, kRadiusLarge);
-        for (size_t i = 0; i < n; i++) {
-            float t = y + insetY + kTitleLine + kS1 + i * kListRowH;
-            add(wifi ? Id::WifiNet : Id::BtDev, {x0 + kS2, t, x1 - kS2, t + kListRowH}, static_cast<int>(i), kRadiusSmall);
-        }
-        y += h + gap;
-    }
-
     // One module for both sliders: Display, then Sound (whose output list opens under it). The Sound row
     // is always laid out (greyed when there is no output), so the height never depends on the audio read.
     if (cfg().showSliders) {
         const bool disp = bright >= 0;
         const float blk = kTitleLine + kS2 + kSliderH;  // a label over a track
-        const float baseH = kS4 + (disp ? blk + kS4 : 0) + blk + kS4;
-        const float tailH = (cfg().showMedia && !compactOutputs ? mediaH + insetY : 0) + actionD + gap +
-                            (powerOpen ? powerH + gap : 0) + insetY - gap;
-        const size_t roomRows = static_cast<size_t>(std::max(0.0f,
-            std::floor((MaxH() - (y + baseH + gap + tailH + kS1)) / kListRowH)));
-        outVisible = outsOpen ? std::min(outs.size(), roomRows) : 0;
-        if (outVisible && outOffset + outVisible > outs.size()) outOffset = outs.size() - outVisible;
-        const float extra = outsOpen ? outVisible * kListRowH + kS1 : 0;
-        const float h = baseH + extra;
-        add(Id::DisplayTile, {x0, y, x1, y + h}, 0, kRadiusLarge);
-        float t = y + kS4;
+        const float padY = dense ? kS2 : kS4;
+        const float h = padY + (disp ? blk + padY : 0) + blk + padY;
+        add(Id::DisplayTile, {x0, y, x1, y + h}, static_cast<int>(padY), kRadiusLarge);
+        float t = y + padY;
         if (disp) {
             add(Id::Bright, {x0 + kS4, t + blk - kSliderH, x1 - kS4, t + blk});
-            t += blk + kS4;
+            t += blk + padY;
         }
         add(Id::SoundTile, {x0, t, x1, t + kTitleLine});  // only for the "Sound" label
         add(Id::OutRow, {x0 + 112, t - kS1, x1 - kS2, t + kTitleLine + kS1}, 0, kRadiusSmall);
         add(Id::Vol, {x0 + kS4, t + blk - kSliderH, x1 - kS4, t + blk});
-        t += blk + kS4;
-        if (outsOpen)
-            for (size_t i = outOffset; i < outOffset + outVisible; i++)
-                add(Id::OutDev, {x0 + kS2, t + i * kListRowH, x1 - kS2, t + (i + 1) * kListRowH}, static_cast<int>(i), kRadiusSmall);
         y += h + gap;
     }
 
-    // Now Playing: always there, so the panel never changes height when a session turns up.
-    if (cfg().showMedia && mediaH > 0) {
+    // Media arrival never changes the home height. The compact power choices temporarily use its space.
+    if (cfg().showMedia && !(dense && powerOpen)) {
         add(Id::MediaTile, {x0, y, x1, y + mediaH}, 0, kRadiusLarge);
         const float cy = y + mediaH / 2, b = kRound;
         float r = x1 - kS3;
@@ -1225,12 +1281,6 @@ void ControlCenter::Impl::Layout() {
         y += powerH + gap;
     }
     y += insetY - gap;
-    if (y > MaxH() && listed > 1) {  // a long list would push the panel off the screen: list only what fits
-        listCap = listed - std::min<size_t>(listed - 1, static_cast<size_t>(std::ceil((y - MaxH()) / kListRowH)));
-        Layout();
-        listCap = SIZE_MAX;
-        return;
-    }
     height = std::min({y, MaxH()});
 }
 
@@ -1459,15 +1509,70 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         auto const& r = it.r;
         const float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
         switch (it.id) {
+            case Id::Back: {
+                glyph(0xE72B, fIcon.get(), {r.left + kS2, r.top, r.left + kS2 + kS6, r.bottom}, kText);
+                txt(L"Control Center", fTitle.get(), {r.left + kS2 + kS6 + kS2, r.top, r.right - 112, r.bottom}, kText);
+                const size_t total = outsOpen ? outs.size() : expand == Expand::Wifi ? wifiRows.size() : btRows.size();
+                const size_t offset = outsOpen ? outOffset : listOffset, visible = outsOpen ? outVisible : listVisible;
+                if (visible && total > visible) {
+                    const auto range = std::to_wstring(offset + 1) + L"–" + std::to_wstring(offset + visible) + L" / " + std::to_wstring(total);
+                    txt(range, fSubR.get(), {r.right - 112, r.top, r.right - kS2, r.bottom}, kDim);
+                }
+                break;
+            }
+            case Id::DeviceListTile: {
+                tile(r);
+                const wchar_t* title = outsOpen ? L"Audio output" : expand == Expand::Wifi ? L"Wi-Fi networks" : L"Bluetooth devices";
+                txt(title, fTitle.get(), {r.left + kS4, r.top + kS4, r.right - (outsOpen ? kS4 : 128), r.top + kS4 + kTitleLine}, kText);
+                const size_t total = outsOpen ? outs.size() : expand == Expand::Wifi ? wifiRows.size() : btRows.size();
+                const size_t offset = outsOpen ? outOffset : listOffset, visible = outsOpen ? outVisible : listVisible;
+                if (visible && total > visible) {
+                    const float top = r.top + kS4 + kTitleLine + kS2 + (outsOpen ? 0 : kListRowH);
+                    const float trackH = r.bottom - kS2 - top;
+                    const float thumbH = std::max(kS6, trackH * visible / total);
+                    const float thumbY = top + (trackH - thumbH) * offset / (total - visible);
+                    box({r.right - kS2, thumbY, r.right - kS2 + kS1 / 2, thumbY + thumbH}, kS1 / 2, kDim);
+                }
+                if (!outsOpen) {
+                    const bool wifi = expand == Expand::Wifi;
+                    const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
+                    const wchar_t* message = wifi ? L"New networks open Windows Settings" : L"Select a device to open Bluetooth settings";
+                    switch (status.phase) {
+                        case svc::DiscoveryPhase::Idle: message = L"Refresh to find devices"; break;
+                        case svc::DiscoveryPhase::Loading: message = wifi ? L"Looking for nearby networks…" : L"Looking for paired devices…"; break;
+                        case svc::DiscoveryPhase::Connecting: message = L"Connecting to network…"; break;
+                        case svc::DiscoveryPhase::Ready:
+                            if (!total) message = wifi ? L"No networks found" : L"No paired devices";
+                            if (wifi && status.error != ERROR_SUCCESS) message = L"Some adapters unavailable; other networks shown";
+                            break;
+                        case svc::DiscoveryPhase::AccessDenied: message = wifi ? L"Allow location access to scan for Wi-Fi" : L"Bluetooth access is blocked"; break;
+                        case svc::DiscoveryPhase::Unavailable: message = wifi ? L"Wi-Fi is unavailable. Check the radio in Settings." : L"Bluetooth is unavailable. Check Settings."; break;
+                        case svc::DiscoveryPhase::Failed: message = L"Couldn't refresh. Try again."; break;
+                    }
+                    txt(message, fSub.get(), {r.left + kS4, r.top + kS4 + kTitleLine + kS2, r.right - kS4, r.top + kS4 + kTitleLine + kS2 + kListRowH}, kDim);
+                } else if (!total) {
+                    txt(L"No audio outputs available", fSub.get(), {r.left + kS4, r.top + kS4 + kTitleLine + kS2, r.right - kS4, r.top + kS4 + kTitleLine + kS2 + kListRowH}, kDim);
+                }
+                break;
+            }
+            case Id::DiscoveryAction: {
+                const bool wifi = expand == Expand::Wifi;
+                const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
+                const bool loading = status.phase == svc::DiscoveryPhase::Loading || status.phase == svc::DiscoveryPhase::Connecting;
+                const wchar_t* label = status.phase == svc::DiscoveryPhase::Connecting ? L"Connecting…" : loading ? L"Scanning…" : status.phase == svc::DiscoveryPhase::AccessDenied || status.phase == svc::DiscoveryPhase::Unavailable ? L"Settings" : status.phase == svc::DiscoveryPhase::Failed ? L"Retry" : L"Refresh";
+                box(r, kRadiusSmall, kOff);
+                txt(label, fCap.get(), r, theme::A(kText, loading ? 0.4f : 1.0f));
+                break;
+            }
             case Id::WifiPill: case Id::BtPill: case Id::RowTile: case Id::DisplayTile: case Id::ListTile: case Id::MediaTile: case Id::PowerTile:
                 tile(r);
                 if (it.id == Id::DisplayTile && bright >= 0)
-                    txt(L"Display", fTitle.get(), {r.left + kS4, r.top + kS4, r.right - kS4, r.top + kS4 + kTitleLine}, kText);
+                    txt(L"Display", fTitle.get(), {r.left + kS4, r.top + it.arg, r.right - kS4, r.top + it.arg + kTitleLine}, kText);
                 if (it.id == Id::ListTile) {
                     const bool wifi = expand == Expand::Wifi;
                     txt(wifi ? L"Wi-Fi networks" : L"Bluetooth devices", fTitle.get(),
                         {r.left + kS4, r.top + kS4, r.right - kS4, r.top + kS4 + kTitleLine}, kText);
-                    if (wifi ? svc::WifiNets().empty() : btDone && svc::BtDevices().empty()) {  // the one row Layout() always reserves
+                    if (wifi ? wifiRows.empty() : btDone && btRows.empty()) {  // the one row Layout() always reserves
                         const float t = r.top + kS4 + kTitleLine + kS1;
                         txt(wifi ? L"No saved networks" : L"No paired devices", fSub.get(), {r.left + kS4, t, r.right - kS4, t + kListRowH}, kDim);
                     }
@@ -1513,10 +1618,10 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 bool wifi = it.id == Id::WifiText;
                 bool avail = wifi ? radios.HasWifi() : radios.HasBluetooth(), on = wifi ? wifiOn : btOn;
                 std::wstring sub;
-                if (wifi) sub = !avail ? L"Unavailable" : !on ? L"Off" : ssid.empty() ? L"Not connected" : ssid;
+                if (wifi) sub = !avail ? L"Unavailable" : !on ? L"Off" : ssid.empty() ? L"On" : ssid;
                 else {
                     sub = !avail ? L"Unavailable" : on ? L"On" : L"Off";
-                    if (on) for (auto const& d : svc::BtDevices()) if (d.connected) { sub = d.name; break; }
+                    if (on) for (auto const& d : btRows) if (d.connected) { sub = d.name; break; }
                 }
                 twoLines(wifi ? L"Wi-Fi" : L"Bluetooth", sub, {r.left, r.top, r.right - 20, r.bottom}, avail ? 1.0f : 0.5f);
                 bool open = expand == (wifi ? Expand::Wifi : Expand::Bluetooth);
@@ -1572,18 +1677,23 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             case Id::OutDev: case Id::WifiNet: case Id::BtDev: {
                 std::wstring name, sub;
                 bool mark = false;
-                const size_t have = it.id == Id::OutDev ? outs.size() : it.id == Id::WifiNet ? svc::WifiNets().size() : svc::BtDevices().size();
+                const size_t have = it.id == Id::OutDev ? outs.size() : it.id == Id::WifiNet ? wifiRows.size() : btRows.size();
                 if (static_cast<size_t>(it.arg) >= have) break;  // a chip or list changed under a stale item: draw nothing, never index past the end
                 if (it.id == Id::OutDev) { name = outs[it.arg].name; mark = outs[it.arg].isDefault; }
                 else if (it.id == Id::WifiNet) {
-                    auto const& n = svc::WifiNets()[it.arg];
+                    auto const& n = wifiRows[it.arg];
                     name = n.ssid; mark = n.connected;
-                    sub = n.connected ? L"Connected" : L"";
+                    sub = n.connected ? L"Connected" : n.profileName.empty() ? L"Set up" : n.secure ? L"Secured" : L"Open";
+                    for (int bar = 0; bar < 4; ++bar) {
+                        const float left = r.left + kS2 + bar * kS1;
+                        box({left, cy + kS2 - (bar + 1) * kS1, left + kS1 / 2, cy + kS2}, 0,
+                            bar < n.bars ? kText : theme::A(kDim, 0.3f));
+                    }
                 } else {
-                    auto const& d = svc::BtDevices()[it.arg];
-                    name = d.name; mark = d.connected; sub = d.connected ? L"Connected" : L"";
+                    auto const& d = btRows[it.arg];
+                    name = d.name; mark = d.connected; sub = d.connected ? L"Connected" : L"Paired";
                 }
-                txt(name, fSub.get(), {r.left + kS2, r.top, r.right - (sub.empty() ? 32 : 112), r.bottom}, mark ? kText : kDim);
+                txt(name, fSub.get(), {r.left + kS2 + (it.id == Id::WifiNet ? kS6 : 0), r.top, r.right - (sub.empty() ? 32 : 112), r.bottom}, mark ? kText : kDim);
                 if (!sub.empty()) txt(sub, fSubR.get(), {r.right - 104, r.top, r.right - 32, r.bottom}, kDim);
                 if (mark) glyph(0xE73E, fIconS.get(), {r.right - 28, r.top, r.right - kS2, r.bottom}, kAccent);
                 break;
@@ -1600,7 +1710,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         }
         if (it.id == Id::MediaTile) {
             auto const& ms = media.State();
-            const float art = 48;
+            const float art = std::min(3 * kS4, r.bottom - r.top - 2 * kS2);
             D2D1_RECT_F ar{r.left + kS4, cy - art / 2, r.left + kS4 + art, cy + art / 2};
             if (ms.artSize > 0 && ms.art.size() == static_cast<size_t>(ms.artSize) * ms.artSize) {
                 winrt::com_ptr<ID2D1Bitmap> bmp;
