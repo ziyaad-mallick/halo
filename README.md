@@ -117,6 +117,21 @@ falls back to its default, so a typo can't break the shell.
 Other files in `%LOCALAPPDATA%\Halo`: `pins.txt` (your dock pins, one per line), `guardian.log` (start
 here when something goes wrong).
 
+## HALO 2.0 (preview)
+
+Turn on **General > HALO 2.0** in Halo Preferences (or `halo2 = on` under `[general]`). It applies live and
+can be turned off again at any time; with it off, Halo behaves exactly as before.
+
+- Clicking anywhere in the dock's left cluster (the Windows logo, Wi-Fi, battery, the time) opens Start,
+  which hosts the control centre.
+- The right side (the bottom-right hot corner and the right-edge swipe) opens notifications and a calendar
+  instead of the Control Center.
+- The right of the dock gets two small widgets: Wi-Fi (click opens Start) and volume (scroll to change it,
+  click to mute).
+
+The dock's hover is magnetic in both versions: icons are easy to hit, with no dead gaps, and the hovered
+icon eases a little toward the pointer (not with reduce motion).
+
 ## Going back to the Windows taskbar
 
 **For a moment:** press **Win+Alt+T**. Halo closes and the taskbar comes back. Press it again to

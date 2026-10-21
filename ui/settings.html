@@ -681,6 +681,7 @@ function renderPage() {
       h("div", { class: "block" }, h("div", { class: "txt" }, h("span", { class: "label" }, "Accent colour"), h("span", { class: "help" }, "Used for switches, sliders and highlights, in Halo and in this window.")),
         swatchGroup("general.accent", ACCENTS, { name: "Accent colour" })),
     ]));
+    body.append(card("HALO 2.0", "Early preview of the next Halo.", [toggleRow("general", { k: "halo2", label: "HALO 2.0", help: "Start hosts the control centre, and the right side of the dock opens notifications and a calendar. Applies immediately." })]));
     body.append(card("Motion", "For people who find movement distracting.", [toggleRow("general", { k: "reduce_motion", label: "Reduce motion", help: "Every animation becomes a simple fade, and icons stop zooming when you hover. Applies to Halo and to the previews here." })]));
     body.append(card("Your settings file", "Halo Preferences is a friendly front end for one plain-text file. You can back it up or share it.", [
       h("div", { class: "block", style: "border-top:0;padding-top:0" }, h("span", { class: "file-path" }, settingsPath)),
