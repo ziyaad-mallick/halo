@@ -25,6 +25,34 @@ namespace {
 static constexpr GUID kGuidAcdcPowerSource = {0x5d3e9a59, 0xe9d5, 0x4b00, {0xa6, 0xbd, 0xff, 0x34, 0xff, 0x51, 0x65, 0x48}};
 static constexpr GUID kGuidBatteryPercentageRemaining = {0xa7ad8041, 0xb45a, 0x4cae, {0x87, 0xa3, 0xee, 0xcb, 0xb4, 0x68, 0xa9, 0xe1}};
 
+// Segoe Fluent Icons; Windows 10 doesn't ship it (CreateTextFormat succeeds anyway and draws the glyph codes as
+// boxes in a fallback font), but its predecessor Segoe MDL2 Assets does.
+wchar_t const* IconFontFamily(IDWriteFactory* factory) {
+    winrt::com_ptr<IDWriteFontCollection> fonts;
+    UINT32 at = 0;
+    BOOL found = TRUE;
+    if (SUCCEEDED(factory->GetSystemFontCollection(fonts.put())) &&
+        SUCCEEDED(fonts->FindFamilyName(L"Segoe Fluent Icons", &at, &found)) && !found)
+        return L"Segoe MDL2 Assets";
+    return L"Segoe Fluent Icons";
+}
+
+// Internet reachability and whether the link is wired (Ethernet) rather than Wi-Fi / mobile.
+struct NetState {
+    bool online = false, wired = false;
+};
+NetState ReadNet() {
+    namespace conn = winrt::Windows::Networking::Connectivity;
+    NetState n;
+    try {
+        if (auto profile = conn::NetworkInformation::GetInternetConnectionProfile()) {
+            n.online = profile.GetNetworkConnectivityLevel() == conn::NetworkConnectivityLevel::InternetAccess;
+            n.wired = !profile.IsWlanConnectionProfile() && !profile.IsWwanConnectionProfile();
+        }
+    } catch (...) {}
+    if (!n.online) n.wired = false;
+    return n;
+}
 
 }  // namespace
 
@@ -82,18 +110,9 @@ void DockCluster::InitDirectWrite() {
         m_typography->AddFontFeature(feat);
     }
 
-    // Segoe Fluent Icons for Wi-Fi and Battery. Windows 10 doesn't ship it (CreateTextFormat succeeds anyway
-    // and draws the glyph codes as boxes in a fallback font); its predecessor Segoe MDL2 Assets does.
+    // Segoe Fluent Icons for Wi-Fi and Battery.
     const float iconSize = 14.0f * m_scale;
-    wchar_t const* iconFont = L"Segoe Fluent Icons";
-    {
-        winrt::com_ptr<IDWriteFontCollection> fonts;
-        UINT32 at = 0;
-        BOOL found = TRUE;
-        if (SUCCEEDED(m_dwriteFactory->GetSystemFontCollection(fonts.put())) &&
-            SUCCEEDED(fonts->FindFamilyName(iconFont, &at, &found)) && !found)
-            iconFont = L"Segoe MDL2 Assets";
-    }
+    wchar_t const* iconFont = IconFontFamily(m_dwriteFactory.get());
     winrt::check_hresult(m_dwriteFactory->CreateTextFormat(
         iconFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, iconSize,
@@ -162,6 +181,10 @@ bool DockCluster::HitTestStart(float localX, float localY) const {
            localY >= 0.0f && localY <= m_pillHeight;
 }
 
+bool DockCluster::HitTestCluster(float localX, float localY) const {
+    return localX >= 0.0f && localX <= m_width && localY >= 0.0f && localY <= m_pillHeight;
+}
+
 void DockCluster::OnTimer(UINT_PTR timerId) {
     if (timerId == kClockTimer) {
         KillTimer(m_hwnd, kClockTimer);
@@ -226,7 +249,6 @@ void DockCluster::Layout() {
 
 void DockCluster::Render() {
     if (!m_surface || !m_dwriteFactory) return;
-    namespace conn = winrt::Windows::Networking::Connectivity;
 
     auto interop = m_surface.as<ICompositionDrawingSurfaceInterop>();
     winrt::com_ptr<ID2D1DeviceContext> dc;
@@ -256,15 +278,9 @@ void DockCluster::Render() {
         dc->DrawTextLayout({ox + m_timeX, oy}, time.get(), white.get());
 
         // Network: Wi-Fi or Ethernet glyph; dimmed Wi-Fi when offline.
-        wchar_t net = L'\uE701';
-        bool online = false;
-        try {
-            if (auto profile = conn::NetworkInformation::GetInternetConnectionProfile()) {
-                online = profile.GetNetworkConnectivityLevel() == conn::NetworkConnectivityLevel::InternetAccess;
-                if (!profile.IsWlanConnectionProfile() && !profile.IsWwanConnectionProfile()) net = L'\uE839';
-            }
-        } catch (...) {}
-        if (!online) net = L'\uE701';
+        const NetState ns = ReadNet();
+        const bool online = ns.online;
+        const wchar_t net = ns.wired ? L'\uE839' : L'\uE701';
         auto netLayout = MakeLayout(std::wstring(1, net), m_tfIcons.get(), m_iconW);
         netLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         dc->DrawTextLayout({ox + m_wifiX, oy}, netLayout.get(), online ? white.get() : dim.get());
@@ -285,7 +301,7 @@ void DockCluster::Render() {
         }
 
         // Start: the Windows 11 logo, four panes under one blue gradient.
-        const float logo = std::round(17.0f * m_scale);
+        const float logo = std::round(20.0f * m_scale);  // 17 before: ~18 % larger
         const float gap = std::max(1.0f, std::round(logo / 14.0f));
         const float pane = (logo - gap) / 2;
         const float lx = ox + m_startX + (m_startWidth - logo) / 2;
@@ -301,6 +317,78 @@ void DockCluster::Render() {
                 const float x = lx + col * (pane + gap), y = ly + row * (pane + gap);
                 dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, y, x + pane, y + pane), r, r), blue.get());
             }
+    } catch (...) {
+        interop->EndDraw();
+        throw;
+    }
+    interop->EndDraw();
+}
+
+// ---- DockWidgets (HALO 2.0) --------------------------------------------------------------------
+
+DockWidgets::DockWidgets(winrt::Windows::UI::Composition::Compositor const& compositor,
+                         winrt::Windows::UI::Composition::CompositionGraphicsDevice const& gdev,
+                         float pillHeight, float scale)
+    : m_gdev(gdev), m_pillHeight(pillHeight), m_scale(scale) {
+    m_slotW = std::round(28.0f * scale);  // one rest-size icon slot each
+    winrt::check_hresult(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                             reinterpret_cast<IUnknown**>(m_dwriteFactory.put())));
+    winrt::check_hresult(m_dwriteFactory->CreateTextFormat(
+        IconFontFamily(m_dwriteFactory.get()), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 15.0f * scale, L"en-us", m_tfIcons.put()));
+    m_tfIcons->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    m_tfIcons->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    if (m_gdev) {
+        m_surface = m_gdev.CreateDrawingSurface(
+            {Width(), m_pillHeight}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+        m_visual = compositor.CreateSpriteVisual();
+        m_visual.Size({Width(), m_pillHeight});
+        m_visual.Brush(compositor.CreateSurfaceBrush(m_surface));
+    }
+    Render();
+}
+
+void DockWidgets::SetVolume(float level, bool muted, bool available) {
+    level = std::clamp(level, 0.0f, 1.0f);
+    if (level == m_volume && muted == m_muted && available == m_audio) return;
+    m_volume = level;
+    m_muted = muted;
+    m_audio = available;
+    Render();
+}
+
+void DockWidgets::Render() {
+    if (!m_surface || !m_dwriteFactory) return;
+    auto interop = m_surface.as<ICompositionDrawingSurfaceInterop>();
+    winrt::com_ptr<ID2D1DeviceContext> dc;
+    POINT offset{};
+    if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset))) return;
+    try {
+        const float ox = static_cast<float>(offset.x), oy = static_cast<float>(offset.y);
+        dc->Clear(D2D1::ColorF(0, 0.0f));
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        winrt::com_ptr<ID2D1SolidColorBrush> white, dim;
+        dc->CreateSolidColorBrush(halo::theme::P().text, white.put());
+        dc->CreateSolidColorBrush(halo::theme::A(halo::theme::P().dim, 0.7f), dim.put());
+        auto glyph = [&](int slot, wchar_t g, ID2D1SolidColorBrush* brush) {
+            D2D1_RECT_F r = D2D1::RectF(ox + SlotLeft(slot), oy, ox + SlotRight(slot), oy + m_pillHeight);
+            dc->DrawText(&g, 1, m_tfIcons.get(), r, brush);
+        };
+
+        // Wi-Fi: the wired glyph on Ethernet, Wi-Fi when connected, dimmed and struck through when offline.
+        const NetState ns = ReadNet();
+        glyph(kWifi, ns.wired ? L'\uE839' : L'\uE701', ns.online ? white.get() : dim.get());
+        if (!ns.online) {
+            const float cx = ox + SlotLeft(kWifi) + m_slotW / 2, cy = oy + m_pillHeight / 2, h = 6.0f * m_scale;
+            dc->DrawLine({cx - h, cy + h}, {cx + h, cy - h}, white.get(), std::max(1.0f, 1.4f * m_scale));
+        }
+
+        // Volume: Mute (E74F) or Volume0..3 (E992..E995) by level.
+        wchar_t vol = L'\uE74F';
+        if (m_audio && !m_muted)
+            vol = m_volume <= 0.0f ? L'\uE992' : m_volume < 0.34f ? L'\uE993' : m_volume < 0.67f ? L'\uE994' : L'\uE995';
+        glyph(kVolume, vol, m_audio ? white.get() : dim.get());
     } catch (...) {
         interop->EndDraw();
         throw;

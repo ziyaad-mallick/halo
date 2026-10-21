@@ -44,6 +44,7 @@
 #include "swoop.h"
 #include "menu.h"
 #include "pins.h"
+#include "services.h"
 #include "taskbar.h"
 #include "winkey.h"
 #include "edge.h"
@@ -94,6 +95,7 @@ constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 constexpr UINT kMsgTestLauncher = WM_APP + 8;
 constexpr UINT kMsgTestControlCenter = WM_APP + 20;  // HALO_TEST=1: toggle the Control Center
 constexpr UINT kMsgSettings = WM_APP + 50;  // halo::settings::Watch: settings.ini changed
+constexpr UINT kMsgVolume = WM_APP + 61;  // HALO 2.0: the speaker volume / mute changed elsewhere
 constexpr UINT kMsgGuardianGone = WM_APP + 60;  // the guardian that started us exited
 constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Control Center) / kRight (notifications)
 constexpr UINT kMsgTestNotifCenter = WM_APP + 21;  // HALO_TEST=1: toggle the Notification Center
@@ -233,6 +235,10 @@ private:
     // closed together: Win+A, Win+N, the edge gestures and the test messages all come through here.
     void OpenPanel(bool byPointer = false, bool withNotifs = true);
     void ClosePanel();
+    // HALO 2.0: the right side opens the notification column on its own (with the calendar), not the Control Center.
+    void OpenNotifications();
+    void ToggleNotifications();
+    void SyncVolume();
     void TogglePanel() { if (m_cc && m_cc->IsOpen()) ClosePanel(); else OpenPanel(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
     std::wstring LaunchTarget(RunningApp const& app) const;
@@ -263,6 +269,8 @@ private:
     std::unique_ptr<halo::Swoop> m_swoop;  // after m_tracker: dies first, giving windows their transitions back
     std::unique_ptr<Dock> m_dock;
     std::unique_ptr<DockCluster> m_cluster;
+    std::unique_ptr<DockWidgets> m_widgets;  // HALO 2.0: Wi-Fi + volume, right of the pill
+    halo::svc::AudioEndpoint m_speaker;       // bound while HALO 2.0 is on
     std::unique_ptr<halo::AppLabel> m_label;
     std::unique_ptr<halo::Launcher> m_launcher;
     std::unique_ptr<halo::Previews> m_previews;
@@ -276,6 +284,7 @@ private:
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
     bool m_pressedStart = false;  // the button went down on the Start logo
+    Dock::Kind m_pressedWidget = Dock::Kind::None;  // HALO 2.0: ... or on the Wi-Fi / volume widget
     bool m_autoHide = true;  // off under HALO_TEST
     halo::settings::Settings m_cfg;  // what the dock was last built / applied with
     UINT m_genieMsg = RegisterWindowMessageW(L"Halo.DockIconForWindow");
@@ -629,7 +638,8 @@ void Halo::ApplySettings(bool themeFlipped) {
     auto const& c = m_cfg;
     auto glass = [](Surface const& g) { return std::make_tuple(g.opacity, g.blur, g.hasTint, g.tint); };
     const bool look = themeFlipped || prev.theme != c.theme || prev.accent != c.accent;
-    const bool dockChanged = look || glass(prev.taskbar) != glass(c.taskbar) || prev.reduceMotion != c.reduceMotion ||
+    const bool h2Changed = prev.halo2 != c.halo2;
+    const bool dockChanged = h2Changed || look || glass(prev.taskbar) != glass(c.taskbar) || prev.reduceMotion != c.reduceMotion ||
                              prev.taskbar.iconSize != c.taskbar.iconSize || prev.taskbar.magnification != c.taskbar.magnification ||
                              prev.taskbar.runningDots != c.taskbar.runningDots;
     const bool ccChanged = look || glass(prev.cc) != glass(c.cc) || prev.cc.showMedia != c.cc.showMedia ||
@@ -643,6 +653,11 @@ void Halo::ApplySettings(bool themeFlipped) {
             return std::wstring(hex);
         }() + L")");
 
+    if (h2Changed) {  // the panels and Start are about to be reached differently: put them away
+        ClosePanel();
+        if (m_launcher && m_launcher->IsOpen()) m_launcher->Hide();
+        Log(std::wstring(L"settings: HALO 2.0 ") + (c.halo2 ? L"on" : L"off"));
+    }
     halo::edge::Configure(c.cc.hotCorner, c.cc.cornerWidth, c.cc.cornerDelay);
     if (m_swoop) m_swoop->SetEnabled(!c.reduceMotion);
     m_autoHide = !_wgetenv(L"HALO_TEST") && c.taskbar.autohide;
@@ -670,6 +685,7 @@ void Halo::RebuildDock(bool keepIcons) {
     m_dock->Detach();
     m_dock.reset();
     m_cluster.reset();
+    m_widgets.reset();
     if (!keepIcons) m_brushes.clear();  // icon surfaces are sized for the old icon size
     ComputeMetrics();
     const int x = m_monitor.left, y = m_monitor.bottom - m_height;
@@ -734,7 +750,14 @@ wuc::SpriteVisual Halo::BuildPillShadow(wuc::ContainerVisual const& pill) {
 void Halo::BuildDock() {
     auto pill = BuildPill();
     m_cluster = std::make_unique<DockCluster>(m_comp, m_gdev, m_hwnd, m_metrics.pillHeight, m_scale.v);
-    m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics, m_cluster.get());
+    if (halo::settings::Get().halo2) {
+        m_widgets = std::make_unique<DockWidgets>(m_comp, m_gdev, m_metrics.pillHeight, m_scale.v);
+        if (!m_speaker.Available()) m_speaker.Bind(eRender, m_hwnd, kMsgVolume);
+        SyncVolume();
+    } else {
+        m_speaker.Unbind();
+    }
+    m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics, m_cluster.get(), m_widgets.get());
     Step(L"pill shadow", [&] {
         auto shadow = BuildPillShadow(pill);
         if (shadow && pill.Parent()) pill.Parent().Children().InsertBelow(shadow, pill);
@@ -1082,7 +1105,10 @@ void Halo::ShowPreviewsFor(int item) {
 
 void Halo::PointerMove(float x, float y) {
     if (m_autoHide) Reveal();
-    if (m_dock) m_dock->OnPointerMove(x);
+    if (m_dock) {
+        m_dock->OnPointerMove(x);
+        m_dock->SetMagnet(m_dock->HitTest(x, y));
+    }
     if (m_menu && m_menu->IsOpen()) return;  // no name label or preview strip over an open menu
     if (m_dock && m_previews) {
         int hit = m_dock->HitTest(x, y);
@@ -1372,6 +1398,23 @@ void Halo::OpenPanel(bool byPointer, bool withNotifs) {
     }
 }
 
+void Halo::OpenNotifications() {
+    if (!m_notif || m_notif->IsOpen()) return;
+    m_notif->SetAnchor(RECT{});  // standalone: the full column at the right edge, calendar included
+    m_notif->Open();
+    Log(L"panel: notifications opened (HALO 2.0)");
+}
+
+void Halo::ToggleNotifications() {
+    if (m_notif && m_notif->IsOpen()) m_notif->Close();
+    else OpenNotifications();
+}
+
+// The speaker's level and mute onto the dock's volume widget.
+void Halo::SyncVolume() {
+    if (m_widgets) m_widgets->SetVolume(m_speaker.Volume(), m_speaker.Muted(), m_speaker.Available());
+}
+
 void Halo::ClosePanel() {
     KillTimer(m_hwnd, kPanelStagger);
     if (m_cc) m_cc->Close();   // its onHidden closes the notification column too
@@ -1389,7 +1432,12 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     if (m == halo::winkey::ControlCenterMessage()) {  // Win+A (wParam 0) / Win+N (1): both toggle the one panel
-        TogglePanel();
+        if (m_cfg.halo2) {  // Win+A is Start (it hosts the control centre), Win+N the notifications and calendar
+            if (w == 1) ToggleNotifications();
+            else OpenLauncher();
+        } else {
+            TogglePanel();
+        }
         return 0;
     }
     switch (m) {
@@ -1423,7 +1471,29 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 else m_launcher->TestCommand(w);
             }
             return 0;
-        case kMsgTestControlCenter: case kMsgTestNotifCenter: if (_wgetenv(L"HALO_TEST")) TogglePanel(); return 0;
+        case kMsgTestControlCenter: case kMsgTestNotifCenter:
+            if (_wgetenv(L"HALO_TEST")) {
+                if (!m_cfg.halo2) TogglePanel();
+                else if (m == kMsgTestNotifCenter) ToggleNotifications();
+                else OpenLauncher();
+            }
+            return 0;
+        case kMsgVolume: SyncVolume(); return 0;
+        case WM_MOUSEWHEEL:
+            if (m_cfg.halo2 && m_dock && m_widgets && m_state == State::Shown) {
+                POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};  // screen coordinates
+                ScreenToClient(m_hwnd, &p);
+                if (m_dock->HitTarget(static_cast<float>(p.x), static_cast<float>(p.y)).kind == Dock::Kind::Volume &&
+                    m_speaker.Available()) {
+                    // 2 % a notch, like the Windows volume; raising it unmutes.
+                    const float step = GET_WHEEL_DELTA_WPARAM(w) / static_cast<float>(WHEEL_DELTA) * 0.02f;
+                    m_speaker.SetVolume(std::clamp(m_speaker.Volume() + step, 0.0f, 1.0f));
+                    if (step > 0 && m_speaker.Muted()) m_speaker.SetMute(false);
+                    SyncVolume();
+                    return 0;
+                }
+            }
+            break;
         case kMsgIntellihideChanged:
             if (w || l) {
                 if (!m_trackingMouse) StartHide();
@@ -1452,6 +1522,11 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 if (SUCCEEDED(SHQueryUserNotificationState(&q)) &&
                     (q == QUNS_BUSY || q == QUNS_RUNNING_D3D_FULL_SCREEN || q == QUNS_PRESENTATION_MODE))
                     return 0;
+            }
+            if (m_cfg.halo2) {  // the right side is notifications + calendar; the top swipe goes to Start (it hosts the control centre)
+                if (w == halo::edge::kTop) OpenLauncher();
+                else OpenNotifications();
+                return 0;
             }
             OpenPanel(w == halo::edge::kBottom, w != halo::edge::kBottom);  // the corner: Quick Settings alone; touch: both, no auto-hide
             return 0;
@@ -1506,7 +1581,9 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_LBUTTONDOWN:
             if (m_dock && m_state == State::Shown) {
-                m_pressedStart = m_dock->HitStart(mx, my);
+                const Dock::Target target = m_dock->HitTarget(mx, my);
+                m_pressedStart = target.kind == Dock::Kind::Start;
+                m_pressedWidget = target.kind == Dock::Kind::Wifi || target.kind == Dock::Kind::Volume ? target.kind : Dock::Kind::None;
                 m_pressed = m_dock->HitTest(mx, my);
                 m_dock->SetPressed(m_pressed);
                 if (m_pressed >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
@@ -1516,6 +1593,15 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_CAPTURECHANGED:
             if (std::exchange(m_pressedStart, false) && m == WM_LBUTTONUP && m_dock && m_dock->HitStart(mx, my))
                 OpenLauncher();
+            if (const Dock::Kind widget = std::exchange(m_pressedWidget, Dock::Kind::None);
+                widget != Dock::Kind::None && m == WM_LBUTTONUP && m_dock && m_dock->HitTarget(mx, my).kind == widget) {
+                if (widget == Dock::Kind::Wifi) {
+                    OpenLauncher();  // Start hosts the Wi-Fi list
+                } else if (m_speaker.Available()) {
+                    m_speaker.SetMute(!m_speaker.Muted());
+                    SyncVolume();
+                }
+            }
             if (m_pressed >= 0 && m_dock) {
                 int pressed = std::exchange(m_pressed, -1);
                 m_dock->SetPressed(-1);

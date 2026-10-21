@@ -21,6 +21,8 @@ namespace {
 
 constexpr float kPi = 3.14159265f;
 constexpr int kFocusMs = 150;      // magnification in and out
+constexpr int kMagnetMs = 120;     // the pull toward the pointer easing in and out
+constexpr float kPullPx = 4.0f;    // its reach at the rest size of 28
 constexpr int kPresenceMs = 250;   // an icon growing in or shrinking out
 constexpr int kFadeMs = 150;       // running dots
 constexpr int kPressInMs = 60;
@@ -72,8 +74,9 @@ float WaveGrowth(DockMetrics const& m) {
 
 Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
            ContainerVisual const& pill, DockMetrics const& metrics,
-           DockCluster* cluster)
-    : m_compositor(compositor), m_pill(pill), m_m(metrics), m_cluster(cluster) {
+           DockCluster* cluster, DockWidgets* widgets)
+    : m_compositor(compositor), m_pill(pill), m_m(metrics), m_cluster(cluster), m_widgets(widgets),
+      m_h2(halo::settings::Get().halo2) {
     m_root = m_compositor.CreateContainerVisual();
     m_root.RelativeSizeAdjustment({1.0f, 1.0f});
     parent.Children().InsertAtTop(m_root);
@@ -109,6 +112,21 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
         }
     }
 
+    if (m_widgets && m_widgets->Visual()) {
+        m_rightWidth = m_widgets->Width();
+        m_rightOffset = m_rightWidth + m_m.gap;
+        const float cw = std::max(1.0f, std::round(m_m.restSize / 28));
+        const float ch = m_m.pillHeight * 0.6f;
+        m_rightDivider = m_compositor.CreateSpriteVisual();
+        m_rightDivider.Size({cw, ch});
+        m_rightDivider.Brush(m_compositor.CreateColorBrush(halo::theme::C(halo::theme::P().divider)));
+        m_rightDivider.Offset({0, m_m.bottom - (m_m.pillHeight + ch) / 2, 0});
+        m_root.Children().InsertAtTop(m_rightDivider);
+        m_widgets->Visual().Offset({0, m_m.bottom - m_m.pillHeight, 0});
+        m_root.Children().InsertAtTop(m_widgets->Visual());
+    }
+    m_shift = (m_clusterOffset - m_rightOffset) / 2;
+
     // A 1px line, 60% of the pill high, in a slot one gap wide: a full gap
     // each side. Its slot and opacity animate when the first unpinned icon
     // arrives and the last one leaves.
@@ -122,7 +140,7 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
     m_divider.Properties().InsertScalar(L"Slot", 0.0f);
     m_root.Children().InsertAtTop(m_divider);
 
-    m_pill.Size({m_clusterOffset + WidthAtRest(m_m, 0, false), m_m.pillHeight});
+    m_pill.Size({m_clusterOffset + m_rightOffset + WidthAtRest(m_m, 0, false), m_m.pillHeight});
     m_pill.Offset({m_m.centerX - m_pill.Size().x / 2, m_m.bottom - m_m.pillHeight, 0});
     auto clipShape = m_compositor.CreateRoundedRectangleGeometry();
     clipShape.CornerRadius({m_m.cornerRadius, m_m.cornerRadius});
@@ -143,18 +161,18 @@ float Dock::RestWidth() const {
         n++;
         extra |= e.extra && n > 1;
     }
-    return m_clusterOffset + WidthAtRest(m_m, n, extra);
+    return m_clusterOffset + m_rightOffset + WidthAtRest(m_m, n, extra);
 }
 
 float Dock::MaxWidth() const {
     // The wave adds at most about 2 * radius / pitch icons' worth of growth.
-    return m_clusterOffset + WidthAtRest(m_m, m_entries.size(), true) + WaveGrowth(m_m) * (m_m.restSize + m_m.gap);
+    return m_clusterOffset + m_rightOffset + WidthAtRest(m_m, m_entries.size(), true) + WaveGrowth(m_m) * (m_m.restSize + m_m.gap);
 }
 
 size_t Dock::MaxItems(float availWidth) const {
     // MaxWidth solved for the icon count: any more and the magnified pill would run off the screen.
     float pitch = m_m.restSize + m_m.gap;
-    float room = availWidth - m_clusterOffset - WidthAtRest(m_m, 0, true) - WaveGrowth(m_m) * pitch;
+    float room = availWidth - m_clusterOffset - m_rightOffset - WidthAtRest(m_m, 0, true) - WaveGrowth(m_m) * pitch;
     return room < pitch ? 1 : static_cast<size_t>(room / pitch);
 }
 
@@ -181,6 +199,7 @@ Dock::Entry Dock::MakeEntry(Item const& item, bool instant) {
     v.Offset({0, IconY(), 0});
     v.Properties().InsertScalar(L"P", instant ? 1.0f : 0.0f);  // presence
     v.Properties().InsertScalar(L"S", instant ? 1.0f : 0.0f);  // scale, set by an expression
+    v.Properties().InsertScalar(L"Mag", 0.0f);                 // 0..1: how far the magnetic pull toward the pointer has eased in
     m_root.Children().InsertAtTop(v);
     e.icon = v;
 
@@ -331,7 +350,7 @@ void Dock::BuildExpressions() {
         for (size_t j = 0; j < n; j++) a.SetReferenceParameter(Param(j), m_entries[j].icon.Properties());
     };
 
-    std::wstring clusterShift = m_clusterOffset > 0.0f ? (L" + " + std::to_wstring(m_clusterOffset / 2)) : L"";
+    std::wstring clusterShift = m_shift != 0.0f ? (L" + " + std::to_wstring(m_shift)) : L"";
 
     for (size_t i = 0; i < n; i++) {
         const std::wstring me = Param(i);
@@ -353,7 +372,10 @@ void Dock::BuildExpressions() {
         // its slot (Offset is its top-left before scaling).
         const std::wstring slotCenter = L"p.Center" + clusterShift + L" - " + total(L"S") + L" / 2 + " + start(i, L"S") + L" + p.Pitch * " +
                                         me + L".S / 2";
-        auto x = m_compositor.CreateExpressionAnimation(slotCenter + L" - p.Rest / 2");
+        // The magnetic pull: a fraction of the way to the pointer, capped, eased in by Mag (stays 0 under reduce motion).
+        const std::wstring pull = L" + Clamp((p.PointerX - (" + slotCenter + L")) * 0.3, -" + std::to_wstring(kPullPx * m_m.restSize / 28) +
+                                  L", " + std::to_wstring(kPullPx * m_m.restSize / 28) + L") * " + me + L".Mag";
+        auto x = m_compositor.CreateExpressionAnimation(slotCenter + pull + L" - p.Rest / 2");
         bind(x);
         Start(m_entries[i].icon, L"Offset.X", x, L"icon x");
 
@@ -383,10 +405,24 @@ void Dock::BuildExpressions() {
         Start(m_clusterDivider, L"Offset.X", clusterDivX, L"cluster divider x");
     }
 
+    if (m_widgets && m_rightDivider) {
+        // Pinned to the pill's right end, so the widgets stay put as the wave stretches the pill.
+        auto wx = m_compositor.CreateExpressionAnimation(L"pill.Offset.X + pill.Size.X - p.Padding - " + std::to_wstring(m_rightWidth));
+        wx.SetReferenceParameter(L"pill", m_pill);
+        wx.SetReferenceParameter(L"p", m_props);
+        Start(m_widgets->Visual(), L"Offset.X", wx, L"widgets x");
+
+        auto dx = m_compositor.CreateExpressionAnimation(
+            L"pill.Offset.X + pill.Size.X - p.Padding - " + std::to_wstring(m_rightWidth + m_m.gap / 2 + m_rightDivider.Size().x / 2));
+        dx.SetReferenceParameter(L"pill", m_pill);
+        dx.SetReferenceParameter(L"p", m_props);
+        Start(m_rightDivider, L"Offset.X", dx, L"widgets divider x");
+    }
+
     // The pill wraps the slots: it grows with the icons instead of letting
     // the outer ones slide off.
-    if (n > 0 || m_cluster) {
-        std::wstring widthExpr = (m_clusterOffset > 0.0f ? (std::to_wstring(m_clusterOffset) + L" + ") : L"") +
+    if (n > 0 || m_cluster || m_widgets) {
+        std::wstring widthExpr = (m_clusterOffset + m_rightOffset > 0.0f ? (std::to_wstring(m_clusterOffset + m_rightOffset) + L" + ") : L"") +
                                  total(L"S") + L" - p.Gap + 2 * p.Padding";
         auto width = m_compositor.CreateExpressionAnimation(widthExpr);
         bind(width);
@@ -414,6 +450,7 @@ void Dock::OnPointerMove(float x) {
 }
 
 void Dock::OnPointerLeave() {
+    SetMagnet(-1);
     if (!m_hovering) return;
     m_hovering = false;
     AnimateTo(m_props, L"Intensity", 0.0f, kFocusMs);
@@ -428,7 +465,7 @@ std::pair<float, float> Dock::RestIconCenter(size_t index) const {
     const float pitch = m_m.restSize + m_m.gap;
     const float divider = d >= 0 ? m_m.gap : 0.0f;
     // The rest layout HitTest uses, with every icon fully present.
-    const float left = m_m.centerX + m_clusterOffset / 2 - (pitch * n + divider) / 2;
+    const float left = m_m.centerX + m_shift - (pitch * n + divider) / 2;
     const float x = left + pitch * index + (d >= 0 && static_cast<int>(index) >= d ? divider : 0.0f) + pitch / 2;
     return {x, IconY() + m_m.restSize / 2};
 }
@@ -443,7 +480,7 @@ std::pair<float, float> Dock::MagnifiedIconCenterAndTop(size_t index) const {
     for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
     const float pitch = m_m.restSize + m_m.gap;
     const float divider = d >= 0 ? m_m.gap : 0.0f;
-    const float restLeft = m_m.centerX + m_clusterOffset / 2 - (pitch * n + divider) / 2;
+    const float restLeft = m_m.centerX + m_shift - (pitch * n + divider) / 2;
     std::vector<float> mag(n);
     float total = divider;
     for (size_t k = 0; k < n; k++) {
@@ -452,7 +489,7 @@ std::pair<float, float> Dock::MagnifiedIconCenterAndTop(size_t index) const {
         mag[k] = 1 + (m_m.maxScale - 1) * (m_hovering ? 1.0f : 0.0f) * (std::cos(t * kPi) + 1) / 2;
         total += pitch * mag[k];
     }
-    float left = m_m.centerX + m_clusterOffset / 2 - total / 2;
+    float left = m_m.centerX + m_shift - total / 2;
     for (size_t k = 0; k < index; k++) {
         if (static_cast<int>(k) == d) left += divider;
         left += pitch * mag[k];
@@ -464,30 +501,7 @@ std::pair<float, float> Dock::MagnifiedIconCenterAndTop(size_t index) const {
     return {centerX, topY};
 }
 
-bool Dock::HitStart(float x, float y) const {
-    if (!m_cluster) return false;
-    std::vector<Entry const*> live;
-    for (auto const& e : m_entries) if (!e.leaving) live.push_back(&e);
-    const size_t n = live.size();
-    int d = -1;
-    for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
-    const float pitch = m_m.restSize + m_m.gap;
-    const float divider = d >= 0 ? m_m.gap : 0.0f;
-    // The pill's width as the expressions compute it, with every icon fully present.
-    const float restLeft = m_m.centerX + m_clusterOffset / 2 - (pitch * n + divider) / 2;
-    float total = divider;
-    for (size_t k = 0; k < n; k++) {
-        float center = restLeft + pitch * k + (d >= 0 && static_cast<int>(k) >= d ? divider : 0.0f) + pitch / 2;
-        float t = std::min(std::abs(m_pointerX - center) / m_m.radius, 1.0f);
-        total += pitch * (1 + (m_m.maxScale - 1) * (m_hovering ? 1.0f : 0.0f) * (std::cos(t * kPi) + 1) / 2);
-    }
-    const float pillWidth = m_clusterOffset + (n > 0 ? total - m_m.gap : 0.0f) + 2 * m_m.padding;
-    const float clusterLeft = m_m.centerX - pillWidth / 2 + m_m.padding;
-    const float top = m_m.bottom - m_m.pillHeight;
-    return y >= top && y <= m_m.bottom && m_cluster->HitTestStart(x - clusterLeft, y - top);
-}
-
-int Dock::HitTest(float x, float y) const {
+Dock::Target Dock::HitTarget(float x, float y) const {
     std::vector<Entry const*> live;
     for (auto const& e : m_entries) if (!e.leaving) live.push_back(&e);
     const size_t n = live.size();
@@ -496,7 +510,7 @@ int Dock::HitTest(float x, float y) const {
     for (size_t k = 1; k < n && d < 0; k++) if (live[k]->extra) d = static_cast<int>(k);
     const float pitch = m_m.restSize + m_m.gap;
     const float divider = d >= 0 ? m_m.gap : 0.0f;
-    const float restLeft = m_m.centerX + m_clusterOffset / 2 - (pitch * n + divider) / 2;
+    const float restLeft = m_m.centerX + m_shift - (pitch * n + divider) / 2;
     std::vector<float> mag(n);
     float total = divider;
     for (size_t k = 0; k < n; k++) {
@@ -506,19 +520,70 @@ int Dock::HitTest(float x, float y) const {
         total += pitch * mag[k];
     }
 
-    if (n == 0) return -1;
+    // The pill's width as the expressions compute it, with every icon fully present.
+    const float pillWidth = m_clusterOffset + m_rightOffset + (n > 0 ? total - m_m.gap : 0.0f) + 2 * m_m.padding;
+    const float pillLeft = m_m.centerX - pillWidth / 2;
+    const float pillTop = m_m.bottom - m_m.pillHeight;
 
-    float left = m_m.centerX + m_clusterOffset / 2 - total / 2;
+    // The targets left to right, as horizontal spans: the cluster (all of it with HALO 2.0, else the Start logo),
+    // then every icon's whole slot, then the widgets.
+    std::vector<halo::hit::Span> spans;
+    std::vector<Target> targets;
+    if (m_cluster) {
+        const float cl = pillLeft + m_m.padding;
+        if (m_h2) spans.push_back({cl, cl + m_clusterWidth});
+        else spans.push_back({cl + m_cluster->StartX(), cl + m_cluster->StartX() + m_cluster->StartWidth()});
+        targets.push_back({Kind::Start, -1});
+    }
+    float left = m_m.centerX + m_shift - total / 2;
     for (size_t k = 0; k < n; k++) {
         if (static_cast<int>(k) == d) left += divider;
-        float slot = pitch * mag[k];
-        if (x >= left && x < left + slot) {
-            float top = m_m.bottom - (m_m.pillHeight - m_m.restSize) / 2 - m_m.restSize * mag[k];
-            return y >= std::min(top, m_m.bottom - m_m.pillHeight) ? static_cast<int>(k) : -1;
-        }
+        const float slot = pitch * mag[k];
+        spans.push_back({left, left + slot});
+        targets.push_back({Kind::App, static_cast<int>(k)});
         left += slot;
     }
-    return -1;
+    if (m_widgets && m_rightWidth > 0.0f) {
+        const float wl = pillLeft + pillWidth - m_m.padding - m_rightWidth;
+        for (int s = 0; s < DockWidgets::kSlots; s++) {
+            spans.push_back({wl + m_widgets->SlotLeft(s), wl + m_widgets->SlotRight(s)});
+            targets.push_back({s == DockWidgets::kWifi ? Kind::Wifi : Kind::Volume, -1});
+        }
+    }
+    // Reaches the pill's edge (the padding) and half a gap beyond; the gaps between targets are at most one gap.
+    const int hit = halo::hit::Nearest(spans, x, m_m.padding + m_m.gap / 2);
+    if (hit < 0) return {};
+    Target t = targets[hit];
+    // A little above the pill (or the magnified icon) still counts.
+    float top = pillTop;
+    if (t.kind == Kind::App) top = std::min(top, m_m.bottom - (m_m.pillHeight - m_m.restSize) / 2 - m_m.restSize * mag[t.index]);
+    if (!halo::hit::BelowTop(y, top, m_m.restSize / 2)) return {};
+    return t;
+}
+
+bool Dock::HitStart(float x, float y) const { return HitTarget(x, y).kind == Kind::Start; }
+
+int Dock::HitTest(float x, float y) const {
+    Target t = HitTarget(x, y);
+    return t.kind == Kind::App ? t.index : -1;
+}
+
+// The hovered icon is pulled toward the pointer by the compositor (the Mag term in BuildExpressions); this only
+// eases which icon's Mag is up.
+void Dock::SetMagnet(int index) {
+    if (halo::settings::Get().reduceMotion) index = -1;
+    unsigned want = 0;
+    int k = 0;
+    for (auto const& e : m_entries) {
+        if (e.leaving) continue;
+        if (k++ == index) want = e.id;
+    }
+    if (want == m_magnetId) return;
+    for (auto& e : m_entries) {
+        if (e.id == m_magnetId && m_magnetId) AnimateTo(e.icon.Properties(), L"Mag", 0.0f, kMagnetMs);
+        if (e.id == want) AnimateTo(e.icon.Properties(), L"Mag", 1.0f, kMagnetMs);
+    }
+    m_magnetId = want;
 }
 
 void Dock::SetPressed(int index) {
@@ -626,4 +691,5 @@ void Dock::OnPowerBroadcast(WPARAM w, LPARAM l) {
 
 void Dock::OnNetworkChanged() {
     if (m_cluster) m_cluster->OnNetworkChanged();
+    if (m_widgets) m_widgets->OnNetworkChanged();
 }

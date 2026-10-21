@@ -43,6 +43,7 @@ slow, `200` = twice as fast). `motion` scales distances and overshoot (`0` = no 
 | `theme` | theme | `system` | | glass and text follow Windows, or are forced dark/light |
 | `accent` | color | `#14A394` | | the "on" colour for toggles, sliders and focus everywhere |
 | `reduce_motion` | bool | `off` | | every effect behaves like `fade`, hover magnification off |
+| `halo2` | bool | `off` | | HALO 2.0 preview: clicking the left cluster opens Start (which hosts the control centre); the right side opens notifications and a calendar instead of the Control Center, and the dock gets Wi-Fi and volume widgets. Applies live |
 
 ### `[taskbar]` (the dock)
 | key | type | default | range | meaning |
