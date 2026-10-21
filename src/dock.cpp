@@ -112,20 +112,11 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
         }
     }
 
-    if (m_widgets && m_widgets->Visual()) {
-        m_rightWidth = m_widgets->Width();
-        m_rightOffset = m_rightWidth + m_m.gap;
-        const float cw = std::max(1.0f, std::round(m_m.restSize / 28));
-        const float ch = m_m.pillHeight * 0.6f;
-        m_rightDivider = m_compositor.CreateSpriteVisual();
-        m_rightDivider.Size({cw, ch});
-        m_rightDivider.Brush(m_compositor.CreateColorBrush(halo::theme::C(halo::theme::P().divider)));
-        m_rightDivider.Offset({0, m_m.bottom - (m_m.pillHeight + ch) / 2, 0});
-        m_root.Children().InsertAtTop(m_rightDivider);
-        m_widgets->Visual().Offset({0, m_m.bottom - m_m.pillHeight, 0});
-        m_root.Children().InsertAtTop(m_widgets->Visual());
+    if (m_widgets && m_widgets->Capsule()) {  // the Now Playing pill floats beside the dock, level with it
+        m_widgets->Capsule().Offset({0, m_m.bottom - m_m.pillHeight, 0});
+        m_root.Children().InsertAtTop(m_widgets->Capsule());
     }
-    m_shift = (m_clusterOffset - m_rightOffset) / 2;
+    m_shift = m_clusterOffset / 2;
 
     // A 1px line, 60% of the pill high, in a slot one gap wide: a full gap
     // each side. Its slot and opacity animate when the first unpinned icon
@@ -140,13 +131,17 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
     m_divider.Properties().InsertScalar(L"Slot", 0.0f);
     m_root.Children().InsertAtTop(m_divider);
 
-    m_pill.Size({m_clusterOffset + m_rightOffset + WidthAtRest(m_m, 0, false), m_m.pillHeight});
+    m_pill.Size({m_clusterOffset + WidthAtRest(m_m, 0, false), m_m.pillHeight});
     m_pill.Offset({m_m.centerX - m_pill.Size().x / 2, m_m.bottom - m_m.pillHeight, 0});
     auto clipShape = m_compositor.CreateRoundedRectangleGeometry();
     clipShape.CornerRadius({m_m.cornerRadius, m_m.cornerRadius});
     clipShape.Size(m_pill.Size());
     m_pill.Clip(m_compositor.CreateGeometricClip(clipShape));
     m_root.Children().InsertAtBottom(m_pill);
+}
+
+float Dock::CapsuleExtent() const {
+    return m_widgets && m_widgets->CapsuleShown() ? m_widgets->CapsuleGap() + m_widgets->CapsuleWidth() : 0.0f;
 }
 
 float Dock::DotSize() const { return m_m.restSize / 7; }  // 4 logical px at the rest size of 28
@@ -161,18 +156,18 @@ float Dock::RestWidth() const {
         n++;
         extra |= e.extra && n > 1;
     }
-    return m_clusterOffset + m_rightOffset + WidthAtRest(m_m, n, extra);
+    return m_clusterOffset + WidthAtRest(m_m, n, extra);
 }
 
 float Dock::MaxWidth() const {
     // The wave adds at most about 2 * radius / pitch icons' worth of growth.
-    return m_clusterOffset + m_rightOffset + WidthAtRest(m_m, m_entries.size(), true) + WaveGrowth(m_m) * (m_m.restSize + m_m.gap);
+    return m_clusterOffset + WidthAtRest(m_m, m_entries.size(), true) + WaveGrowth(m_m) * (m_m.restSize + m_m.gap);
 }
 
 size_t Dock::MaxItems(float availWidth) const {
     // MaxWidth solved for the icon count: any more and the magnified pill would run off the screen.
     float pitch = m_m.restSize + m_m.gap;
-    float room = availWidth - m_clusterOffset - m_rightOffset - WidthAtRest(m_m, 0, true) - WaveGrowth(m_m) * pitch;
+    float room = availWidth - m_clusterOffset - WidthAtRest(m_m, 0, true) - WaveGrowth(m_m) * pitch;
     return room < pitch ? 1 : static_cast<size_t>(room / pitch);
 }
 
@@ -405,24 +400,17 @@ void Dock::BuildExpressions() {
         Start(m_clusterDivider, L"Offset.X", clusterDivX, L"cluster divider x");
     }
 
-    if (m_widgets && m_rightDivider) {
-        // Pinned to the pill's right end, so the widgets stay put as the wave stretches the pill.
-        auto wx = m_compositor.CreateExpressionAnimation(L"pill.Offset.X + pill.Size.X - p.Padding - " + std::to_wstring(m_rightWidth));
-        wx.SetReferenceParameter(L"pill", m_pill);
-        wx.SetReferenceParameter(L"p", m_props);
-        Start(m_widgets->Visual(), L"Offset.X", wx, L"widgets x");
-
-        auto dx = m_compositor.CreateExpressionAnimation(
-            L"pill.Offset.X + pill.Size.X - p.Padding - " + std::to_wstring(m_rightWidth + m_m.gap / 2 + m_rightDivider.Size().x / 2));
-        dx.SetReferenceParameter(L"pill", m_pill);
-        dx.SetReferenceParameter(L"p", m_props);
-        Start(m_rightDivider, L"Offset.X", dx, L"widgets divider x");
+    if (m_widgets && m_widgets->Capsule()) {
+        // Glued to the pill's right edge (and so follows it as the wave stretches it), one gap away.
+        auto cx = m_compositor.CreateExpressionAnimation(L"pill.Offset.X + pill.Size.X + " + std::to_wstring(m_widgets->CapsuleGap()));
+        cx.SetReferenceParameter(L"pill", m_pill);
+        Start(m_widgets->Capsule(), L"Offset.X", cx, L"capsule x");
     }
 
     // The pill wraps the slots: it grows with the icons instead of letting
     // the outer ones slide off.
     if (n > 0 || m_cluster || m_widgets) {
-        std::wstring widthExpr = (m_clusterOffset + m_rightOffset > 0.0f ? (std::to_wstring(m_clusterOffset + m_rightOffset) + L" + ") : L"") +
+        std::wstring widthExpr = (m_clusterOffset > 0.0f ? (std::to_wstring(m_clusterOffset) + L" + ") : L"") +
                                  total(L"S") + L" - p.Gap + 2 * p.Padding";
         auto width = m_compositor.CreateExpressionAnimation(widthExpr);
         bind(width);
@@ -521,7 +509,7 @@ Dock::Target Dock::HitTarget(float x, float y) const {
     }
 
     // The pill's width as the expressions compute it, with every icon fully present.
-    const float pillWidth = m_clusterOffset + m_rightOffset + (n > 0 ? total - m_m.gap : 0.0f) + 2 * m_m.padding;
+    const float pillWidth = m_clusterOffset + (n > 0 ? total - m_m.gap : 0.0f) + 2 * m_m.padding;
     const float pillLeft = m_m.centerX - pillWidth / 2;
     const float pillTop = m_m.bottom - m_m.pillHeight;
 
@@ -543,11 +531,12 @@ Dock::Target Dock::HitTarget(float x, float y) const {
         targets.push_back({Kind::App, static_cast<int>(k)});
         left += slot;
     }
-    if (m_widgets && m_rightWidth > 0.0f) {
-        const float wl = pillLeft + pillWidth - m_m.padding - m_rightWidth;
-        for (int s = 0; s < DockWidgets::kSlots; s++) {
-            spans.push_back({wl + m_widgets->SlotLeft(s), wl + m_widgets->SlotRight(s)});
-            targets.push_back({s == DockWidgets::kWifi ? Kind::Wifi : s == DockWidgets::kBluetooth ? Kind::Bluetooth : Kind::Media, -1});
+    if (m_widgets && m_widgets->CapsuleShown()) {  // the Now Playing pill beside the dock: artwork and text, then its two buttons
+        using Part = DockWidgets::Part;
+        const float cl = pillLeft + pillWidth + m_widgets->CapsuleGap();
+        for (auto [part, kind] : {std::pair{Part::Body, Kind::Media}, {Part::Play, Kind::MediaPlay}, {Part::Next, Kind::MediaNext}}) {
+            spans.push_back({cl + m_widgets->PartLeft(part), cl + m_widgets->PartRight(part)});
+            targets.push_back({kind, -1});
         }
     }
     // Reaches the pill's edge (the padding) and half a gap beyond; the gaps between targets are at most one gap.
@@ -691,5 +680,4 @@ void Dock::OnPowerBroadcast(WPARAM w, LPARAM l) {
 
 void Dock::OnNetworkChanged() {
     if (m_cluster) m_cluster->OnNetworkChanged();
-    if (m_widgets) m_widgets->OnNetworkChanged();
-}
+  }

@@ -1,10 +1,14 @@
 #include "theme.h"
+#include "tokens.h"
 #include "cluster.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <winrt/Windows.Graphics.DirectX.h>
+#include <winrt/Windows.UI.Composition.h>
+#include <chrono>
+#include <winrt/Windows.Foundation.Collections.h>
 
 #ifndef __ICompositionDrawingSurfaceInterop_INTERFACE_DEFINED__
 #define __ICompositionDrawingSurfaceInterop_INTERFACE_DEFINED__
@@ -240,7 +244,7 @@ void DockCluster::Layout() {
     m_timeW = TextWidth(L"88:88", m_tfTime.get());
     m_wifiX = m_timeX + m_timeW + 10.0f * s;
     m_iconW = std::max(TextWidth(L"\uE701", m_tfIcons.get()), TextWidth(L"\uEBAA", m_tfIcons.get()));
-    m_battX = halo::settings::Get().halo2 ? m_timeX + m_timeW + 12.0f * s : m_wifiX + m_iconW + 8.0f * s;
+    m_battX = m_wifiX + m_iconW + 8.0f * s;
     m_battTextW = TextWidth(L"100%", m_tfBattText.get());
     m_startWidth = std::round((halo::settings::Get().halo2 ? 36.0f : 28.0f) * s);  // one rest-size icon slot
     m_startX = m_battX + m_iconW + 3.0f * s + m_battTextW + 8.0f * s;
@@ -277,7 +281,7 @@ void DockCluster::Render() {
         time->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         dc->DrawTextLayout({ox + m_timeX, oy}, time.get(), white.get());
 
-        if (!halo::settings::Get().halo2) {
+        {
         // Network: Wi-Fi or Ethernet glyph; dimmed Wi-Fi when offline.
         const NetState ns = ReadNet();
         const bool online = ns.online;
@@ -327,99 +331,297 @@ void DockCluster::Render() {
     interop->EndDraw();
 }
 
-// ---- DockWidgets (HALO 2.0) --------------------------------------------------------------------
+// ---- DockWidgets: the Now Playing pill (HALO 2.0) -----------------------------------------------
+
+namespace {
+
+using halo::ui::kBody;
+using halo::ui::kCaption;
+using halo::ui::kHoverMs;
+using halo::ui::kIcon;
+using halo::ui::kRadiusSmall;
+using halo::ui::kS2;
+using halo::ui::kS3;
+using halo::ui::kSlowMs;
+
+// The artwork box-filtered to px x px (premultiplied BGRA in, out), so the pill keeps a few KB rather than the source image.
+std::vector<uint32_t> Thumb(std::vector<uint32_t> const& src, int srcPx, int px) {
+    std::vector<uint32_t> out(static_cast<size_t>(px) * px, 0);
+    if (srcPx <= 0 || src.size() < static_cast<size_t>(srcPx) * srcPx) return out;
+    for (int y = 0; y < px; y++)
+        for (int x = 0; x < px; x++) {
+            const int x0 = x * srcPx / px, x1 = std::max(x0 + 1, (x + 1) * srcPx / px);
+            const int y0 = y * srcPx / px, y1 = std::max(y0 + 1, (y + 1) * srcPx / px);
+            uint32_t acc[4] = {};
+            for (int yy = y0; yy < y1; yy++)
+                for (int xx = x0; xx < x1; xx++) {
+                    const uint32_t c = src[static_cast<size_t>(yy) * srcPx + xx];
+                    for (int k = 0; k < 4; k++) acc[k] += (c >> (8 * k)) & 0xFF;
+                }
+            const uint32_t n = static_cast<uint32_t>((x1 - x0) * (y1 - y0));
+            uint32_t c = 0;
+            for (int k = 0; k < 4; k++) c |= (acc[k] / n) << (8 * k);
+            out[static_cast<size_t>(y) * px + x] = c;
+        }
+    return out;
+}
+
+void FadeTo(winrt::Windows::UI::Composition::Compositor const& comp, winrt::Windows::UI::Composition::Visual const& v, float to) {
+    auto a = comp.CreateScalarKeyFrameAnimation();
+    a.InsertKeyFrame(1.0f, to, comp.CreateCubicBezierEasingFunction({0.2f, 0.0f}, {0.0f, 1.0f}));
+    a.Duration(std::chrono::milliseconds(kHoverMs));
+    v.StartAnimation(L"Opacity", a);
+}
+
+}  // namespace
 
 DockWidgets::DockWidgets(winrt::Windows::UI::Composition::Compositor const& compositor,
                          winrt::Windows::UI::Composition::CompositionGraphicsDevice const& gdev,
                          float pillHeight, float scale)
-    : m_gdev(gdev), m_pillHeight(pillHeight), m_scale(scale) {
-    m_slotW = std::round(28.0f * scale);
-    m_mediaW = std::round(144.0f * scale);  // one rest-size icon slot each
+    : m_comp(compositor), m_gdev(gdev), m_scale(scale) {
+    m_capH = pillHeight;  // the dock pill's own height
+    m_capGap = std::round(kS3 * scale);
+    m_inset = std::round(kS2 * scale);  // concentric with the pill: radius 20 less 8 is the artwork's 12
+    m_art = m_capH - 2 * m_inset;       // artwork and both buttons are the same size
+    m_textW = std::round(112.0f * scale);
+    m_capW = std::round(m_inset + m_art + kS3 * scale + m_textW + m_inset + 2 * m_art + m_inset);
+    m_thumbPx = static_cast<int>(m_art);
     winrt::check_hresult(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                              reinterpret_cast<IUnknown**>(m_dwriteFactory.put())));
-    winrt::check_hresult(m_dwriteFactory->CreateTextFormat(
-        IconFontFamily(m_dwriteFactory.get()), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 15.0f * scale, L"en-us", m_tfIcons.put()));
-    winrt::check_hresult(m_dwriteFactory->CreateTextFormat(
-        L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 12.0f * scale, L"en-us", m_tfMedia.put()));
-    m_tfMedia->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    m_tfMedia->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-    m_tfIcons->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_tfIcons->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    if (m_gdev) {
-        m_surface = m_gdev.CreateDrawingSurface(
-            {Width(), m_pillHeight}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-        m_visual = compositor.CreateSpriteVisual();
-        m_visual.Size({Width(), m_pillHeight});
-        m_visual.Brush(compositor.CreateSurfaceBrush(m_surface));
+    auto make = [&](wchar_t const* family, float size, DWRITE_FONT_WEIGHT weight, winrt::com_ptr<IDWriteTextFormat>& out) {
+        winrt::check_hresult(m_dwriteFactory->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                                               size * scale, L"en-us", out.put()));
+    };
+    make(IconFontFamily(m_dwriteFactory.get()), kIcon, DWRITE_FONT_WEIGHT_NORMAL, m_tfGlyph);
+    make(halo::ui::kFontText, kBody, DWRITE_FONT_WEIGHT_SEMI_BOLD, m_tfTitle);
+    make(halo::ui::kFontText, kCaption, DWRITE_FONT_WEIGHT_NORMAL, m_tfArtist);
+    m_tfGlyph->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    m_tfGlyph->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    for (auto* f : {m_tfTitle.get(), m_tfArtist.get()}) f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+    m_props = compositor.CreatePropertySet();
+    m_props.InsertScalar(L"Show", 0.0f);
+    if (!m_gdev) return;
+
+    // Fixed size; it fades and scales (about its left edge, so it stays beside the dock) with Show.
+    m_capsule = compositor.CreateContainerVisual();
+    m_capsule.Size({m_capW, m_capH});
+    m_capsule.CenterPoint({0.0f, m_capH / 2, 0.0f});
+    m_capsule.Opacity(0.0f);
+    auto geo = compositor.CreateRoundedRectangleGeometry();
+    geo.CornerRadius({halo::ui::kRadiusLarge * scale, halo::ui::kRadiusLarge * scale});
+    geo.Size({m_capW, m_capH});
+    m_capsule.Clip(compositor.CreateGeometricClip(geo));
+    auto opacity = compositor.CreateExpressionAnimation(L"c.Show");
+    opacity.SetReferenceParameter(L"c", m_props);
+    m_capsule.StartAnimation(L"Opacity", opacity);
+    auto scaleX = compositor.CreateExpressionAnimation(L"Vector3(0.94 + 0.06 * c.Show, 0.94 + 0.06 * c.Show, 1)");
+    scaleX.SetReferenceParameter(L"c", m_props);
+    m_capsule.StartAnimation(L"Scale", scaleX);
+
+    auto highlight = [&](halo::theme::Argb c) {
+        auto g = compositor.CreateEllipseGeometry();
+        g.Radius({m_art / 2, m_art / 2});
+        g.Center({m_art / 2, m_art / 2});
+        auto shape = compositor.CreateSpriteShape(g);
+        shape.FillBrush(compositor.CreateColorBrush(halo::theme::C(c)));
+        auto v = compositor.CreateShapeVisual();
+        v.Size({m_art, m_art});
+        v.Opacity(0.0f);
+        v.Shapes().Append(shape);
+        return v;
+    };
+    m_hoverHl = highlight(halo::theme::P().hover);
+    m_pressHl = highlight(halo::theme::P().press);
+    m_capsule.Children().InsertAtTop(m_hoverHl);
+    m_capsule.Children().InsertAtTop(m_pressHl);
+    m_content = compositor.CreateSpriteVisual();
+    m_content.Size({m_capW, m_capH});
+    m_capsule.Children().InsertAtTop(m_content);
+}
+
+void DockWidgets::AttachCapsuleGlass(winrt::Windows::UI::Composition::ContainerVisual const& glass) {
+    if (!m_capsule) return;
+    glass.Size({m_capW, m_capH});
+    m_capsule.Children().InsertAtBottom(glass);
+}
+
+// [0, play) is the artwork and text, then the play/pause button, then next.
+float DockWidgets::PartLeft(Part p) const {
+    switch (p) {
+        case Part::Play: return m_capW - m_inset - 2 * m_art;
+        case Part::Next: return m_capW - m_inset - m_art;
+        default: return 0.0f;
+    }
+}
+
+float DockWidgets::PartRight(Part p) const {
+    switch (p) {
+        case Part::Body: return PartLeft(Part::Play);
+        case Part::Play: return PartLeft(Part::Next);
+        default: return m_capW;
+    }
+}
+
+void DockWidgets::AnimateShow(float to) {
+    if (halo::settings::Get().reduceMotion) {
+        m_props.StopAnimation(L"Show");
+        m_props.InsertScalar(L"Show", to);
+        return;
+    }
+    auto a = m_comp.CreateScalarKeyFrameAnimation();
+    a.InsertKeyFrame(1.0f, to, m_comp.CreateCubicBezierEasingFunction({0.2f, 0.0f}, {0.0f, 1.0f}));  // decelerates, no overshoot
+    a.Duration(std::chrono::milliseconds(kSlowMs));
+    m_props.StartAnimation(L"Show", a);
+}
+
+void DockWidgets::MoveHighlight(winrt::Windows::UI::Composition::ShapeVisual const& v, Part p, bool glide) {
+    const float x = PartLeft(p);
+    if (!glide) {
+        v.StopAnimation(L"Offset.X");
+        v.Offset({x, m_inset, 0});
+        return;
+    }
+    v.Offset({v.Offset().x, m_inset, 0});
+    auto a = m_comp.CreateScalarKeyFrameAnimation();
+    a.InsertKeyFrame(1.0f, x, m_comp.CreateCubicBezierEasingFunction({0.2f, 0.0f}, {0.0f, 1.0f}));
+    a.Duration(std::chrono::milliseconds(kHoverMs));
+    v.StartAnimation(L"Offset.X", a);
+}
+
+// The hover highlight glides between the two buttons and fades in and out; only the buttons have one.
+void DockWidgets::SetHover(Part p) {
+    if (!m_hoverHl) return;
+    if (p == Part::Body || (p == Part::Next && !m_canNext) || !m_hasMedia) p = Part::None;
+    if (p == m_hover) return;
+    const bool was = m_hover != Part::None;
+    m_hover = p;
+    if (p == Part::None) {
+        FadeTo(m_comp, m_hoverHl, 0.0f);
+        return;
+    }
+    MoveHighlight(m_hoverHl, p, was);
+    FadeTo(m_comp, m_hoverHl, 1.0f);
+}
+
+void DockWidgets::SetPressed(Part p) {
+    if (!m_pressHl) return;
+    if (p == Part::Body || (p == Part::Next && !m_canNext) || !m_hasMedia) p = Part::None;
+    if (p == m_press) return;
+    m_press = p;
+    if (p == Part::None) {
+        FadeTo(m_comp, m_pressHl, 0.0f);
+        return;
+    }
+    MoveHighlight(m_pressHl, p, false);
+    m_pressHl.StopAnimation(L"Opacity");
+    m_pressHl.Opacity(1.0f);  // a press answers at once
+}
+
+void DockWidgets::SetMedia(halo::svc::MediaState const& st) {
+    std::wstring title = st.title.empty() ? st.artist : st.title;
+    std::wstring artist = st.title.empty() ? L"" : st.artist;
+    if (st.has && title.empty()) title = L"Now Playing";
+    size_t sig = 0;
+    for (size_t i = 0; i < st.art.size(); i += 97) sig = sig * 31 + st.art[i];
+    sig ^= static_cast<size_t>(st.artSize) << 40;
+    if (m_title == title && m_artist == artist && m_hasMedia == st.has && m_playing == st.playing && m_canNext == st.canNext && m_artSig == sig) return;
+    const bool hadMedia = m_hasMedia;
+    m_title = title;
+    m_artist = artist;
+    m_hasMedia = st.has;
+    m_playing = st.playing;
+    m_canNext = st.canNext;
+    if (sig != m_artSig) m_thumb = st.artSize > 0 ? Thumb(st.art, st.artSize, m_thumbPx) : std::vector<uint32_t>{};
+    m_artSig = sig;
+    if (!m_hasMedia || !m_gdev || !m_capsule) {
+        SetHover(Part::None);
+        SetPressed(Part::None);
+        if (hadMedia) AnimateShow(0.0f);
+        return;
+    }
+    if (!m_surface) {  // the surface is made when the first track appears, and kept (a few KB)
+        m_surface = m_gdev.CreateDrawingSurface({m_capW, m_capH},
+                                                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                                winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+        m_content.Brush(m_comp.CreateSurfaceBrush(m_surface));
     }
     Render();
+    if (!hadMedia) AnimateShow(1.0f);
 }
 
-void DockWidgets::SetBluetooth(bool available, bool on) {
-    if (m_btAvailable == available && m_btOn == on) return;
-    m_btAvailable = available;
-    m_btOn = on;
-    Render();
-}
-
-void DockWidgets::SetMedia(std::wstring const& title, bool has, bool playing) {
-    if (m_title == title && m_hasMedia == has && m_playing == playing) return;
-    m_title = title;
-    m_hasMedia = has;
-    m_playing = playing;
-    Render();
-}
-
+// The pill's content: drawn when the track or its state changes, never while the pointer moves.
 void DockWidgets::Render() {
-    if (!m_surface || !m_dwriteFactory) return;
+    if (!m_surface || !m_hasMedia) return;
     auto interop = m_surface.as<ICompositionDrawingSurfaceInterop>();
     winrt::com_ptr<ID2D1DeviceContext> dc;
     POINT offset{};
     if (FAILED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &offset))) return;
     try {
         const float ox = static_cast<float>(offset.x), oy = static_cast<float>(offset.y);
+        const float s = m_scale;
         dc->Clear(D2D1::ColorF(0, 0.0f));
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        winrt::com_ptr<ID2D1SolidColorBrush> white, dim;
-        dc->CreateSolidColorBrush(halo::theme::P().text, white.put());
-        dc->CreateSolidColorBrush(halo::theme::A(halo::theme::P().dim, 0.7f), dim.put());
-        auto glyph = [&](int slot, wchar_t g, ID2D1SolidColorBrush* brush) {
-            D2D1_RECT_F r = D2D1::RectF(ox + SlotLeft(slot), oy, ox + SlotRight(slot), oy + m_pillHeight);
-            dc->DrawText(&g, 1, m_tfIcons.get(), r, brush);
-        };
+        auto const& pal = halo::theme::P();
+        winrt::com_ptr<ID2D1SolidColorBrush> text, soft, faint;
+        dc->CreateSolidColorBrush(pal.text, text.put());
+        dc->CreateSolidColorBrush(pal.dim, soft.put());
+        dc->CreateSolidColorBrush(pal.faint, faint.put());
 
-        // Wi-Fi: the wired glyph on Ethernet, Wi-Fi when connected, dimmed and struck through when offline.
-        const NetState ns = ReadNet();
-        glyph(kWifi, ns.wired ? L'\uE839' : L'\uE701', ns.online ? white.get() : dim.get());
-        if (!ns.online) {
-            const float cx = ox + SlotLeft(kWifi) + m_slotW / 2, cy = oy + m_pillHeight / 2, h = 6.0f * m_scale;
-            dc->DrawLine({cx - h, cy + h}, {cx + h, cy - h}, white.get(), std::max(1.0f, 1.4f * m_scale));
+        // Artwork: a rounded thumb (else a note on the resting fill).
+        const float tx = ox + m_inset, ty = oy + m_inset, r = kRadiusSmall * s;
+        const D2D1_ROUNDED_RECT thumb = D2D1::RoundedRect(D2D1::RectF(tx, ty, tx + m_art, ty + m_art), r, r);
+        bool art = false;
+        if (m_thumbPx > 0 && m_thumb.size() == static_cast<size_t>(m_thumbPx) * m_thumbPx) {
+            winrt::com_ptr<ID2D1Bitmap> bmp;
+            if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(m_thumbPx, m_thumbPx), m_thumb.data(), m_thumbPx * 4,
+                                           D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)),
+                                           bmp.put()))) {
+                winrt::com_ptr<ID2D1BitmapBrush> brush;
+                dc->CreateBitmapBrush(bmp.get(), D2D1::BitmapBrushProperties(),
+                                      D2D1::BrushProperties(1.0f, D2D1::Matrix3x2F::Translation(tx, ty)), brush.put());
+                dc->FillRoundedRectangle(thumb, brush.get());
+                art = true;
+            }
+        }
+        if (!art) {
+            winrt::com_ptr<ID2D1SolidColorBrush> fill;
+            dc->CreateSolidColorBrush(pal.fill, fill.put());
+            dc->FillRoundedRectangle(thumb, fill.get());
+            const wchar_t note = 0xE8D6;
+            dc->DrawText(&note, 1, m_tfGlyph.get(), thumb.rect, soft.get());
         }
 
-        glyph(kBluetooth, 0xE702, m_btAvailable && m_btOn ? white.get() : dim.get());
-        const float inset = 8 * m_scale;
-        auto pill = D2D1::RectF(ox + SlotLeft(kMedia) + inset, oy + inset, ox + Width(), oy + m_pillHeight - inset);
-        winrt::com_ptr<ID2D1SolidColorBrush> fill;
-        dc->CreateSolidColorBrush(halo::theme::P().fill, fill.put());
-        const float radius = (pill.bottom - pill.top) / 2;
-        dc->FillRoundedRectangle(D2D1::RoundedRect(pill, radius, radius), fill.get());
-        const wchar_t play = m_hasMedia ? (m_playing ? 0xE769 : 0xE768) : 0xE8D6;
-        dc->DrawText(&play, 1, m_tfIcons.get(), D2D1::RectF(pill.left + 4 * m_scale, pill.top, pill.left + 28 * m_scale, pill.bottom),
-                     m_hasMedia ? white.get() : dim.get());
-        const std::wstring title = m_hasMedia ? (m_title.empty() ? L"Now Playing" : m_title) : L"Not Playing";
-        winrt::com_ptr<IDWriteTextLayout> label;
-        const float textWidth = std::max(1.0f, pill.right - pill.left - 40 * m_scale);
-        if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(title.c_str(), static_cast<UINT32>(title.size()), m_tfMedia.get(),
-                                                      textWidth, pill.bottom - pill.top, label.put()))) {
+        // Title over artist, both ellipsised, centred as a block.
+        const float textX = ox + m_inset + m_art + kS3 * s;
+        auto line = [&](std::wstring const& str, IDWriteTextFormat* fmt) {
+            winrt::com_ptr<IDWriteTextLayout> l;
+            if (str.empty() || FAILED(m_dwriteFactory->CreateTextLayout(str.c_str(), static_cast<UINT32>(str.size()), fmt, m_textW, m_capH, l.put())))
+                return winrt::com_ptr<IDWriteTextLayout>{};
             DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
             winrt::com_ptr<IDWriteInlineObject> ellipsis;
-            m_dwriteFactory->CreateEllipsisTrimmingSign(m_tfMedia.get(), ellipsis.put());
-            label->SetTrimming(&trim, ellipsis.get());
-            dc->DrawTextLayout({pill.left + 28 * m_scale, pill.top}, label.get(), m_hasMedia ? white.get() : dim.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            m_dwriteFactory->CreateEllipsisTrimmingSign(fmt, ellipsis.put());
+            l->SetTrimming(&trim, ellipsis.get());
+            return l;
+        };
+        auto t = line(m_title, m_tfTitle.get()), a = line(m_artist, m_tfArtist.get());
+        DWRITE_TEXT_METRICS tm{}, am{};
+        if (t) t->GetMetrics(&tm);
+        if (a) a->GetMetrics(&am);
+        float y = oy + (m_capH - tm.height - am.height) / 2;
+        if (t) {
+            dc->DrawTextLayout({textX, y}, t.get(), text.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            y += tm.height;
         }
+        if (a) dc->DrawTextLayout({textX, y}, a.get(), soft.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        // Buttons: pause while playing, play while paused, then next (faint when the player has none).
+        auto button = [&](Part p, wchar_t g, ID2D1SolidColorBrush* brush) {
+            const float x = ox + PartLeft(p);
+            dc->DrawText(&g, 1, m_tfGlyph.get(), D2D1::RectF(x, oy + m_inset, x + m_art, oy + m_inset + m_art), brush);
+        };
+        button(Part::Play, m_playing ? 0xE769 : 0xE768, text.get());
+        button(Part::Next, 0xE893, m_canNext ? text.get() : faint.get());
     } catch (...) {
         interop->EndDraw();
         throw;

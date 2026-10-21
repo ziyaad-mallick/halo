@@ -81,10 +81,9 @@ int wmain(int argc, wchar_t** argv) {
         items.push_back({L"app" + std::to_wstring(i), comp.CreateColorBrush(), false, i >= 4});
     dock.SetItems(items);
 
-    // Pill geometry at rest: cluster 192 + gap 10, 5 slots of 38 + a 10 divider (one unpinned), the measured widget width + 10.
+    // Pill geometry at rest: cluster 192 + gap 10, 5 slots of 38 + a 10 divider (one unpinned).
     const float cW = cluster.Width();  // font-dependent (192 with the stock Segoe metrics)
-    const float right = h2 ? widgets.Width() + 10.0f : 0.0f;
-    const float pillW = (cW + 10.0f) + 5 * 38.0f - 10.0f + 10.0f + right + 20.0f;
+    const float pillW = (cW + 10.0f) + 5 * 38.0f - 10.0f + 10.0f + 20.0f;
     const float pillL = m.centerX - pillW / 2, pillR = pillL + pillW;
     const float midY = m.bottom - m.pillHeight / 2;
     printf("pill x %.1f..%.1f\n", pillL, pillR);
@@ -129,15 +128,29 @@ int wmain(int argc, wchar_t** argv) {
         // The whole cluster is Start: time, battery, logo and the gaps between.
         for (float x = cl; x <= cl + cW; x += 4.0f) CHECK(dock.HitStart(x, midY));
         CHECK(dock.HitStart(cl + 5.0f, midY - 20.0f));
-        // The widgets on the right: Wi-Fi, Bluetooth, media; every point across them hits one, none is dead.
-        float wl = pillR - 10.0f - widgets.Width();
-        for (float x = wl; x < wl + widgets.Width(); x += 2.0f) {
-            auto t = dock.HitTarget(x, midY);
-            CHECK(t.kind == (x <= wl + 28.0f ? Dock::Kind::Wifi : x <= wl + 56.0f ? Dock::Kind::Bluetooth : Dock::Kind::Media));
-        }
-        CHECK(dock.HitTarget(pillR - 2.0f, midY).kind == Dock::Kind::Media);  // the pill's right padding
-        CHECK(dock.HitTarget(wl - 4.0f, midY).kind != Dock::Kind::None);       // the divider before them
-        CHECK(!dock.HitStart(wl + 10.0f, midY));
+        // The dock is the 1.x dock: nothing on its right but the last icon and the pill's padding.
+        CHECK(dock.HitTarget(pillR - 3.0f, midY).kind == Dock::Kind::App);
+        CHECK(dock.CapsuleExtent() == 0.0f);  // nothing is playing: no Now Playing pill, no extra input region
+
+        // Now Playing: a separate pill one gap beyond the dock, [artwork + text][play/pause][next].
+        halo::svc::MediaState st;
+        st.has = true;
+        st.playing = true;
+        st.canNext = true;
+        st.title = L"Title";
+        st.artist = L"Artist";
+        widgets.SetMedia(st);
+        const float capL = pillR + widgets.CapsuleGap();
+        CHECK(widgets.CapsuleWidth() > 0.0f && dock.CapsuleExtent() == widgets.CapsuleGap() + widgets.CapsuleWidth());
+        using Part = DockWidgets::Part;
+        CHECK(dock.HitTarget(capL + 10.0f, midY).kind == Dock::Kind::Media);
+        CHECK(dock.HitTarget(capL + (widgets.PartLeft(Part::Play) + widgets.PartRight(Part::Play)) / 2, midY).kind == Dock::Kind::MediaPlay);
+        CHECK(dock.HitTarget(capL + (widgets.PartLeft(Part::Next) + widgets.PartRight(Part::Next)) / 2, midY).kind == Dock::Kind::MediaNext);
+        for (float x = capL; x < capL + widgets.CapsuleWidth(); x += 2.0f) CHECK(dock.HitTarget(x, midY).kind != Dock::Kind::None);  // no dead spots
+        CHECK(dock.HitTarget(pillR + widgets.CapsuleGap() / 2, midY).kind != Dock::Kind::None);  // the gap between them snaps to a side
+        st.has = false;
+        widgets.SetMedia(st);
+        CHECK(dock.CapsuleExtent() == 0.0f && dock.HitTarget(capL + 10.0f, midY).kind == Dock::Kind::None);  // gone again
     }
 
     // Magnification moves slots under the pointer: hit-testing follows what is drawn.
