@@ -13,7 +13,7 @@ The dock is the reference for quality. Preserve its behavior and visual system. 
 ## Visual directions for review
 
 - [Start preview](previews/start-refresh.html): 720 × 560 logical-pixel roomy proposal; 600 × 500 compact; light/dark; local example search. Native functionality is unchanged until mock approval. App symbols in the mock are placeholders; production retains actual app icons.
-- [Control Center preview](previews/control-center-refresh.html): quieter grouped connections, substantial display/sound controls, compact secondary toggles/media, bounded details, stable footer. This is a design proposal, not a screenshot of the native build. The native detail-page architecture is implemented; the full proposed home styling remains a subsequent pass.
+- [Control Center preview](previews/control-center-refresh.html): quieter grouped connections, substantial display/sound controls, compact secondary toggles/media, bounded details, stable footer. This is a design proposal, not a screenshot of the native build. The native detail-page architecture is implemented; the native home now follows its grouping (tight toggles, a larger step between groups; 22 px sliders with a 30 px target; a one-row now-playing module with an empty state). Section captions are not drawn: they would cost ~60 px of a panel that already runs dense on 768 px displays. Dark theme is near-black neutral glass (#0B0B0D at 78%, dim text >= 4.8:1 on a white wallpaper worst case). Open/close and hover/press are faster (110 ms close, 130 ms fade, 80 ms hover, 20 ms press spring) and a slider drag repaints only its module straight from the pointer, 1:1; reduce_motion and the speed setting apply to all of it.
 
 ## Evidence and limits
 
