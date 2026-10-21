@@ -23,6 +23,7 @@ ids = sorted(set(re.findall(r'Id::(\w+)', layout)) | {'DeviceListTile'})
 constants = '\n'.join(line for line in src.splitlines()
                       if line.startswith('constexpr float kW =')
                       or line.startswith('constexpr float kHeaderH =')
+                      or line.startswith('constexpr float kHomeH =')
                       or line.startswith('constexpr float kMaxH ='))
 maxh = re.search(r'float MaxH\(\) const \{[^\n]+', src).group(0)
 dense = re.search(r'bool Dense\(\) const \{[^\n]+', src).group(0)
@@ -60,6 +61,7 @@ struct Fixture {
     Expand expand=Expand::None;
     struct Config { bool showSliders=true, showMedia=true; } config;
     Config const& cfg() const { return config; }
+    struct { struct S { bool has=true; } s; S const& State() const { return s; } } media;  // now playing: controls are laid out only while something plays
     void Layout();
 '''
 code += maxh + '\n' + dense + '\n};\n' + layout
@@ -136,7 +138,8 @@ int main() {
 '''
 cpp = out / 'layout-repro.cpp'
 cpp.write_text(code, encoding='utf-8')
-compiler = root / 'toolchain/audit-download/llvm-mingw-20250709-ucrt-x86_64/bin/clang++.exe'
+import os
+compiler = Path(os.environ['HALO_CXX']) if os.environ.get('HALO_CXX') else root / 'toolchain/audit-download/llvm-mingw-20250709-ucrt-x86_64/bin/clang++.exe'
 exe = out / 'layout-repro.exe'
 subprocess.run([str(compiler), '-std=c++23', '-static', str(cpp), '-o', str(exe)], check=True)
 try:

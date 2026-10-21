@@ -5,7 +5,8 @@
 //   Type     4 sizes on a ~1.25 ratio (12 caption, 14 body/title, 18 heading, 28 display), 2 weights.
 //   Radius   2: small (controls, rows, chips) and large (tiles); a panel is large + its inset, so
 //            corners stay concentric. Round controls are circles.
-//   Motion   fast (state feedback) and slow (entrances); entering decelerates, leaving accelerates.
+//   Motion   fast (state feedback) and slow (entrances); entering decelerates, leaving accelerates. A press
+//            answers at once (no animation is waited on), and a slider drag tracks the pointer 1:1.
 #pragma once
 
 namespace halo::ui {
@@ -28,10 +29,14 @@ constexpr float kPanelInset = kS4, kPanelRadius = kRadiusLarge + kPanelInset;
 constexpr float kRound = 36;      // a round toggle inside a pill or tile
 constexpr float kRoundAction = 44;  // the free-standing action buttons
 constexpr float kPillH = 64;      // a connectivity pill (round toggle + two lines)
-constexpr float kSliderH = 28;    // the thick slider track
+constexpr float kSliderH = 22;    // the slider track as drawn (was 28: ~21 % shorter)
+constexpr float kSliderHitH = kSliderH + 2 * kS1;  // its pointer target: 4 px taller on each side, so it is still easy to grab
+constexpr float kMediaArt = 48;   // now-playing artwork
+constexpr float kMediaH = kMediaArt + 2 * kS3;  // the now-playing module
 
 // Motion.
-constexpr int kFastMs = 120, kSlowMs = 280;
-constexpr float kEnterTravel = 24;  // logical px a panel rises/sinks while it fades in/out
+constexpr int kFastMs = 90, kSlowMs = 280;  // fast was 120
+constexpr int kHoverMs = 80;                // a highlight gliding between controls, and fading in/out
+constexpr float kEnterTravel = 16;  // logical px a panel rises/sinks while it fades in/out
 
 }  // namespace halo::ui

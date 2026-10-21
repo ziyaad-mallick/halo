@@ -3,7 +3,7 @@
 //
 // Follows the Windows app mode (Settings > Personalization > Colors): light is
 // frosted white glass, dark ink, a hairline outer edge and a soft shadow; dark
-// is the original #16161A@50% liquid glass. HALO_THEME=light|dark overrides, then settings.ini's
+// is near-black neutral glass (#0B0B0D@78%) with faint white cards; text stays at WCAG AA or better. HALO_THEME=light|dark overrides, then settings.ini's
 // [general] theme and accent. Refresh() re-reads them after settings::Reload(); P() always returns the
 // same object, so a `const auto& pal = P()` kept across a Refresh() sees the new colours.
 #pragma once
@@ -42,6 +42,7 @@ struct Palette {
     Argb dot;                 // running-app dot
     Argb veil;                // full-screen dim behind the launcher
     D2D1_COLOR_F labelBg, labelRim, labelText;
+    Argb hover, press;        // the highlight that glides between controls, and its stronger pressed state
 };
 
 // The glass a surface builds: the palette's tint scaled by the surface's opacity (66 % = as designed, so a
@@ -68,18 +69,20 @@ inline const Palette& Base(bool dark) {
         {0, 0, 0, 0.07f},
         {0x24, 0x00, 0x00, 0x00}, {0xB0, 0x1D, 0x1D, 0x1F}, {0x38, 0xF2, 0xF2, 0xF5},
         {1, 1, 1, 0.86f}, {0, 0, 0, 0.10f}, {0.11f, 0.11f, 0.12f, 0.92f},
+        {0x12, 0x00, 0x00, 0x00}, {0x24, 0x00, 0x00, 0x00},
     };
     static const Palette darkP{
-        40.0f, {0xA8, 0x18, 0x19, 0x1E}, 0.025f,  // smoked glass: #18191E at 66%
-        {0x70, 0xFF, 0xFF, 0xFF}, {0x18, 0xFF, 0xFF, 0xFF}, {0x0A, 0xFF, 0xFF, 0xFF}, {0x26, 0xFF, 0xFF, 0xFF},
-        {0x00, 0x00, 0x00, 0x00}, {0x55, 0x00, 0x00, 0x00}, 28.0f, 10.0f,  // a shadow in dark too, or panels melt into bright windows
-        {1, 1, 1, 0.96f}, {1, 1, 1, 0.88f}, {1, 1, 1, 0.70f}, {1, 1, 1, 0.30f},
+        40.0f, {0xC8, 0x0B, 0x0B, 0x0D}, 0.02f,  // near-black neutral glass: #0B0B0D at 78%
+        {0x60, 0xFF, 0xFF, 0xFF}, {0x14, 0xFF, 0xFF, 0xFF}, {0x08, 0xFF, 0xFF, 0xFF}, {0x20, 0xFF, 0xFF, 0xFF},
+        {0x00, 0x00, 0x00, 0x00}, {0x66, 0x00, 0x00, 0x00}, 28.0f, 10.0f,  // a shadow in dark too, or panels melt into bright windows
+        {1, 1, 1, 0.96f}, {1, 1, 1, 0.88f}, {1, 1, 1, 0.72f}, {1, 1, 1, 0.34f},
         {0x14 / 255.0f, 0xA3 / 255.0f, 0x94 / 255.0f, 1.0f}, {1, 1, 1, 1},  // teal #14A394: #12857B went muddy on dark glass
-        {1, 1, 1, 0.10f}, {1, 1, 1, 0.16f}, {1, 1, 1, 0.06f},
-        {1, 1, 1, 0.12f},
-        {1, 1, 1, 0.16f},
-        {0x33, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF}, {0xB0, 0x16, 0x16, 0x1A},
-        {0x16 / 255.0f, 0x16 / 255.0f, 0x1A / 255.0f, 0.88f}, {1, 1, 1, 0.18f}, {1, 1, 1, 0.95f},
+        {1, 1, 1, 0.065f}, {1, 1, 1, 0.11f}, {1, 1, 1, 0.04f},
+        {1, 1, 1, 0.08f},
+        {1, 1, 1, 0.14f},
+        {0x33, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF}, {0xB0, 0x0E, 0x0E, 0x10},
+        {0x0E / 255.0f, 0x0E / 255.0f, 0x10 / 255.0f, 0.90f}, {1, 1, 1, 0.16f}, {1, 1, 1, 0.95f},
+        {0x22, 0xFF, 0xFF, 0xFF}, {0x38, 0xFF, 0xFF, 0xFF},
     };
     return dark ? darkP : light;
 }

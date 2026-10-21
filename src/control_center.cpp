@@ -55,8 +55,10 @@ namespace {
 // side, so the spring's overshoot never clips; everything below is in panel ("pill") coordinates.
 // Geometry, all from tokens.h: a 344 px panel, the inset and gaps on the 4 px scale, concentric corners.
 constexpr float kW = 380, kInset = ui::kPanelInset, kGap = ui::kS3, kRadius = ui::kPanelRadius;
-constexpr float kHeaderH = 56, kTitleLine = 20, kCaptionLine = 16, kListRowH = 36, kMediaH = 76, kPowH = 52;
+constexpr float kHeaderH = 56, kTitleLine = 20, kCaptionLine = 16, kListRowH = 36, kPowH = 52;
 constexpr float kMaxH = 900, kMargin = ui::kS2;
+// The home view at its full (non-dense) height: the details page and the "does it fit" test measure against it.
+constexpr float kHomeH = 620;
 
 constexpr UINT kMsgAudio = WM_APP + 1, kMsgMic = WM_APP + 2, kMsgRadios = WM_APP + 3, kMsgBright = WM_APP + 4,
                kMsgMedia = WM_APP + 5, kMsgWifi = WM_APP + 6, kMsgBt = WM_APP + 7, kMsgLate = WM_APP + 8,
@@ -64,11 +66,11 @@ constexpr UINT kMsgAudio = WM_APP + 1, kMsgMic = WM_APP + 2, kMsgRadios = WM_APP
 constexpr UINT_PTR kTimerClose = 1, kTimerChord = 2, kTimerClock = 3, kTimerLeave = 4, kTimerSettle = 5;
 // While the opening spring runs nothing redraws: updates that arrive (the deferred reads, radios, media,
 // brightness) are held and drawn once, kSettleMs after the show. A redraw mid-motion cost a frame.
-constexpr UINT kSettleMs = 330;
+constexpr UINT kSettleMs = 240;
 // Auto-hide: while open, where the pointer is gets checked every kLeaveTickMs; kLeaveMs outside the panel
 // (plus kLeaveSlack px around it) closes it. Then the chips: a hovered control grows by about kLiftPx
 // logical px and leans toward the pointer by kLean of the distance, at most kLeanMax.
-constexpr UINT kLeaveTickMs = 50, kLeaveMs = 280;
+constexpr UINT kLeaveTickMs = 50, kLeaveMs = 200;
 constexpr float kLeaveSlack = 18, kLiftPx = 4, kPressScale = 0.96f, kLean = 0.07f, kLeanMax = 3.5f;
 constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloControlCenterTimers";
 
@@ -192,6 +194,7 @@ struct ControlCenter::Impl {
     wuc::CompositionPropertySet ptr{nullptr};  // "P": the pointer in pill px, read by the hovered chip's lean
     int hotChip = -1;
     wuc::CompositionRoundedRectangleGeometry clip{nullptr}, rim{nullptr}, hvGeo{nullptr}, specGeo{nullptr};
+    wuc::CompositionColorBrush hvBrush{nullptr};  // the highlight's fill: stronger while pressed
     bool hvShown = false;
 
     // Kept across opens: the DirectWrite factory and formats, and the grain texture.
@@ -258,7 +261,13 @@ struct ControlCenter::Impl {
     void Layout();
     void ApplySize();
     void Render();
-    void Paint(ID2D1DeviceContext* dc, float tx, float ty, Item const* only, Item const* skip);
+    void Paint(ID2D1DeviceContext* dc, float tx, float ty, Item const* only, Item const* skip, D2D1_RECT_F const* region = nullptr);
+    void RepaintRegion(D2D1_RECT_F r);
+    void PressFeedback(Item const* it);
+    // Motion for the CC's own feedback honours the surface's speed and reduce_motion (which also turns every effect into a fade).
+    std::chrono::milliseconds Fast(int ms) const {
+        return settings::Get().reduceMotion ? 1ms : std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(ms / settings::Speed(cfg())))));
+    }
     void BuildVisuals();
     wuc::CompositionBrush NoiseBrush(int w, int h);
     void Pulse(Item const& it);
@@ -392,6 +401,7 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 } else {
                     pressed = *it;
                     if (Scalable(it->id)) { HoverChip(ChipOf(it)); Squash(true); }
+                    else PressFeedback(it);  // the highlight answers at once, before anything else
                 }
             }
             return 0;
@@ -427,6 +437,7 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 Item p = std::exchange(pressed, Item{});
                 auto* it = (m == WM_LBUTTONUP && st == St::Open) ? HitAt(x, y) : nullptr;
                 if (Scalable(p.id)) Squash(false);
+                else PressFeedback(nullptr);
                 if (it && Same(*it, p)) {
                     Item c = *it;  // Click re-lays-out and invalidates `it`
                     Click(c);
@@ -439,7 +450,9 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 for (auto const& it : items)
                     if (static_cast<WPARAM>(it.id) == w) { Item c = it; Settle(); Click(c); Snapshot(); break; }
             return 0;
-        case kMsgAudio: SyncSpeaker(); Render(); return 0;
+        case kMsgAudio:
+            if (drag == Id::Vol) return 0;  // the pointer owns the value while it drags: the device's echo must not pull it back
+            SyncSpeaker(); Render(); return 0;
         case kMsgMic: SyncMic(); Render(); return 0;
         case kMsgRadios:
             SyncRadios();
@@ -448,6 +461,7 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             Render();
             return 0;
         case kMsgBright:
+            if (drag == Id::Bright) return 0;
             if (svc::brightness::Supported()) bright = svc::brightness::Level();
             Render();
             return 0;
@@ -553,7 +567,7 @@ void ControlCenter::Impl::Open(bool pointer) {
         // waits on a foreground change); a click in it activates it like any window.
         ShowWindow(hwnd, pointer ? SW_SHOWNOACTIVATE : SW_SHOW);
         settling = true;
-        SetTimer(hwnd, kTimerSettle, kSettleMs, nullptr);
+        SetTimer(hwnd, kTimerSettle, static_cast<UINT>(kSettleMs / settings::Speed(cfg())), nullptr);
         {
             LARGE_INTEGER q1;
             QueryPerformanceCounter(&q1);
@@ -598,6 +612,7 @@ void ControlCenter::Impl::Close() {
     btRows.clear();
     SetHover(nullptr);
     hover = pressed = {};
+    PressFeedback(nullptr);
     drag = Id::None;
     const float pad = motion::kPad * s;
     motion::Out(comp, pill, {pad, TopPx(), 0}, Travel(), cfg(), Corner());
@@ -617,6 +632,7 @@ void ControlCenter::Impl::Park() {
     hover = pressed = {};
     tracking = false;
     if (hv) { hv.StopAnimation(L"Opacity"); hv.Opacity(0); }
+    if (hvBrush) hvBrush.Color(theme::C(theme::P().hover));
     hvShown = false;
     if (ghost) { inner.Children().Remove(ghost); ghost = nullptr; }
     for (auto& c : chips) {  // back to rest, so the next open does not start with a lifted chip
@@ -661,7 +677,7 @@ void ControlCenter::Impl::Teardown() {
     ghost = lower = nullptr;
     upperClip = lowerClip = nullptr;
     surf = nullptr; content = nullptr; chipLayer = nullptr; ptr = nullptr; hv = nullptr; hvGeo = nullptr;
-    pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr; specGeo = nullptr;
+    hvBrush = nullptr; pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr; specGeo = nullptr;
     items.clear();
     rect = {};
     if (wasOpen && api->onHidden) api->onHidden();
@@ -670,7 +686,7 @@ void ControlCenter::Impl::Teardown() {
 // A soft ring that springs out of a toggle's icon: the "springy" feedback for a click. One
 // compositor animation, no timer; the next pulse replaces it.
 void ControlCenter::Impl::Pulse(Item const& it) {
-    if (!fx) return;
+    if (!fx || settings::Get().reduceMotion) return;
     fx.Children().RemoveAll();
     float rad = std::min(it.r.right - it.r.left, it.r.bottom - it.r.top) / 2 - 2;
     auto geo = comp.CreateEllipseGeometry();
@@ -687,12 +703,12 @@ void ControlCenter::Impl::Pulse(Item const& it) {
     auto sc = comp.CreateVector3KeyFrameAnimation();
     sc.InsertKeyFrame(0.0f, {0.9f, 0.9f, 1.0f});
     sc.InsertKeyFrame(1.0f, {1.5f, 1.5f, 1.0f}, comp.CreateCubicBezierEasingFunction({0.2f, 0.8f}, {0.3f, 1.0f}));
-    sc.Duration(380ms);
+    sc.Duration(Fast(260));
     v.StartAnimation(L"Scale", sc);
     auto op = comp.CreateScalarKeyFrameAnimation();
     op.InsertKeyFrame(0.0f, 1.0f);
     op.InsertKeyFrame(1.0f, 0.0f);
-    op.Duration(380ms);
+    op.Duration(Fast(260));
     v.StartAnimation(L"Opacity", op);
 }
 
@@ -705,7 +721,7 @@ void ControlCenter::Impl::SetHover(Item const* it) {
             hvShown = false;
             auto a = comp.CreateScalarKeyFrameAnimation();
             a.InsertKeyFrame(1.0f, 0.0f);
-            a.Duration(140ms);
+            a.Duration(Fast(ui::kHoverMs));
             hv.StartAnimation(L"Opacity", a);
         }
         return;
@@ -716,11 +732,11 @@ void ControlCenter::Impl::SetHover(Item const* it) {
         auto ease = comp.CreateCubicBezierEasingFunction({0.2f, 0.0f}, {0.0f, 1.0f});
         auto o = comp.CreateVector2KeyFrameAnimation();
         o.InsertKeyFrame(1.0f, off, ease);
-        o.Duration(110ms);
+        o.Duration(Fast(ui::kHoverMs));
         hvGeo.StartAnimation(L"Offset", o);
         auto z = comp.CreateVector2KeyFrameAnimation();
         z.InsertKeyFrame(1.0f, sz, ease);
-        z.Duration(110ms);
+        z.Duration(Fast(ui::kHoverMs));
         hvGeo.StartAnimation(L"Size", z);
     } else {
         hvGeo.StopAnimation(L"Offset");
@@ -731,8 +747,20 @@ void ControlCenter::Impl::SetHover(Item const* it) {
     }
     auto a = comp.CreateScalarKeyFrameAnimation();
     a.InsertKeyFrame(1.0f, 1.0f);
-    a.Duration(110ms);
+    a.Duration(Fast(ui::kHoverMs));
     hv.StartAnimation(L"Opacity", a);
+}
+
+// The pressed state of a plain control (a row, a text side of a pill): the hover highlight jumps to the control and
+// to its stronger fill in the same message that saw the button go down, with no animation to wait for. nullptr = released.
+void ControlCenter::Impl::PressFeedback(Item const* it) {
+    if (!hv || !hvBrush) return;
+    const auto& p = theme::P();
+    if (!it) { hvBrush.Color(theme::C(p.hover)); return; }
+    hvBrush.Color(theme::C(p.press));
+    SetHover(it);
+    hv.StopAnimation(L"Opacity");
+    hv.Opacity(1);
 }
 
 // Hover and press feedback, the dock's way: every Scalable control is drawn onto its own little surface
@@ -756,7 +784,7 @@ void ControlCenter::Impl::SyncChips() {
                     auto glide = comp.CreateSpringVector3Animation();
                     glide.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(c.rest));
                     glide.DampingRatio(0.86f);
-                    glide.Period(std::chrono::milliseconds(48));
+                    glide.Period(Fast(40));
                     c.v.StartAnimation(L"Offset", glide);
                 }
                 break;
@@ -777,7 +805,7 @@ void ControlCenter::Impl::SyncChips() {
             chipLayer.Children().InsertAtTop(c.v);
         }
         c.it = it;
-        c.lift = std::clamp(1 + kLiftPx / std::min(it.r.right - it.r.left, it.r.bottom - it.r.top), 1.03f, 1.09f);
+        c.lift = settings::Get().reduceMotion ? 1.0f : std::clamp(1 + kLiftPx / std::min(it.r.right - it.r.left, it.r.bottom - it.r.top), 1.03f, 1.09f);
         auto interop = c.surf.as<ICompositionDrawingSurfaceInterop>();
         winrt::com_ptr<ID2D1DeviceContext> dc;
         POINT off{};
@@ -815,12 +843,12 @@ void ControlCenter::Impl::HoverChip(int i) {
         auto scale = comp.CreateSpringVector3Animation();
         scale.FinalValue(Ref3(1.0f));
         scale.DampingRatio(0.6f);
-        scale.Period(45ms);
+        scale.Period(Fast(38));
         c.v.StartAnimation(L"Scale", scale);
         auto back = comp.CreateSpringVector3Animation();
         back.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(c.rest));
         back.DampingRatio(0.6f);
-        back.Period(45ms);
+        back.Period(Fast(38));
         c.v.StartAnimation(L"Offset", back);
     }
     hotChip = i;
@@ -829,8 +857,9 @@ void ControlCenter::Impl::HoverChip(int i) {
     auto grow = comp.CreateSpringVector3Animation();
     grow.FinalValue(Ref3(c.lift));
     grow.DampingRatio(0.55f);
-    grow.Period(45ms);
+    grow.Period(Fast(38));
     c.v.StartAnimation(L"Scale", grow);
+    if (settings::Get().reduceMotion) return;  // no lean toward the pointer
     auto lean = comp.CreateExpressionAnimation(
         L"Vector3(rest.X + Clamp((ptr.P.X - mid.X) * k, -m, m), rest.Y + Clamp((ptr.P.Y - mid.Y) * k, -m, m), 0)");
     lean.SetReferenceParameter(L"ptr", ptr);
@@ -846,8 +875,8 @@ void ControlCenter::Impl::Squash(bool down) {
     auto& c = chips[hotChip];
     auto spring = comp.CreateSpringVector3Animation();
     spring.FinalValue(Ref3(down ? kPressScale : c.lift));
-    spring.DampingRatio(down ? 0.55f : 0.42f);  // the release overshoots: the bounce
-    spring.Period(down ? 35ms : 50ms);
+    spring.DampingRatio(down ? 0.8f : 0.42f);  // the press settles with no wobble; the release overshoots: the bounce
+    spring.Period(down ? Fast(20) : Fast(42));
     c.v.StartAnimation(L"Scale", spring);
 }
 
@@ -1129,7 +1158,7 @@ void ControlCenter::Impl::ScrollDetails(int rows) {
 void ControlCenter::Impl::DragTo(float x) {
     for (auto const& it : items) {
         if (it.id != drag) continue;
-        float h = it.r.bottom - it.r.top;
+        const float h = ui::kSliderH;
         float f = std::clamp((x - it.r.left - h / 2) / (it.r.right - it.r.left - h), 0.0f, 1.0f);
         if (drag == Id::Vol) {
             volume = f;
@@ -1137,9 +1166,13 @@ void ControlCenter::Impl::DragTo(float x) {
         } else {
             bright = static_cast<int>(std::lround(f * 100));
             ULONGLONG now = GetTickCount64();
-            if (now - lastBrightSet >= 60) { lastBrightSet = now; svc::brightness::Set(bright); }
+            if (now - lastBrightSet >= 33) { lastBrightSet = now; svc::brightness::Set(bright); }
         }
-        Render();
+        // The track follows the pointer 1:1: the slider module is redrawn on its own, straight away, with no
+        // layout pass, no chip sync and no animation in between.
+        auto tile = std::find_if(items.begin(), items.end(), [](Item const& i) { return i.id == Id::DisplayTile; });
+        if (st == St::Open && !settling && tile != items.end()) RepaintRegion(tile->r);
+        else Render();
         return;
     }
 }
@@ -1158,12 +1191,14 @@ void ControlCenter::Impl::Layout() {
     using namespace ui;
     items.clear();
     const bool dense = Dense() ||
-        636.0f + (outsOpen ? outs.size() * kListRowH + kS1 : 0) + (powerOpen ? kPowH + kGap : 0) > MaxH();
+        kHomeH + (outsOpen ? outs.size() * kListRowH + kS1 : 0) + (powerOpen ? kPowH + kS2 : 0) > MaxH();
     const float insetY = dense ? kS2 : kInset;
-    const float gap = dense ? kS1 : kGap;
+    // Grouped like the preview: tight inside a group (the toggles, the sliders), a larger step between groups.
+    const float gap = dense ? kS1 : kS2;
+    const float grp = dense ? kS2 : kS4;
     const float headerH = kHeaderH;
     const float pillH = dense ? 4 * kS3 : kPillH;
-    const float mediaH = dense ? 4 * kS3 : kMediaH;
+    const float mediaH = dense ? 4 * kS3 : kMediaH;  // ui::kMediaH
     const float actionD = dense ? kRound : kRoundAction;
     const float powerH = dense ? kRoundAction : kPowH;
     const float x0 = kInset, x1 = kW - kInset;
@@ -1172,7 +1207,7 @@ void ControlCenter::Impl::Layout() {
 
     // Details get their own bounded page: expanding devices must never bury the shell actions.
     if (outsOpen || expand != Expand::None) {
-        height = std::min(MaxH(), 636.0f);
+        height = std::min(MaxH(), kHomeH);
         add(Id::Back, {x0, y, x1, y + headerH});
         y += headerH + kS2;
         const float footerTop = height - insetY - actionD;
@@ -1203,7 +1238,7 @@ void ControlCenter::Impl::Layout() {
     // Header, on the glass itself: the time and date (opens the calendar), the battery chip (cycles the power mode).
     add(Id::Clock, {x0, y, x1 - 136 - kGap, y + headerH}, 0, kRadiusSmall);
     add(Id::Battery, {x1 - 136, y + kS2, x1, y + headerH - kS2}, 0, kRadiusSmall);
-    y += headerH + gap;
+    y += headerH + (dense ? kS1 : kS3);
 
     // The toggle grid: three rows of 64 px on two columns.
     //   Wi-Fi pill            | Bluetooth pill          (round toggle; the text side opens the list)
@@ -1225,7 +1260,7 @@ void ControlCenter::Impl::Layout() {
     y += pillH + gap;
     add(Id::Night, {x0, y, x0 + col, y + pillH}, 0, kRadiusLarge);
     add(Id::Dark, {rx, y, x1, y + pillH}, 0, kRadiusLarge);
-    y += pillH + gap;
+    y += pillH + grp;
 
     // One module for both sliders: Display, then Sound (whose output list opens under it). The Sound row
     // is always laid out (greyed when there is no output), so the height never depends on the audio read.
@@ -1234,29 +1269,36 @@ void ControlCenter::Impl::Layout() {
         const float blk = kTitleLine + kS2 + kSliderH;  // a label over a track
         const float padY = dense ? kS2 : kS4;
         const float h = padY + (disp ? blk + padY : 0) + blk + padY;
+        // The track is kSliderH tall; its pointer target is kS1 taller on each side (kSliderHitH).
+        auto track = [&](Id id, float top) {
+            add(id, {x0 + kS4, top + blk - kSliderH - (kSliderHitH - kSliderH) / 2, x1 - kS4, top + blk + (kSliderHitH - kSliderH) / 2});
+        };
         add(Id::DisplayTile, {x0, y, x1, y + h}, static_cast<int>(padY), kRadiusLarge);
         float t = y + padY;
         if (disp) {
-            add(Id::Bright, {x0 + kS4, t + blk - kSliderH, x1 - kS4, t + blk});
+            track(Id::Bright, t);
             t += blk + padY;
         }
         add(Id::SoundTile, {x0, t, x1, t + kTitleLine});  // only for the "Sound" label
         add(Id::OutRow, {x0 + 112, t - kS1, x1 - kS2, t + kTitleLine + kS1}, 0, kRadiusSmall);
-        add(Id::Vol, {x0 + kS4, t + blk - kSliderH, x1 - kS4, t + blk});
-        y += h + gap;
+        track(Id::Vol, t);
+        y += h + grp;
     }
 
     // Media arrival never changes the home height. The compact power choices temporarily use its space.
     if (cfg().showMedia && !(dense && powerOpen)) {
         add(Id::MediaTile, {x0, y, x1, y + mediaH}, 0, kRadiusLarge);
-        const float cy = y + mediaH / 2, b = kRound;
-        float r = x1 - kS3;
-        add(Id::Next, {r - b, cy - b / 2, r, cy + b / 2}, 0, b / 2);
-        r -= b + kS1;
-        add(Id::PlayPause, {r - b, cy - b / 2, r, cy + b / 2}, 0, b / 2);
-        r -= b + kS1;
-        add(Id::Prev, {r - b, cy - b / 2, r, cy + b / 2}, 0, b / 2);
-        y += mediaH + insetY;
+        // One row of prev / play / next at the right, only while something plays (nothing to control otherwise).
+        if (media.State().has) {
+            const float cy = y + mediaH / 2, b = kRound, side = kRound - kS1;
+            float r = x1 - kS3;
+            add(Id::Next, {r - side, cy - b / 2, r, cy + b / 2}, 0, b / 2);
+            r -= side;
+            add(Id::PlayPause, {r - b, cy - b / 2, r, cy + b / 2}, 0, b / 2);
+            r -= b;
+            add(Id::Prev, {r - side, cy - b / 2, r, cy + b / 2}, 0, b / 2);
+        }
+        y += mediaH + grp;
     }
 
     // Actions: free-standing round buttons across the width.
@@ -1314,13 +1356,13 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
         auto spring = [&] {
             auto a = comp.CreateSpringVector2Animation();
             a.DampingRatio(0.86f);
-            a.Period(std::chrono::milliseconds(60));
+            a.Period(Fast(48));
             return a;
         };
         auto move = comp.CreateSpringVector3Animation();
         move.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(at));
         move.DampingRatio(0.86f);
-        move.Period(std::chrono::milliseconds(60));
+        move.Period(Fast(48));
         pill.StartAnimation(L"Offset", move);
         auto size = [&](wuc::CompositionObject const& o, wfn::float2 to) {
             auto a = spring();
@@ -1358,7 +1400,7 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
             follow(oc, L"TopInset", L"S + Max(0, H - inner.Size.Y)", oldPx);
             auto fade = comp.CreateScalarKeyFrameAnimation();
             fade.InsertKeyFrame(1.0f, 0.0f, comp.CreateCubicBezierEasingFunction({0.4f, 0.0f}, {1.0f, 1.0f}));
-            fade.Duration(std::chrono::milliseconds(ui::kSlowMs));
+            fade.Duration(Fast(2 * ui::kFastMs));
             old.StartAnimation(L"Opacity", fade);
             inner.Children().InsertBelow(old, content);
             ghost = old;
@@ -1430,9 +1472,11 @@ void ControlCenter::Impl::Render() {
 }
 
 // Draws every item (or just `only`, minus `skip`) with the panel origin at (tx, ty) device px.
-void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item const* only, Item const* skip) {
+// With `region` (logical px, already on whole device px) only that part of the surface is cleared and redrawn.
+void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item const* only, Item const* skip, D2D1_RECT_F const* region) {
     using namespace ui;
     dc->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(tx, ty));
+    if (region) dc->PushAxisAlignedClip(*region, D2D1_ANTIALIAS_MODE_ALIASED);
     dc->Clear(ColorF(0, 0.0f));
     dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     winrt::com_ptr<ID2D1SolidColorBrush> br;
@@ -1506,6 +1550,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         if (only && !Same(it, *only)) continue;
         if (skip && Same(it, *skip)) continue;
         if (!only && chipLayer && Scalable(it.id)) continue;  // drawn on its chip
+        if (region && (it.r.right <= region->left || it.r.left >= region->right || it.r.bottom <= region->top || it.r.top >= region->bottom)) continue;
         auto const& r = it.r;
         const float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
         switch (it.id) {
@@ -1656,14 +1701,15 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 box(r, kRadiusSmall, theme::P().fill);
                 txt(it.id == Id::PowSleep ? L"Sleep" : it.id == Id::PowRestart ? L"Restart" : L"Shut down", fBtn.get(), r, kText);
                 break;
-            case Id::Bright: case Id::Vol: {  // a thick track; the fill carries the icon at its left end
-                float h = r.bottom - r.top, f = it.id == Id::Vol ? volume : bright / 100.0f;
-                if (it.id == Id::Vol && !speaker.Available()) { box(r, h / 2, theme::A(kOff, 0.5f)); break; }
-                box(r, h / 2, kOff);
-                D2D1_RECT_F fr{r.left, r.top, r.left + h + f * (r.right - r.left - h), r.bottom};
+            case Id::Bright: case Id::Vol: {  // the track (kSliderH) centred in its taller pointer target; the fill carries the icon at its left end
+                const float h = kSliderH, f = it.id == Id::Vol ? volume : bright / 100.0f;
+                const D2D1_RECT_F tr{r.left, cy - h / 2, r.right, cy + h / 2};
+                if (it.id == Id::Vol && !speaker.Available()) { box(tr, h / 2, theme::A(kOff, 0.5f)); break; }
+                box(tr, h / 2, kOff);
+                D2D1_RECT_F fr{tr.left, tr.top, tr.left + h + f * (tr.right - tr.left - h), tr.bottom};
                 box(fr, h / 2, kFill);
                 wchar_t g = it.id == Id::Bright ? 0xE706 : (muted || volume <= 0.001f ? 0xE74F : 0xE767);
-                glyph(g, fIconS.get(), {r.left, r.top, r.left + h, r.bottom}, kOnFill);
+                glyph(g, fIconS.get(), {tr.left, tr.top, tr.left + h, tr.bottom}, kOnFill);
                 break;
             }
             case Id::OutRow: {
@@ -1703,16 +1749,19 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 if (!ms.has) break;  // nothing to control: no controls
                 bool ok = it.id == Id::Prev ? ms.canPrev : it.id == Id::Next ? ms.canNext : true;
                 wchar_t g = it.id == Id::Prev ? 0xE892 : it.id == Id::Next ? 0xE893 : (ms.playing ? 0xE769 : 0xE768);
-                glyph(g, it.id == Id::PlayPause ? fIcon.get() : fIconS.get(), r, theme::A(kText, ok ? 1.0f : 0.3f));
+                if (it.id == Id::PlayPause) round(cx, cy, (r.bottom - r.top) / 2, false, true, g, fIcon.get(), false);  // the one filled control
+                else glyph(g, fIconS.get(), r, theme::A(kText, ok ? 1.0f : 0.3f));
                 break;
             }
             default: break;
         }
         if (it.id == Id::MediaTile) {
+            // Artwork, then title over artist (each one line, ellipsis), then prev / play / next. Nothing playing:
+            // a quiet placeholder and one explanatory line, with no controls.
             auto const& ms = media.State();
-            const float art = std::min(3 * kS4, r.bottom - r.top - 2 * kS2);
-            D2D1_RECT_F ar{r.left + kS4, cy - art / 2, r.left + kS4 + art, cy + art / 2};
-            if (ms.artSize > 0 && ms.art.size() == static_cast<size_t>(ms.artSize) * ms.artSize) {
+            const float art = std::min(kMediaArt, r.bottom - r.top - 2 * kS2);
+            D2D1_RECT_F ar{r.left + kS3, cy - art / 2, r.left + kS3 + art, cy + art / 2};
+            if (ms.has && ms.artSize > 0 && ms.art.size() == static_cast<size_t>(ms.artSize) * ms.artSize) {
                 winrt::com_ptr<ID2D1Bitmap> bmp;
                 auto props = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
                 winrt::com_ptr<ID2D1BitmapBrush> bb;
@@ -1721,17 +1770,42 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     float k = art / ms.artSize;
                     bb->SetTransform(D2D1::Matrix3x2F::Scale(k, k) * D2D1::Matrix3x2F::Translation(ar.left, ar.top));
                     bb->SetInterpolationMode(D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                    dc->FillRoundedRectangle(D2D1::RoundedRect(ar, kRadiusSmall, kRadiusSmall), bb.get());
+                    dc->FillRoundedRectangle(D2D1::RoundedRect(ar, kS3, kS3), bb.get());
                 }
             } else {
-                box(ar, kRadiusSmall, kOff);
-                glyph(0xE8D6, fIcon.get(), ar, kDim);  // music note
+                box(ar, kS3, theme::A(kOff, ms.has ? 1.0f : 0.6f));
+                glyph(0xE8D6, fIcon.get(), ar, theme::A(kDim, ms.has ? 1.0f : 0.7f));  // music note
             }
-            const float tl = ar.right + kS3, tr = ms.has ? r.right - kS3 - 3 * kRound - 2 * kS1 - kS2 : r.right - kS3;
-            if (ms.has) twoLines(ms.title.empty() ? L"Now Playing" : ms.title, ms.artist, {tl, r.top, tr, r.bottom}, 1.0f);
-            else twoLines(L"Not Playing", L"Media you play shows up here", {tl, r.top, tr, r.bottom}, 1.0f);
+            const float tl = ar.right + kS3;
+            if (ms.has) {
+                float tr = r.right - kS3;
+                for (auto const& b : items) if (b.id == Id::Prev) tr = b.r.left - kS2;
+                const std::wstring title = ms.title.empty() ? L"Now Playing" : ms.title;
+                if (ms.artist.empty()) txt(title, fTitle.get(), {tl, r.top, tr, r.bottom}, kText);
+                else twoLines(title, ms.artist, {tl, r.top, tr, r.bottom}, 1.0f);
+            } else {
+                twoLines(L"Nothing playing", L"Play something and it shows up here", {tl, r.top, r.right - kS3, r.bottom}, 0.72f);
+            }
         }
     }
+    if (region) dc->PopAxisAlignedClip();
+}
+
+// Redraws just `r` (logical px) of the panel surface: the slider drag's fast path. Items did not move, so no layout.
+void ControlCenter::Impl::RepaintRegion(D2D1_RECT_F r) {
+    if (!surf || st != St::Open) return;
+    const RECT px{static_cast<LONG>(std::floor(r.left * s)), static_cast<LONG>(std::floor(r.top * s)),
+                  static_cast<LONG>(std::ceil(r.right * s)), static_cast<LONG>(std::ceil(r.bottom * s))};
+    auto interop = surf.as<ICompositionDrawingSurfaceInterop>();
+    winrt::com_ptr<ID2D1DeviceContext> dc;
+    POINT off{};
+    if (FAILED(interop->BeginDraw(&px, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) return;
+    try {
+        // `off` is where the update rect's corner lands in the returned target, so the surface origin is at off - corner.
+        const D2D1_RECT_F region{px.left / s, px.top / s, px.right / s, px.bottom / s};
+        Paint(dc.get(), static_cast<float>(off.x - px.left), static_cast<float>(off.y - px.top), nullptr, nullptr, &region);
+    } catch (...) {}
+    interop->EndDraw();
 }
 
 // HALO_CC_SNAPSHOT=<file.png>: once each open has settled, the panel's drawing (chips included) over a flat stand-in
@@ -1925,7 +1999,8 @@ void ControlCenter::Impl::BuildVisuals() {
     hv.Opacity(0);
     hvGeo = comp.CreateRoundedRectangleGeometry();
     auto hs = comp.CreateSpriteShape(hvGeo);
-    hs.FillBrush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(theme::Dark() ? 0x26 : 0x12, theme::Dark() ? 0xFF : 0x00, theme::Dark() ? 0xFF : 0x00, theme::Dark() ? 0xFF : 0x00)));
+    hvBrush = comp.CreateColorBrush(theme::C(theme::P().hover));
+    hs.FillBrush(hvBrush);
     hv.Shapes().Append(hs);
     inner.Children().InsertAtTop(hv);
     hvShown = false;
