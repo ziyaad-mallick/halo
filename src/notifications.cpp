@@ -1158,7 +1158,8 @@ void NotificationCenter::Impl::DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidCo
 
 // Each card slides 12 px in from the right and fades, 25 ms after the one before it. Compositor only.
 void NotificationCenter::Impl::AnimateIn(Card& c, int order) {
-    const auto delay = std::chrono::milliseconds(25 * order);
+    if (settings::Get().reduceMotion) { c.outer.Opacity(1); return; }
+    const auto delay = std::chrono::milliseconds(12 * std::min(order, 4));
     auto ease = comp.CreateCubicBezierEasingFunction({0.2f, 0.8f}, {0.2f, 1.0f});
     c.outer.Opacity(0);
     auto fade = comp.CreateScalarKeyFrameAnimation();
@@ -1170,13 +1171,14 @@ void NotificationCenter::Impl::AnimateIn(Card& c, int order) {
     auto slide = comp.CreateScalarKeyFrameAnimation();
     slide.InsertKeyFrame(0.0f, 12.0f * s);
     slide.InsertKeyFrame(1.0f, 0.0f, ease);
-    slide.Duration(300ms);
+    slide.Duration(200ms);
     slide.DelayTime(delay);
     slide.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
     c.outer.StartAnimation(L"Offset.X", slide);
 }
 
 void NotificationCenter::Impl::AnimateOut(Card& c) {
+    if (settings::Get().reduceMotion) { c.outer.Opacity(0); return; }
     auto fade = comp.CreateScalarKeyFrameAnimation();
     fade.InsertKeyFrame(1.0f, 0.0f);
     fade.Duration(130ms);
@@ -1202,6 +1204,13 @@ void NotificationCenter::Impl::Update(bool firstShow) {
         y += h + extra + kGap;
         rows.push_back(std::move(r));
     };
+    const bool calendarFirst = settings::Get().halo2 && !attached;
+    if (calendarFirst) {
+        Row r;
+        r.key = L"cal";
+        r.kind = K::Calendar;
+        add(std::move(r), kCalH);
+    }
     if (!attached) {
         Row r;
         r.key = L"hdr";
@@ -1265,7 +1274,7 @@ void NotificationCenter::Impl::Update(bool firstShow) {
         r.count = more;
         add(std::move(r), kMoreH);
     }
-    {
+    if (!calendarFirst) {
         Row r;
         r.key = L"cal";
         r.kind = K::Calendar;
@@ -1289,7 +1298,7 @@ void NotificationCenter::Impl::Update(bool firstShow) {
             if (moved) {
                 auto glide = comp.CreateScalarKeyFrameAnimation();
                 glide.InsertKeyFrame(1.0f, r.y * s, comp.CreateCubicBezierEasingFunction({0.2f, 0.8f}, {0.2f, 1.0f}));
-                glide.Duration(260ms);
+                glide.Duration(settings::Get().reduceMotion ? 1ms : std::chrono::milliseconds(ui::kSlowMs));
                 c.outer.StartAnimation(L"Offset.Y", glide);
             }
             next.push_back(std::move(c));
@@ -1358,7 +1367,7 @@ void NotificationCenter::Impl::ApplyGeometry() {
     GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
     s = dx / 96.0f;
     if (!attached) {
-        kW = kWStd;
+        kW = settings::Get().halo2 ? 408.0f : kWStd;
         kCalHead = kCalHeadStd;
         kCalRow = kCalRowStd;
         kCalH = kCalHStd;
@@ -1455,7 +1464,7 @@ bool NotificationCenter::IsOpen() const { return m->st == Impl::St::Open; }
 HWND NotificationCenter::Hwnd() const { return m->st == Impl::St::Closed ? nullptr : m->hwnd; }
 // Attach above the Control Center panel (physical px); an empty rect detaches. Re-lays out while open.
 void NotificationCenter::SetAnchor(RECT ccPanel) {
-    m->attached = ccPanel.right > ccPanel.left;
+    m->attached = !settings::Get().halo2 && ccPanel.right > ccPanel.left;
     m->anchorRc = ccPanel;
     if (m->st == Impl::St::Open && m->attached) {
         m->ApplyGeometry();
