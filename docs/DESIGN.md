@@ -193,6 +193,49 @@ ship builds with `tools/install.ps1`), and Quiet Dock's Windhawk mods are disabl
 - **Shortcuts:** Win+Alt+T toggles Halo and the Windows taskbar (guardian); the Windows key alone
   opens Halo's Start panel (its own search; Command Palette is no longer used) and reveals the dock.
 
+### Start 2.0 (`general.halo2`)
+
+With the switch off nothing below exists: Start is the 1.x panel, unchanged. With it on, Start becomes a wider
+two-column panel that opens on the left of the screen (24 px in from the monitor edge, above the dock; the open and
+close swoop still grows from the dock). It is one glass panel, and the control centre lives in its right column.
+
+**Left column (540 px wide, 480 minimum): the existing Start plus a widget strip.** Top to bottom: search, then
+"Hello, <first name>" (first word of the account display name, else the user name) with a one-line quote of the day,
+then two cards, then recent apps (and, on a roomy screen, one row of recent files), then the Settings/Power bar.
+The clock card holds the time, the date, battery % with its state (hidden when the machine has no battery) and a
+power-mode chip (Best efficiency / Balanced / Best performance). A click cycles the mode through the Windows power
+overlay API (`PowerSetActiveOverlayScheme`, via `svc::SetPowerMode`); when the API does not report a mode the chip is
+read-only and dim. The month card is a calendar with today in an accent circle, week start taken from the locale.
+The quote is one of 61 short lines by long-dead authors, picked by `days since 1970 mod 61`, no network.
+The clock and battery refresh on a timer armed for each minute boundary, only while the panel is open.
+
+**Right column (312 px, 264 minimum): a compact control centre on the Control Center's services** (`src/services.h`:
+Radios, the Wi-Fi/Bluetooth discovery, AudioEndpoint, brightness, Media). Wi-Fi and Bluetooth tiles (accent when on)
+toggle the radio; the chevron on a tile swaps everything under the tiles for a list of nearby networks or paired
+devices (Back, Refresh, the rows, wheel to scroll). Under the tiles: a brightness and a volume slider (the volume
+glyph mutes), a now-playing card (art, title/artist, previous/play/next) and the usage monitor. The column is exactly
+the height of the Start panel.
+
+**Usage monitor** (`src/usage.h/.cpp`): RAM, CPU, GPU and disk as a percentage with a thin bar. A worker thread
+exists only between Show and Close: it samples PDH once a second (`\Processor(_Total)\% Processor Time`,
+`\PhysicalDisk(_Total)\% Disk Time` clamped to 100, `\GPU Engine(*)\Utilization Percentage` summed per engine and then
+the busiest engine of the busiest adapter, `GlobalMemoryStatusEx` for RAM) and posts a message; the wildcard GPU
+counter is re-expanded every 5 s because engine instances come and go with processes. Closed means no thread, no PDH
+query and no timer. The monitor repaints on its own small surface so a sample never redraws the controls.
+
+**Fitting small screens** (`src/start_widgets.h`, checked by `tools/start_test.cpp`). The panel height is whatever the
+left column needs, floored at 336 px for the right column, and the left column steps down through four levels until it
+fits the room above the dock: 0 greeting + quote, widgets, apps, one row of files; 1 without files; 2 without the
+quote; 3 the month shrinks to this week. At 1366x768 the 125% layout is level 0 (501 of 508 px available) and the 150%
+layout is level 1 (399 of 406). The right column has a roomy variant (taller media card, usage as four rows) used when
+the panel is at least ~414 px tall, and otherwise a compact one (2 x 2 usage grid); its gaps flex between 4 and 32 px.
+Width: 540 + 312 = 852 px, which is inside the 862 px a 1366x768 screen has at 150% (910 px less 2 x 24 margin); on a
+narrower screen the left column gives up width first, to 480, then the right to 264.
+
+**Keyboard.** Tab (or Shift+Tab) moves the keyboard between the columns; the left column is the search field as
+before. In the right column the arrows move between controls (left/right adjust a slider by 5 %), Enter or Space acts,
+typing a letter returns to search and types it, Esc backs out of a radio list and then closes the panel.
+
 ## Risks and open questions
 
 - **Blur behind a custom-shaped Win32 composition window.** The options are
