@@ -660,6 +660,7 @@ wuc::CompositionBrush Launcher::FileBrush(std::wstring const& path, float logica
     if (img == m_fileIcons.end()) {  // a search hit outside the head of the list: its icon is loaded now
         IconImage loaded;
         if (!LoadJumboIcon(path, loaded) || !loaded.width) loaded = {};
+        if (m_fileIcons.size() >= 64) m_fileIcons.erase(m_fileIcons.begin());
         img = m_fileIcons.emplace(key, std::move(loaded)).first;
     }
     if (!img->second.width) return nullptr;
@@ -1667,6 +1668,7 @@ void Launcher::Prefetch() {
         if (m_fileIcons.contains(key)) continue;
         IconImage img;
         if (!LoadJumboIcon(f.path, img) || !img.width) img = {};
+        if (m_fileIcons.size() >= 64) m_fileIcons.erase(m_fileIcons.begin());
         m_fileIcons.emplace(key, std::move(img));
     }
     if (!m_indexed) BuildIndex();

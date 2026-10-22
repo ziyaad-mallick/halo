@@ -30,6 +30,7 @@
 #include <vector>
 #include "apps.h"
 #include "cluster.h"
+#include "media_visibility.h"
 #include "control_center.h"
 #include "notifications.h"
 #include "theme.h"
@@ -112,6 +113,7 @@ constexpr UINT_PTR kHideTimer = 1;
 constexpr UINT_PTR kPreviewTimer = 21;  // the pointer rested on a running app
 constexpr UINT_PTR kPreviewGrace = 22;  // the pointer left the icon and the strip
 constexpr UINT_PTR kPanelStagger = 23;  // the notification column follows the Control Center
+constexpr UINT_PTR kMediaExpiry = 24;
 constexpr UINT kPanelStaggerMs = 40;
 constexpr UINT kPreviewDelayMs = 400;
 constexpr UINT kPreviewGraceMs = 300;
@@ -222,6 +224,8 @@ private:
     wuc::CompositionBrush MakeNoiseBrush(int w, int h);
     void BuildDock();
     void RefreshDock();
+    void UpdateDockMedia();
+    void OpenMediaSource();
     void UpdateRegion();
     wuc::CompositionBrush IconBrushFor(std::wstring const& path);
     wuc::CompositionBrush FallbackIconBrush();
@@ -275,6 +279,7 @@ private:
     std::unique_ptr<DockCluster> m_cluster;
     std::unique_ptr<DockWidgets> m_widgets;  // HALO 2.0: Wi-Fi, Bluetooth and Now Playing
     halo::svc::Media m_dockMedia;
+    halo::MediaVisibility m_mediaVisibility;
     halo::svc::Radios m_dockRadios;
     std::unique_ptr<halo::AppLabel> m_label;
     std::unique_ptr<halo::Launcher> m_launcher;
@@ -754,8 +759,39 @@ wuc::SpriteVisual Halo::BuildPillShadow(wuc::ContainerVisual const& pill, float 
     return sprite;
 }
 
+void Halo::UpdateDockMedia() {
+    if (!m_widgets) return;
+    auto const& state = m_dockMedia.State();
+    const auto now = GetTickCount64();
+    const bool visible = m_mediaVisibility.Update(state.has, state.playing, now);
+    KillTimer(m_hwnd, kMediaExpiry);
+    if (visible && !state.playing)
+        SetTimer(m_hwnd, kMediaExpiry, static_cast<UINT>(m_mediaVisibility.until - now), nullptr);
+    const bool wasShown = m_widgets->CapsuleShown();
+    m_widgets->SetMedia(state, visible);
+    if (m_dock && wasShown != m_widgets->CapsuleShown()) UpdateRegion();
+}
+
+void Halo::OpenMediaSource() {
+    auto const& source = m_dockMedia.State().source;
+    if (source.empty()) return;
+    // GSMTC identifies the player, including browsers; bring its existing window forward.
+    for (auto const& app : m_tracker->Apps()) {
+        const auto slash = app.exe.find_last_of(L"\\/");
+        const auto name = app.exe.substr(slash == std::wstring::npos ? 0 : slash + 1);
+        if (_wcsicmp(source.c_str(), app.aumid.c_str()) && _wcsicmp(source.c_str(), app.exe.c_str()) &&
+            _wcsicmp(source.c_str(), name.c_str())) continue;
+        if (HWND hwnd = m_tracker->Front(app.key)) { ActivateWindow(hwnd); return; }
+    }
+    // Registered packaged/desktop AUMIDs can also activate a player with no visible window.
+    if (source.find(L'\\') == std::wstring::npos && source.find(L'/') == std::wstring::npos)
+        ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + source).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 void Halo::BuildDock() {
     m_dockMedia.Stop();
+    KillTimer(m_hwnd, kMediaExpiry);
+    m_mediaVisibility = {};
     m_dockRadios.Stop();
     auto pill = BuildPill();
     m_cluster = std::make_unique<DockCluster>(m_comp, m_gdev, m_hwnd, m_metrics.pillHeight, m_scale.v);
@@ -765,13 +801,7 @@ void Halo::BuildDock() {
             m_widgets->AttachCapsuleGlass(BuildPill(static_cast<int>(std::ceil(m_widgets->CapsuleHeight())), 0.0f, nullptr,
                                                     static_cast<int>(std::ceil(m_widgets->CapsuleWidth()))));
         }
-        m_dockMedia.Start(m_hwnd, kMsgDockMedia, [this] {
-            if (!m_widgets) return;
-            auto const& state = m_dockMedia.State();
-            const bool wasShown = m_widgets->CapsuleShown();
-            m_widgets->SetMedia(state);
-            if (m_dock && wasShown != m_widgets->CapsuleShown()) UpdateRegion();  // the capsule opened or closed
-        });
+        m_dockMedia.Start(m_hwnd, kMsgDockMedia, [this] { UpdateDockMedia(); });
     }
     m_dock = std::make_unique<Dock>(m_comp, m_slide, pill, m_metrics, m_cluster.get(), m_widgets.get());
     Step(L"pill shadow", [&] {
@@ -819,6 +849,8 @@ wuc::CompositionBrush Halo::IconBrushFor(std::wstring const& path) {
     } catch (std::exception const&) {
         Log(L"icon for " + path + L" failed (std::exception)");
     }
+    // Visible sprites own their brushes; cap only the reuse cache across Start searches.
+    if (m_brushes.size() >= 128) m_brushes.erase(m_brushes.begin());
     m_brushes.insert_or_assign(path, brush);
     return brush;
 }
@@ -838,6 +870,7 @@ wuc::CompositionBrush Halo::FallbackIconBrush() {
     } catch (std::exception const&) {
         Log(L"generic icon failed (std::exception)");
     }
+    if (m_brushes.size() >= 128) m_brushes.erase(m_brushes.begin());
     m_brushes.insert_or_assign(kKey, brush);
     return brush;
 }
@@ -1544,7 +1577,10 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             OpenPanel(w == halo::edge::kBottom, w != halo::edge::kBottom);  // the corner: Quick Settings alone; touch: both, no auto-hide
             return 0;
         case WM_TIMER:
-            if (w == kHideTimer) {
+            if (w == kMediaExpiry) {
+                KillTimer(m_hwnd, kMediaExpiry);
+                UpdateDockMedia();
+            } else if (w == kHideTimer) {
                 KillTimer(m_hwnd, kHideTimer);
                 // Only a window over the dock, or a fullscreen app, takes it away (PointerLeave arms the timer on
                 // that condition too). The genie hold arms it regardless: with nothing in the way the dock stays up.
@@ -1596,11 +1632,11 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (m_dock && m_state == State::Shown) {
                 const Dock::Target target = m_dock->HitTarget(mx, my);
                 m_pressedStart = target.kind == Dock::Kind::Start;
-                m_pressedWidget = target.kind == Dock::Kind::MediaPlay || target.kind == Dock::Kind::MediaNext ? target.kind : Dock::Kind::None;
+                m_pressedWidget = target.kind == Dock::Kind::Media || target.kind == Dock::Kind::MediaPlay || target.kind == Dock::Kind::MediaNext ? target.kind : Dock::Kind::None;
                 if (m_widgets) m_widgets->SetPressed(MediaPart(m_pressedWidget));
                 m_pressed = m_dock->HitTest(mx, my);
                 m_dock->SetPressed(m_pressed);
-                if ((m_pressed >= 0 || MediaPart(m_pressedWidget) != DockWidgets::Part::None) && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
+                if ((m_pressed >= 0 || m_pressedWidget != Dock::Kind::None) && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
             }
             return 0;
         case WM_LBUTTONUP:
@@ -1609,13 +1645,15 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 OpenLauncher();
             {
                 const Dock::Kind releasedWidget = std::exchange(m_pressedWidget, Dock::Kind::None);
-                if (m_widgets && MediaPart(releasedWidget) != DockWidgets::Part::None) {
+                if (m_widgets && releasedWidget != Dock::Kind::None) {
                     m_widgets->SetPressed(DockWidgets::Part::None);
                     if (m_pressed < 0 && m == WM_LBUTTONUP) ReleaseCapture();
                 }
                 if (const Dock::Kind widget = releasedWidget;
                     widget != Dock::Kind::None && m == WM_LBUTTONUP && m_dock && m_dock->HitTarget(mx, my).kind == widget) {
-                    if (widget == Dock::Kind::MediaPlay && m_dockMedia.State().has) {
+                    if (widget == Dock::Kind::Media && m_dockMedia.State().has) {
+                        OpenMediaSource();
+                    } else if (widget == Dock::Kind::MediaPlay && m_dockMedia.State().has) {
                         m_dockMedia.PlayPause();
                     } else if (widget == Dock::Kind::MediaNext && m_dockMedia.State().canNext) {
                         m_dockMedia.Next();

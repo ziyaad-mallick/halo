@@ -1316,6 +1316,7 @@ winrt::fire_and_forget Media::PullAsync() {
         MediaState next;
         if (sess) {
             next.has = true;
+            next.source = sess.SourceAppUserModelId().c_str();
             auto info = sess.GetPlaybackInfo();
             next.playing = info.PlaybackStatus() ==
                            winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
@@ -1326,8 +1327,8 @@ winrt::fire_and_forget Media::PullAsync() {
             if (gen != *live || seq != *newest) co_return;
             next.title = props.Title().c_str();
             next.artist = props.Artist().c_str();
-            if (next.title == m_state.title && next.artist == m_state.artist) {
-                next.art = m_state.art;  // same track: keep the decoded art
+            if (next.source == m_state.source && next.title == m_state.title && next.artist == m_state.artist) {
+                next.art = std::move(m_state.art);  // transfer the cached bitmap, no allocation/copy on playback events
                 next.artSize = m_state.artSize;
             } else if (auto thumb = props.Thumbnail()) {
                 try {

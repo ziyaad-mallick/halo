@@ -154,7 +154,7 @@ DiscoveryStatus BtStatus();
 // ---- Now Playing (GSMTC) ------------------------------------------------------------------
 struct MediaState {
     bool has = false, playing = false, canPrev = false, canNext = false;
-    std::wstring title, artist;
+    std::wstring title, artist, source;
     int artSize = 0;  // album art is artSize x artSize premultiplied BGRA; 0 = none
     std::vector<uint32_t> art;
 };

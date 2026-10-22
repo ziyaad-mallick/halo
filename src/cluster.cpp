@@ -518,8 +518,8 @@ void DockWidgets::SetPressed(Part p) {
     m_pressHl.Opacity(1.0f);  // a press answers at once
 }
 
-void DockWidgets::SetMedia(halo::svc::MediaState const& st) {
-    const bool shown = st.has && st.playing;
+void DockWidgets::SetMedia(halo::svc::MediaState const& st, bool keepPaused) {
+    const bool shown = st.has && (st.playing || keepPaused);
     std::wstring title = st.title.empty() ? st.artist : st.title;
     std::wstring artist = st.title.empty() ? L"" : st.artist;
     if (st.has && title.empty()) title = L"Now Playing";

@@ -16,7 +16,7 @@ code = r'''
 constexpr int WM_LBUTTONUP=1, WM_CAPTURECHANGED=2;
 struct DockWidgets { enum class Part {None, Play, Next}; void SetPressed(Part) {} };
 struct Dock {
- enum class Kind {None, MediaPlay, MediaNext};
+ enum class Kind {None, Media, MediaPlay, MediaNext};
  struct Target {Kind kind;};
  Kind hit=Kind::MediaPlay;
  Target HitTarget(float,float) { return {hit}; }
@@ -33,7 +33,8 @@ struct Fixture {
  DockWidgets widgets; Dock dock;
  DockWidgets* m_widgets=&widgets; Dock* m_dock=&dock;
  Dock::Kind m_pressedWidget=Dock::Kind::MediaPlay;
- int m_pressed=-1; float mx=0,my=0;
+ int m_pressed=-1, opened=0; float mx=0,my=0;
+ void OpenMediaSource() { ++opened; }
  Media m_dockMedia;
  void ReleaseCapture() { Up(WM_CAPTURECHANGED); }
  void Up(int m) {
@@ -42,10 +43,13 @@ struct Fixture {
 };
 int main() {
  int failures=0;
- for (auto kind : {Dock::Kind::MediaPlay, Dock::Kind::MediaNext}) {
+ for (auto kind : {Dock::Kind::Media, Dock::Kind::MediaPlay, Dock::Kind::MediaNext}) {
   Fixture f; f.dock.hit=kind; f.m_pressedWidget=kind;
   f.Up(WM_LBUTTONUP);
-  if(f.m_dockMedia.play+f.m_dockMedia.next != 1) ++failures;
+  if(f.m_dockMedia.play+f.m_dockMedia.next+f.opened != 1) ++failures;
+  Fixture outside; outside.m_pressedWidget=kind; outside.dock.hit=Dock::Kind::None;
+  outside.Up(WM_LBUTTONUP);
+  if(outside.m_dockMedia.play+outside.m_dockMedia.next+outside.opened) ++failures;
   Fixture cancelled; cancelled.Up(WM_CAPTURECHANGED);
   if(cancelled.m_dockMedia.play) ++failures;
  }

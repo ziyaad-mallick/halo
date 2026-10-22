@@ -141,6 +141,7 @@ void Swoop::Disable(HWND hwnd) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     ULONGLONG now = GetTickCount64();
+    std::erase_if(m_hasMod, [now](auto const& entry) { return now - entry.second.first > kModCacheMs; });
     auto& c = m_hasMod[pid];
     if (c.first == 0 || now - c.first > kModCacheMs) {
         c = {now, ModLoaded(pid)};

@@ -65,7 +65,7 @@ namespace {
 // Logical px; everything is scaled by the monitor DPI.
 constexpr float kWStd = ui::kNotificationWidth;          // panel width when standalone (attached, it follows the Control Center)
 constexpr float kEdge = ui::kNotificationEdge;           // gap to the screen edge (right and top)
-constexpr float kPad = ui::kNotificationPad, kIcon = 32, kTextX = kPad + kIcon + ui::kS3, kRadius = ui::kNotificationRadius, kGap = ui::kNotificationGap, kPeek = 8;  // the Control Center's grid
+constexpr float kPad = ui::kNotificationPad, kIcon = 32, kTextX = kPad + kIcon + ui::kS3, kRadius = ui::kNotificationRadius, kGap = ui::kNotificationGap;  // the Control Center's grid
 constexpr float kHeaderY = 16, kTitleY = 36, kBodyY = 56, kLine = 16, kMinH = 76, kCollapseH = 28;
 constexpr float kHeadH = 38, kMoreH = 28, kEmptyH = 56;
 constexpr float kCalHeadStd = 74, kCalNav = 26, kCalDow = 18, kCalRowStd = 26, kCalHStd = kCalHeadStd + kCalNav + 4 + kCalDow + 2 + 6 * kCalRowStd + 12;
@@ -359,7 +359,7 @@ struct NotificationCenter::Impl {
     void Dismissed() { if (api->onDismiss) api->onDismiss(); else Close(); }
     // A short rise as it fades in (attached, out of the Control Center below it); standalone, in from the right.
     float2 Travel() const { return attached ? float2{0, ui::kEnterTravel * s} : float2{ui::kEnterTravel * 2 * s, 0}; }
-    void AnimateIn(Card& c, int order);
+    void AnimateIn(Card& c);
     void AnimateOut(Card& c);
     int CardAt(float x, float y, int* part);
     int Visible() const;
@@ -721,7 +721,7 @@ LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 int old = hoverCard;
                 hoverCard = i;
                 hoverPart = part;
-                if (old >= 0 && old < static_cast<int>(cards.size())) Draw(cards[old], false, -1);
+                if (old != i && old >= 0 && old < static_cast<int>(cards.size())) Draw(cards[old], false, -1);
                 if (i >= 0) Draw(cards[i], true, part);
             }
             return 0;
@@ -757,6 +757,7 @@ LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == kTimerGone) {
                 KillTimer(h, kTimerGone);
+                for (auto const& c : dying) panelVis.Children().Remove(c.outer);
                 dying.clear();
                 Place();
             } else if (w == kTimerClose) {
@@ -872,27 +873,11 @@ wuc::CompositionBrush NotificationCenter::Impl::NoiseBrush(int w, int h) {
 // 2.5% grain, 1 px gradient rim.
 void NotificationCenter::Impl::CreateCard(Card& c) {
     const float wPx = std::ceil(kW * s), hPx = std::ceil(c.row.h * s);
-    const bool group = c.row.kind == K::Group;
     c.outer = comp.CreateContainerVisual();
-    c.outer.Size({wPx, hPx + (group ? kPeek * s : 0)});
+    c.outer.Size({wPx, hPx});
     c.outer.CenterPoint({wPx / 2, 0, 0});
 
     const bool quiet = c.row.kind == K::Header || c.row.kind == K::Empty || c.row.kind == K::More || c.row.kind == K::Collapse;
-    if (group) {  // the rest of the stack peeking out from under the card
-        for (int i = 2; i >= 1; --i) {
-            auto peek = comp.CreateSpriteVisual();
-            float inset = (7.0f * i) * s;
-            peek.Size({wPx - 2 * inset, 20 * s});
-            peek.Offset({inset, hPx + (i == 1 ? 5.0f : 10.0f) * s - 20 * s, 0});
-            peek.Brush(comp.CreateColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(theme::Dark() ? (i == 1 ? 0x30 : 0x1A) : (i == 1 ? 0x78 : 0x48), 0xFF, 0xFF, 0xFF)));
-            auto g = comp.CreateRoundedRectangleGeometry();
-            g.CornerRadius({kRadius * s, kRadius * s});
-            g.Size(peek.Size());
-            peek.Clip(comp.CreateGeometricClip(g));
-            c.outer.Children().InsertAtTop(peek);
-        }
-    }
-
     if (!quiet) {
         const float rr = (c.row.kind == K::Collapse || c.row.kind == K::More || c.row.kind == K::Header) ? c.row.h / 2 * s : kRadius * s;
         auto col = theme::P().shadow;
@@ -914,7 +899,7 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
         auto tint = comp.CreateSpriteVisual();
         tint.RelativeSizeAdjustment({1, 1});
         const auto& gcc = settings::Get().cc;  // the notification column follows the Control Center's glass
-        tint.Brush(comp.CreateColorBrush(theme::Dark() || gcc.hasTint ? theme::C(theme::Glass(gcc).tint) : winrt::Windows::UI::ColorHelper::FromArgb(0xF0, 0xFA, 0xFA, 0xFC)));
+        tint.Brush(comp.CreateColorBrush(theme::C(theme::Glass(gcc).tint)));
         c.vis.Children().InsertAtTop(tint);
 
         if (noise) {
@@ -949,12 +934,6 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
         auto rimVisual = comp.CreateShapeVisual();
         rimVisual.RelativeSizeAdjustment({1, 1});
         rimVisual.Shapes().Append(sprite);
-        if (theme::P().edge.a) {  // hairline edge for light glass
-            auto edge = comp.CreateSpriteShape(c.rim);
-            edge.StrokeBrush(comp.CreateColorBrush(theme::C(theme::P().edge)));
-            edge.StrokeThickness(t);
-            rimVisual.Shapes().Append(edge);
-        }
         c.vis.Children().InsertAtTop(rimVisual);
     }
 
@@ -1170,24 +1149,19 @@ void NotificationCenter::Impl::DrawCalendar(ID2D1DeviceContext* dc, ID2D1SolidCo
     }
 }
 
-// Each card slides 12 px in from the right and fades, 25 ms after the one before it. Compositor only.
-void NotificationCenter::Impl::AnimateIn(Card& c, int order) {
+// Only newly arriving alerts animate independently; opening moves the column as one.
+void NotificationCenter::Impl::AnimateIn(Card& c) {
     if (settings::Get().reduceMotion) { c.outer.Opacity(1); return; }
-    const auto delay = std::chrono::milliseconds(12 * std::min(order, 4));
     auto ease = comp.CreateCubicBezierEasingFunction({0.2f, 0.8f}, {0.2f, 1.0f});
     c.outer.Opacity(0);
     auto fade = comp.CreateScalarKeyFrameAnimation();
     fade.InsertKeyFrame(1.0f, 1.0f);
-    fade.Duration(200ms);
-    fade.DelayTime(delay);
-    fade.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
+    fade.Duration(160ms);
     c.outer.StartAnimation(L"Opacity", fade);
     auto slide = comp.CreateScalarKeyFrameAnimation();
-    slide.InsertKeyFrame(0.0f, 12.0f * s);
+    slide.InsertKeyFrame(0.0f, 6.0f * s);
     slide.InsertKeyFrame(1.0f, 0.0f, ease);
-    slide.Duration(200ms);
-    slide.DelayTime(delay);
-    slide.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
+    slide.Duration(160ms);
     c.outer.StartAnimation(L"Offset.X", slide);
 }
 
@@ -1197,13 +1171,9 @@ void NotificationCenter::Impl::AnimateOut(Card& c) {
     fade.InsertKeyFrame(1.0f, 0.0f);
     fade.Duration(130ms);
     c.outer.StartAnimation(L"Opacity", fade);
-    auto scale = comp.CreateVector3KeyFrameAnimation();
-    scale.InsertKeyFrame(1.0f, {0.96f, 0.96f, 1.0f});
-    scale.Duration(130ms);
-    c.outer.StartAnimation(L"Scale", scale);
 }
 
-// Diffs the wanted rows against the live cards: new ones animate in (staggered), gone ones fade out,
+// Diffs the wanted rows against the live cards: new ones animate in, gone ones fade out,
 // survivors glide to their new slot.
 void NotificationCenter::Impl::Update(bool firstShow) {
     if (st != St::Open || !root) return;
@@ -1260,7 +1230,7 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     int cardsShown = 0;
     for (auto& z : sized) {
         const bool isCard = z.r.kind != K::Collapse;
-        float use = z.h + (z.r.kind == K::Group ? kPeek : 0) + kGap;
+        float use = z.h + kGap;
         if ((isCard && cardsShown >= (attached ? kMaxCardsAttached : kMaxCards)) || used + use > cardsAvail) break;
         used += use;
         cardsShown += isCard;
@@ -1270,7 +1240,7 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     if (keep < sized.size() && !attached)
         while (keep > 1 && used + kMoreH + kGap > cardsAvail) {
             --keep;
-            used -= sized[keep].h + (sized[keep].r.kind == K::Group ? kPeek : 0) + kGap;
+            used -= sized[keep].h + kGap;
         }
     int more = 0;
     for (size_t i = keep; i < sized.size(); ++i)
@@ -1278,8 +1248,7 @@ void NotificationCenter::Impl::Update(bool firstShow) {
         else if (sized[i].r.kind == K::Group) more += sized[i].r.count;
     if (attached && keep && sized[0].r.kind != K::Collapse) sized[0].r.clearBtn = true;
     for (size_t i = 0; i < keep; ++i) {
-        const float extra = sized[i].r.kind == K::Group ? kPeek : 0;
-        add(std::move(sized[i].r), sized[i].h, extra);
+        add(std::move(sized[i].r), sized[i].h);
     }
     if (more && (!attached || used + kMoreH + kGap <= cardsAvail)) {
         Row r;
@@ -1297,7 +1266,6 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     totalH = y - kGap;
 
     std::vector<Card> next;
-    int order = 0;
     for (auto& r : rows) {
         std::wstring sig = r.n.title + L"\x1f" + r.n.body + L"\x1f" + Rel(r.n.ft) + L"\x1f" + std::to_wstring(r.count) + L"\x1f" +
                            std::to_wstring(r.h) + (r.kind == K::Group ? L"g" : L"") + (r.clearBtn ? L"C" : L"") + (icons.count(r.n.appKey) ? L"i" : L"") +
@@ -1323,8 +1291,7 @@ void NotificationCenter::Impl::Update(bool firstShow) {
             CreateCard(c);
             c.outer.Offset({0, r.y * s, 0});
             panelVis.Children().InsertAtTop(c.outer);
-            if (!(attached && firstShow)) AnimateIn(c, order);  // attached: the whole column moves as one
-            ++order;
+            if (!firstShow) AnimateIn(c);  // opening moves the whole column once, like the dock
             next.push_back(std::move(c));
         }
     }

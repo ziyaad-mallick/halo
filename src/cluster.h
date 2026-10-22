@@ -150,7 +150,7 @@ public:
     void AttachCapsuleGlass(winrt::Windows::UI::Composition::ContainerVisual const& glass);
     void SetHover(Part p);
     void SetPressed(Part p);
-    void SetMedia(halo::svc::MediaState const& state);
+    void SetMedia(halo::svc::MediaState const& state, bool keepPaused = false);
 
 private:
     void Render();

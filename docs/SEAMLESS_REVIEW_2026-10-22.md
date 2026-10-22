@@ -1,0 +1,11 @@
+# Halo media and notification refinement
+
+- Music remains visible for ten seconds after a playing-to-paused transition. Metadata updates cannot extend the deadline; resuming cancels it, and a missing session hides immediately. Startup-paused sessions remain hidden. A one-shot window timer handles expiry; there is no new polling loop.
+- Clicking capsule artwork/title activates the matching existing player window, using the GSMTC source AUMID or executable identity. Registered AUMIDs fall back to AppsFolder activation. Browser sessions activate the browser window; the GSMTC identity does not identify a tab.
+- Notifications retain the Windows listener and calendar. Shared frosted tint, rounded cards and quiet borders remain; decorative stacked slabs and duplicate rims are removed. Opening now moves the column once, rather than combining column and card entrance motion. Dismissals fade without glass scaling.
+- Dismissed cards now detach from the compositor tree. The actual-handler regression reproduced 100 retained visuals after 100 dismissals on the baseline. The agent's patched run retained zero; the parent's subsequent patched rerun was blocked by Windows Application Control. No bypass attempted.
+- File icon bitmap reuse is capped at 64 entries, app icon brush reuse at 128. Existing visible sprites retain their brush references. Expired Swoop PID answers are removed using the existing TTL. Same-track media updates transfer cached artwork instead of copying its pixel buffer. Cache eviction may require reloading an icon on a later cache miss.
+
+Validation: media capture/body action fixture: zero failures, including synchronous capture loss and release outside. Media visibility test: all checks passed, covering deadline, repeated metadata events, resume, quit and initial paused state. Notification preview build passed. Final build and dock checks are recorded in the ops log.
+
+Native visual audit, real-player activation/playback and controlled whole-app RAM/CPU/GPU measurements remain **UNVERIFIED**. Run the isolated build on a test desktop, exercise those flows and compare process/DWM counters with the previous build to settle them. The installed live shell was not modified.
