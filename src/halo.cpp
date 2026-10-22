@@ -245,7 +245,7 @@ private:
     void OpenPanel(bool byPointer = false, bool withNotifs = true);
     void ClosePanel();
     // HALO 2.0: the right side opens the notification column on its own (with the calendar), not the Control Center.
-    void OpenNotifications();
+    void OpenNotifications(bool byPointer = false);
     void ToggleNotifications();
     void TogglePanel() { if (m_cc && m_cc->IsOpen()) ClosePanel(); else OpenPanel(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
@@ -1462,10 +1462,10 @@ void Halo::OpenPanel(bool byPointer, bool withNotifs) {
     }
 }
 
-void Halo::OpenNotifications() {
+void Halo::OpenNotifications(bool byPointer) {
     if (!m_notif || m_notif->IsOpen()) return;
     m_notif->SetAnchor(RECT{});  // standalone: the full column at the right edge, calendar included
-    m_notif->Open();
+    m_notif->Open(byPointer);
     Log(L"panel: notifications opened (HALO 2.0)");
 }
 
@@ -1571,7 +1571,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             }
             if (m_cfg.halo2) {  // the right side is notifications + calendar; the top swipe goes to Start (it hosts the control centre)
                 if (w == halo::edge::kTop) OpenLauncher();
-                else OpenNotifications();
+                else OpenNotifications(true);
                 return 0;
             }
             OpenPanel(w == halo::edge::kBottom, w != halo::edge::kBottom);  // the corner: Quick Settings alone; touch: both, no auto-hide

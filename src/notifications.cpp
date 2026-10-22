@@ -72,7 +72,7 @@ constexpr float kCalHeadStd = 74, kCalNav = 26, kCalDow = 18, kCalRowStd = 26, k
 constexpr int kMaxCards = 6, kMaxCardsAttached = 3;
 constexpr float kAttachGap = 8, kAttachMargin = 8;  // above the Control Center; to the screen top
 constexpr UINT kMsgData = WM_APP + 1;
-constexpr UINT_PTR kTimerGone = 1, kTimerClose = 2;
+constexpr UINT_PTR kTimerGone = 1, kTimerClose = 2, kTimerLeave = 3;
 constexpr wchar_t kClass[] = L"HaloNotifications", kMsgClass[] = L"HaloNotificationsMsg";
 
 // Refers into the live palette: a theme or accent change shows at the next paint.
@@ -325,6 +325,8 @@ struct NotificationCenter::Impl {
     float totalH = 0, winH = 0;
     int hoverCard = -1, hoverPart = 0;
     bool tracking = false;
+    bool byPointer = false, entered = false;
+    ULONGLONG outSince = 0;
 
     // calendar
     SYSTEMTIME today{};
@@ -346,6 +348,13 @@ struct NotificationCenter::Impl {
     void Close();
     void Teardown();
     void Focus();
+    void CheckPointer();
+    settings::Surface MotionConfig() const {
+        settings::Surface cfg = settings::Get().halo2 ? static_cast<settings::Surface>(settings::Get().taskbar) : static_cast<settings::Surface>(settings::Get().cc);
+        if (settings::Get().reduceMotion) cfg.effect = settings::Effect::None;
+        return cfg;
+    }
+    float DockClearance() const { return settings::Get().halo2 ? settings::Get().taskbar.iconSize + 2 * ui::kS6 : 0; }
     void BuildFonts();
     std::vector<Row> BuildRows();
     void Update(bool firstShow);
@@ -358,7 +367,7 @@ struct NotificationCenter::Impl {
     void ApplyGeometry();
     void Dismissed() { if (api->onDismiss) api->onDismiss(); else Close(); }
     // A short rise as it fades in (attached, out of the Control Center below it); standalone, in from the right.
-    float2 Travel() const { return attached ? float2{0, ui::kEnterTravel * s} : float2{ui::kEnterTravel * 2 * s, 0}; }
+    float2 Travel() const { return attached || settings::Get().halo2 ? float2{0, ui::kEnterTravel * s} : float2{ui::kEnterTravel * 2 * s, 0}; }
     void AnimateIn(Card& c);
     void AnimateOut(Card& c);
     int CardAt(float x, float y, int* part);
@@ -755,7 +764,9 @@ LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_TIMER:
-            if (w == kTimerGone) {
+            if (w == kTimerLeave) {
+                CheckPointer();
+            } else if (w == kTimerGone) {
                 KillTimer(h, kTimerGone);
                 for (auto const& c : dying) panelVis.Children().Remove(c.outer);
                 dying.clear();
@@ -1319,6 +1330,8 @@ void NotificationCenter::Impl::Place() {
     const int hPx = std::max(1, static_cast<int>(std::ceil((h + 2 * motion::kPad) * s)));
     int x = work.right - wPx + static_cast<int>((motion::kPad - kEdge) * s);
     int yy = work.top + static_cast<int>((kEdge - motion::kPad) * s);
+    if (!attached && settings::Get().halo2)
+        yy = work.bottom - hPx + static_cast<int>((motion::kPad - kEdge - DockClearance()) * s);
     if (attached) {  // directly above the Control Center, same left edge
         const int pad = static_cast<int>(std::lround(motion::kPad * s));
         x = anchorRc.left - pad;
@@ -1352,7 +1365,7 @@ void NotificationCenter::Impl::ApplyGeometry() {
         kCalHead = settings::Get().halo2 ? ui::kNotificationCalendarHead : kCalHeadStd;
         kCalRow = settings::Get().halo2 ? ui::kNotificationCalendarRow : kCalRowStd;
         kCalH = kCalHead + kCalNav + 4 + kCalDow + 2 + 6 * kCalRow + 12;
-        availH = (work.bottom - work.top) / s - 2 * kEdge;
+        availH = (work.bottom - work.top) / s - 2 * kEdge - DockClearance();
         return;
     }
     kW = (anchorRc.right - anchorRc.left) / s;
@@ -1394,9 +1407,12 @@ void NotificationCenter::Impl::Open() {
         st = St::Open;
         winH = 0;
         Update(true);
-        motion::In(comp, panelVis, rest, Travel(), settings::Get().cc);  // before the show: no frame at rest first
+        motion::In(comp, panelVis, rest, Travel(), MotionConfig());  // before the show: no frame at rest first
         ShowWindow(hwnd, attached ? SW_SHOWNOACTIVATE : SW_SHOW);  // attached: the Control Center keeps the focus
         if (!attached) Focus();
+        entered = false;
+        outSince = 0;
+        if (!attached) SetTimer(hwnd, kTimerLeave, 100, nullptr);
         SetEvent(evReq);
         svc::Log(std::wstring(L"notifications: open") + (attached ? L" (attached)" : L"") + L" availH=" + std::to_wstring(static_cast<int>(availH)) +
                  L" totalH=" + std::to_wstring(static_cast<int>(totalH)));
@@ -1406,17 +1422,36 @@ void NotificationCenter::Impl::Open() {
     }
 }
 
+void NotificationCenter::Impl::CheckPointer() {
+    if (st != St::Open || attached || !settings::Get().cc.closeOnLeave || (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
+    POINT p;
+    RECT r;
+    if (!GetCursorPos(&p) || !GetWindowRect(hwnd, &r)) return;
+    if (PtInRect(&r, p)) entered = true;
+    if (!byPointer && !entered) return;
+    const int slack = static_cast<int>(ui::kS4 * s);
+    InflateRect(&r, slack, slack);
+    bool inside = PtInRect(&r, p);
+    // Allow an edge-opened panel to be reached before the cursor has entered it.
+    if (!entered && p.x >= work.right - slack && p.x < work.right && p.y >= work.top && p.y < work.bottom) inside = true;
+    if (inside) { outSince = 0; return; }
+    const auto now = GetTickCount64();
+    if (!outSince) outSince = now;
+    else if (now - outSince >= static_cast<ULONGLONG>(settings::Get().taskbar.hideDelay)) Dismissed();
+}
+
 void NotificationCenter::Impl::Close() {
     visible = false;
     if (st != St::Open) return;
     st = St::Closing;
-    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Travel(), settings::Get().cc);
-    SetTimer(hwnd, kTimerClose, motion::OutMs(settings::Get().cc) + 10, nullptr);
+    KillTimer(hwnd, kTimerLeave);
+    motion::Out(comp, panelVis, {motion::kPad * s, motion::kPad * s, 0}, Travel(), MotionConfig());
+    SetTimer(hwnd, kTimerClose, motion::OutMs(MotionConfig()) + 10, nullptr);
 }
 
 void NotificationCenter::Impl::Teardown() {
     visible = false;
-    if (hwnd) { KillTimer(hwnd, kTimerGone); KillTimer(hwnd, kTimerClose); }
+    if (hwnd) { KillTimer(hwnd, kTimerGone); KillTimer(hwnd, kTimerClose); KillTimer(hwnd, kTimerLeave); }
     cards.clear();
     dying.clear();
     panelVis = nullptr;
@@ -1439,7 +1474,7 @@ NotificationCenter::NotificationCenter(HINSTANCE inst, HWND, wuc::Compositor com
 }
 NotificationCenter::~NotificationCenter() { m->Stop(); }
 void NotificationCenter::Toggle() { IsOpen() ? Close() : Open(); }
-void NotificationCenter::Open() { m->Open(); }
+void NotificationCenter::Open(bool byPointer) { m->byPointer = byPointer; m->Open(); }
 void NotificationCenter::Close() { m->Close(); }
 bool NotificationCenter::IsOpen() const { return m->st == Impl::St::Open; }
 HWND NotificationCenter::Hwnd() const { return m->st == Impl::St::Closed ? nullptr : m->hwnd; }

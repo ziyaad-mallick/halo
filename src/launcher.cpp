@@ -2630,13 +2630,22 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
 
     {   // the hero: "Hello Name", and the quote of the day under it
         auto g = at(m_greetRect);
+        const float clockLeft = g.right - start::kGreetingClockW * s;
         auto fHello = txt.Format(ui::kFontDisplay, tk::kHero * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        txt.Draw(dc, L"Hello " + start::FirstName(m_user, m_user), fHello.get(), R(g.left, g.top, g.right, g.top + start::kGreetH * s),
+        txt.Draw(dc, L"Hello " + start::FirstName(m_user, m_user), fHello.get(), R(g.left, g.top, clockLeft - tk::kGroup * s, g.top + start::kGreetH * s),
                  c.ink.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        wchar_t clock[64] = {};
+        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &st, nullptr, clock, 64);
+        auto fTime = txt.Format(ui::kFontText, tk::kTitle * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        auto fDate = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_NORMAL);
+        txt.Draw(dc, clock, fTime.get(), R(clockLeft, g.top, g.right, g.top + 24 * s), c.ink.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        txt.Draw(dc, DateText(st, L"ddd, d MMM"), fDate.get(), R(clockLeft, g.top + 24 * s, g.right, g.top + start::kGreetH * s),
+                 c.muted.get(), DWRITE_TEXT_ALIGNMENT_TRAILING, true);
         auto const q = start::QuoteForDate(st.wYear, st.wMonth, st.wDay);
-        auto fQuote = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_NORMAL);
-        txt.Draw(dc, L"“" + std::wstring(q.text) + L"”  — " + q.author, fQuote.get(),
-                 R(g.left, g.top + start::kGreetH * s, g.right, g.top + (start::kGreetH + 20) * s), c.muted.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        auto fQuote = txt.Format(ui::kFontText, (m_plan.greetH < start::kGreetQuoteH ? tk::kText : tk::kTitle) * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        fQuote->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        txt.Draw(dc, q.text, fQuote.get(), R(g.left, g.top + start::kGreetH * s, g.right, g.bottom),
+                 c.soft.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
     }
 
     const float radius = tk::kRCard * s, pad = tk::kPad * s;
@@ -2670,14 +2679,16 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
         }
         auto track = at(m_modeRect);
         const bool known = m_mode != svc::PowerMode::Unknown;
-        dc->FillRoundedRectangle(D2D1::RoundedRect(track, track.bottom - track.top, track.bottom - track.top), c.hover.get());
+        const float modeCorner = (tk::kRRow - ui::kS1) * s;
+        dc->FillRoundedRectangle(D2D1::RoundedRect(track, modeCorner, modeCorner), c.hover.get());
         static const wchar_t* labels[] = {L"Efficiency", L"Balanced", L"Performance"};
         const int sel = ModeIndex(m_mode);
         for (int i = 0; i < 3; i++) {
             auto seg = at(m_modeSeg[i]);
             if (known && i == sel) {
                 auto in = Inflate(seg, -2 * s);
-                dc->FillRoundedRectangle(D2D1::RoundedRect(in, (in.bottom - in.top) / 2, (in.bottom - in.top) / 2), c.sel.get());
+                const float corner = modeCorner - 2 * s;
+                dc->FillRoundedRectangle(D2D1::RoundedRect(in, corner, corner), c.sel.get());
             }
             txt.Draw(dc, labels[i], (known && i == sel ? fCapB : fCap).get(), seg, known && i == sel ? c.ink.get() : c.muted.get(),
                      DWRITE_TEXT_ALIGNMENT_CENTER);

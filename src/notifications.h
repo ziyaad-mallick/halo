@@ -17,7 +17,7 @@ public:
                        winrt::Windows::UI::Composition::CompositionGraphicsDevice gdev);
     ~NotificationCenter();
     void Toggle();
-    void Open();
+    void Open(bool byPointer = false);
     void Close();
     bool IsOpen() const;
     HWND Hwnd() const;  // null while closed

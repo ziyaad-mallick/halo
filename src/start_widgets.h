@@ -168,9 +168,10 @@ constexpr int kFastMs = ui::kFastMs, kSlowMs = ui::kSlowMs;
 // ---- Layout -------------------------------------------------------------------------------------------
 inline constexpr float kScreenMargin = 24, kPanelTop = 8;
 inline constexpr float kLeftMax = 664, kLeftMin = 480, kRightW = 384, kRightMinW = 280;
-inline constexpr float kSearchTop = 228, kSearchH = 40, kGap = 24, kLabelH = 16;
+inline constexpr float kSearchTop = 252, kSearchH = 40, kGap = 24, kLabelH = 16;
 inline constexpr float kAppRowH = tk::kAppCellH, kFileCellH = tk::kFileRowH, kBottomH = 56;
-inline constexpr float kGreetQuoteH = 64, kGreetH = 40;
+inline constexpr float kGreetQuoteH = 88, kGreetH = 40;
+inline constexpr float kGreetingClockW = 192;
 inline constexpr float kWidgetsH = tk::kCardH;
 inline constexpr float kRightPad = 24, kRightMinH = 336;
 
@@ -199,7 +200,7 @@ inline float AvailHeight(float monitorTopPx, float anchorBottomPx, float scale) 
 struct LeftPlan {
     int level = 0;
     bool quote = true, files = true, weekOnly = true;
-    float greetY = 32, greetH = kGreetQuoteH, widgetsY = 116, widgetsH = kWidgetsH;
+    float greetY = 32, greetH = kGreetQuoteH, widgetsY = 140, widgetsH = kWidgetsH;
     float searchY = kSearchTop;
     float appsLabelY = 0, appsTop = 0, filesLabelY = 0, filesTop = 0;
     float dividerY = 0, height = 0, contentBottom = 0;
@@ -207,6 +208,11 @@ struct LeftPlan {
 inline LeftPlan PlanLeft(float avail, bool wantApps, bool wantFiles) {
     LeftPlan p;
     p.files = wantFiles;
+    if (avail < 400) {  // keep the search/results reachable on short, high-DPI displays
+        p.greetH -= tk::kGroup;
+        p.widgetsY -= tk::kGroup;
+        p.searchY -= tk::kGroup;
+    }
     float y = p.searchY + kSearchH + kGap;
     p.appsLabelY = y;
     p.appsTop = y + kLabelH + tk::kInCard;
