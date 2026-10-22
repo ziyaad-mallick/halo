@@ -17,17 +17,19 @@ namespace halo::start {
 
 // ---- Quote of the day ---------------------------------------------------------------------------------
 // ~60 short quotes from authors long in the public domain, no network. The pick is a pure function of the date.
+// Self-reliance additions: Emerson, Essays, First Series, "Self-Reliance":
+// https://www.gutenberg.org/files/2944/2944-h/2944-h.htm
 struct Quote {
     const wchar_t* text;
     const wchar_t* author;
 };
 inline constexpr Quote kQuotes[] = {
     {L"A journey of a thousand miles begins with a single step.", L"Lao Tzu"},
-    {L"Nature does not hurry, yet everything is accomplished.", L"Lao Tzu"},
+    {L"Trust thyself: every heart vibrates to that iron string.", L"Ralph Waldo Emerson"},
     {L"It does not matter how slowly you go as long as you do not stop.", L"Confucius"},
     {L"Learning without thought is labour lost.", L"Confucius"},
     {L"Know thyself.", L"Delphic maxim"},
-    {L"The unexamined life is not worth living.", L"Socrates"},
+    {L"Insist on yourself; never imitate.", L"Ralph Waldo Emerson"},
     {L"The beginning is the most important part of the work.", L"Plato"},
     {L"Well begun is half done.", L"Aristotle"},
     {L"No man ever steps in the same river twice.", L"Heraclitus"},
@@ -39,12 +41,12 @@ inline constexpr Quote kQuotes[] = {
     {L"Dare to be wise.", L"Horace"},
     {L"I am human; nothing human is alien to me.", L"Terence"},
     {L"A rolling stone gathers no moss.", L"Publilius Syrus"},
-    {L"It is a bad plan that admits of no modification.", L"Publilius Syrus"},
+    {L"Do your work, and you shall reinforce yourself.", L"Ralph Waldo Emerson"},
     {L"While we are postponing, life speeds by.", L"Seneca"},
     {L"First say to yourself what you would be; then do what you have to do.", L"Epictetus"},
     {L"The soul becomes dyed with the colour of its thoughts.", L"Marcus Aurelius"},
     {L"If it is not right, do not do it; if it is not true, do not say it.", L"Marcus Aurelius"},
-    {L"Let your plans be dark and impenetrable as night, and when you move, fall like a thunderbolt.", L"Sun Tzu"},
+    {L"Nothing can bring you peace but yourself.", L"Ralph Waldo Emerson"},
     {L"Slow and steady wins the race.", L"Aesop"},
     {L"United we stand, divided we fall.", L"Aesop"},
     {L"Look before you leap.", L"Aesop"},
@@ -54,15 +56,15 @@ inline constexpr Quote kQuotes[] = {
     {L"A man who dares to waste one hour of time has not discovered the value of life.", L"Charles Darwin"},
     {L"Nothing in life is to be feared, it is only to be understood.", L"Marie Curie"},
     {L"Genius is one percent inspiration and ninety-nine percent perspiration.", L"Thomas Edison"},
-    {L"Brevity is the soul of wit.", L"Shakespeare"},
+    {L"To be great is to be misunderstood.", L"Ralph Waldo Emerson"},
     {L"To thine own self be true.", L"Shakespeare"},
     {L"We know what we are, but know not what we may be.", L"Shakespeare"},
     {L"Our doubts are traitors.", L"Shakespeare"},
     {L"To strive, to seek, to find, and not to yield.", L"Tennyson"},
-    {L"No man is an island.", L"John Donne"},
+    {L"Do that which is assigned you, and you cannot hope too much or dare too much.", L"Ralph Waldo Emerson"},
     {L"Nothing will ever be attempted if all possible objections must first be overcome.", L"Samuel Johnson"},
     {L"The perfect is the enemy of the good.", L"Voltaire"},
-    {L"Doubt is not a pleasant condition, but certainty is absurd.", L"Voltaire"},
+    {L"Nothing can bring you peace but the triumph of principles.", L"Ralph Waldo Emerson"},
     {L"Well done is better than well said.", L"Benjamin Franklin"},
     {L"Lost time is never found again.", L"Benjamin Franklin"},
     {L"An investment in knowledge pays the best interest.", L"Benjamin Franklin"},

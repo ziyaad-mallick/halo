@@ -38,6 +38,8 @@ constexpr float kMediaH = kMediaArt + 2 * kS3;  // the now-playing module
 constexpr float kNotificationWidth = 360, kNotificationEdge = kS4;
 constexpr float kNotificationPad = kS4, kNotificationGap = kS3;
 constexpr float kNotificationRadius = kRadiusLarge;
+constexpr float kNotificationInset = kS2, kNotificationPanelPad = kS3;
+constexpr float kNotificationGlossEnd = 0.45f;
 constexpr float kNotificationCalendarHead = kS4, kNotificationCalendarRow = 28;
 
 // Motion.

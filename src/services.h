@@ -94,6 +94,8 @@ public:
     void Stop();
     bool HasWifi() const { return m_wifi != nullptr; }
     bool HasBluetooth() const { return m_bt != nullptr; }
+    bool Loading() const { return m_loading; }
+    bool Failed() const { return m_failed; }
     bool WifiOn() const;
     bool BluetoothOn() const;
     void SetWifi(bool on) { Set(m_wifi, on, m_notify, m_msg); }
@@ -108,6 +110,7 @@ private:
     winrt::Windows::Devices::Radios::Radio::StateChanged_revoker m_wifiRev, m_btRev;
     HWND m_notify{};
     UINT m_msg{};
+    bool m_loading = false, m_failed = false;
     std::shared_ptr<unsigned> m_gen = std::make_shared<unsigned>(0);
 };
 std::wstring ConnectedSsid();  // empty when not on Wi-Fi

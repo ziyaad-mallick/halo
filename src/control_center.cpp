@@ -1663,9 +1663,10 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 bool wifi = it.id == Id::WifiText;
                 bool avail = wifi ? radios.HasWifi() : radios.HasBluetooth(), on = wifi ? wifiOn : btOn;
                 std::wstring sub;
-                if (wifi) sub = !avail ? L"Unavailable" : !on ? L"Off" : ssid.empty() ? L"On" : ssid;
+                const wchar_t* missing = radios.Loading() ? L"Checking…" : radios.Failed() ? L"Check Settings" : L"Unavailable";
+                if (wifi) sub = !avail ? missing : !on ? L"Off" : ssid.empty() ? L"On" : ssid;
                 else {
-                    sub = !avail ? L"Unavailable" : on ? L"On" : L"Off";
+                    sub = !avail ? missing : on ? L"On" : L"Off";
                     if (on) for (auto const& d : btRows) if (d.connected) { sub = d.name; break; }
                 }
                 twoLines(wifi ? L"Wi-Fi" : L"Bluetooth", sub, {r.left, r.top, r.right - 20, r.bottom}, avail ? 1.0f : 0.5f);

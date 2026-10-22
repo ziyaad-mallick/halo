@@ -149,7 +149,7 @@ constexpr float kMenuPad = 8;
 constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 24;
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
 constexpr int kMaxApps = 12, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
-constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2, kCaretTimer = 3;  // kClockTimer: halo2, re-armed to each minute boundary
+constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2, kCaretTimer = 3, kServicesTimer = 4;  // kClockTimer: halo2, re-armed to each minute boundary
 constexpr int kListBuffer = 4, kScrollMs = 180;  // rows drawn past each end of the list; the scroll slide
 constexpr UINT kMsgAppsFolder = WM_APP + 1;  // lParam: a Launcher::Found* from the Apps folder thread, owned by the panel
 // halo2: service notifications for the right column (the Control Center's own numbering is its own window's business).
@@ -1457,7 +1457,6 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     m_ccFocus = m_ccHover = -1;
     m_drag = 0;
     m_demo = false;
-    StartServices();
 
     // Everything slow (Recent files, their icons, the account picture, the app index) is cached; Refresh() updates it after the show.
     try {
@@ -1487,6 +1486,10 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     ArmClock();
 
     m_open = true;
+    // Build establishes m_h2 on the first opening. Yield before binding devices,
+    // so synchronous audio setup cannot hold back Show and its compositor commit.
+    const auto bindDelay = std::max<UINT>(USER_TIMER_MINIMUM, static_cast<UINT>(std::lround(motion::kFadeInMs / settings::Speed(st))));
+    SetTimer(m_hwnd, kServicesTimer, bindDelay, nullptr);
     Focus();
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&fq);
@@ -1529,8 +1532,8 @@ void Launcher::Hide() {
     Log(L"hiding");
 }
 
-// HALO 2.0 open and close: the dock's reveal without the overshoot. Opening, the panel rises a short way on a critically
-// damped spring (it arrives, it does not bounce) while it fades in; closing, it sinks and fades. Only offset and opacity
+// HALO 2.0 open and close: a bounded ease-out rise and fade; closing, it sinks and fades
+// from the current compositor pose, including when the entrance is interrupted. Only offset and opacity
 // animate, on the compositor: the glass behind is never resized or scaled. speed scales the times, motion the travel;
 // reduce_motion and the fade effect do not move at all.
 void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
@@ -1538,26 +1541,27 @@ void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
     const bool reduce = settings::Get().reduceMotion;
     const float speed = settings::Speed(st);
     auto ms = [&](float x) { return std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(x / speed)))); };
-    v.StopAnimation(L"Offset");
-    v.StopAnimation(L"Opacity");
     v.StopAnimation(L"Scale");
     v.Scale({1, 1, 1});
     if (st.effect == settings::Effect::None) {
+        v.StopAnimation(L"Offset");
+        v.StopAnimation(L"Opacity");
         v.Offset(rest);
         v.Opacity(in ? 1.0f : 0.0f);
         return;
     }
     const float travel = reduce || st.effect == settings::Effect::Fade ? 0.0f : ui::kEnterTravel * m_s * settings::Amount(st);
     if (in) {
+        v.StopAnimation(L"Offset");
+        v.StopAnimation(L"Opacity");
         v.Offset({rest.x, rest.y + travel, rest.z});
         v.Opacity(0);
         if (travel != 0) {
-            auto spring = m_comp.CreateSpringVector3Animation();
-            spring.InitialValue(Ref3({rest.x, rest.y + travel, rest.z}));
-            spring.FinalValue(Ref3(rest));
-            spring.DampingRatio(1.0f);  // critically damped
-            spring.Period(ms(motion::kPeriodMs));
-            v.StartAnimation(L"Offset", spring);
+            auto slide = m_comp.CreateVector3KeyFrameAnimation();
+            slide.InsertKeyFrame(0.0f, {rest.x, rest.y + travel, rest.z});
+            slide.InsertKeyFrame(1.0f, rest, m_easeOut);
+            slide.Duration(ms(motion::kFadeInMs));
+            v.StartAnimation(L"Offset", slide);
         } else {
             v.Offset(rest);
         }
@@ -2282,7 +2286,11 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_TIMER:
-            if (w == kRefreshTimer) {
+            if (w == kServicesTimer) {
+                KillTimer(m_hwnd, kServicesTimer);
+                if (m_open && !m_servicesOn) StartServices();
+            }
+            else if (w == kRefreshTimer) {
                 KillTimer(m_hwnd, kRefreshTimer);
                 if (m_open) Refresh();
             }
@@ -2642,10 +2650,28 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
         txt.Draw(dc, DateText(st, L"ddd, d MMM"), fDate.get(), R(clockLeft, g.top + 24 * s, g.right, g.top + start::kGreetH * s),
                  c.muted.get(), DWRITE_TEXT_ALIGNMENT_TRAILING, true);
         auto const q = start::QuoteForDate(st.wYear, st.wMonth, st.wDay);
-        auto fQuote = txt.Format(ui::kFontText, (m_plan.greetH < start::kGreetQuoteH ? tk::kText : tk::kTitle) * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        const bool compactQuote = m_plan.greetH < start::kGreetQuoteH;
+        auto fQuote = txt.Format(ui::kFontText, (compactQuote ? tk::kCap : tk::kTitle) * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         fQuote->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-        txt.Draw(dc, q.text, fQuote.get(), R(g.left, g.top + start::kGreetH * s, g.right, g.bottom),
-                 c.soft.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        const std::wstring words = q.text, credit = L" - " + std::wstring(q.author);
+        auto layout = txt.Layout(words + credit, fQuote.get(), g.right - g.left, (m_plan.greetH - start::kGreetH) * s);
+        if (layout) {
+            const DWRITE_TEXT_RANGE quoteRange{0, static_cast<UINT32>(words.size())};
+            const DWRITE_TEXT_RANGE creditRange{quoteRange.length, static_cast<UINT32>(credit.size())};
+            layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, quoteRange);
+            layout->SetFontSize((compactQuote ? tk::kCap - 2 : tk::kCap) * s, creditRange);
+            layout->SetFontWeight(DWRITE_FONT_WEIGHT_NORMAL, creditRange);
+            layout->SetDrawingEffect(c.muted.get(), creditRange);
+            if (compactQuote) layout->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, tk::kCap * s, (tk::kCap - 2) * s);
+            for (float size = compactQuote ? tk::kCap : tk::kTitle; size > tk::kCap; ) {
+                DWRITE_TEXT_METRICS metrics{};
+                layout->GetMetrics(&metrics);
+                if (metrics.height <= (m_plan.greetH - start::kGreetH) * s) break;
+                size -= 2;
+                layout->SetFontSize(size * s, quoteRange);
+            }
+            dc->DrawTextLayout({g.left, g.top + start::kGreetH * s}, layout.get(), c.soft.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
     }
 
     const float radius = tk::kRCard * s, pad = tk::kPad * s;
@@ -2809,6 +2835,7 @@ void Launcher::StopServices() {
     svc::WifiStop();
     svc::BtStop();
     if (m_hwnd) {
+        KillTimer(m_hwnd, kServicesTimer);
         KillTimer(m_hwnd, kClockTimer);
         KillTimer(m_hwnd, kCaretTimer);
     }
@@ -3135,7 +3162,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
                 const bool avail = h.index == 0 ? airAvail : h.index == 1 ? m_hotspotAvail : h.index == 5 ? (m_mic.Available() || demo) : true;
                 const bool on = h.index == 0 ? (airAvail && !m_wifiOn && !m_btOn) : h.index == 1 ? m_hotspotOn : h.index == 2 ? m_dnd
                                 : h.index == 3 ? m_night : h.index == 4 ? m_dark : m_micMuted;
-                std::wstring state = !avail ? L"Unavailable" : h.index == 5 ? (m_micMuted ? L"Muted" : L"On") : on ? L"On" : L"Off";
+                std::wstring state = !avail ? (h.index == 0 && (!m_servicesOn || m_radios.Loading()) ? L"Checking…" : h.index == 0 && m_radios.Failed() ? L"Check Settings" : L"Unavailable") : h.index == 5 ? (m_micMuted ? L"Muted" : L"On") : on ? L"On" : L"Off";
                 tile(r, h.index == 5 && m_micMuted ? 0xEC54 : icons[h.index], on, avail, names[h.index], state, tk::kPad * s);
                 break;
             }
@@ -3143,7 +3170,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
             case Kind::CcBt: {
                 const bool wifi = h.kind == Kind::CcWifi;
                 const bool has = wifi ? hasWifi : hasBt, on = has && (wifi ? m_wifiOn : m_btOn);
-                std::wstring sub = !has ? L"Unavailable" : on ? (wifi && !m_ssid.empty() ? m_ssid : L"On") : L"Off";
+                std::wstring sub = !has ? (!m_servicesOn || m_radios.Loading() ? L"Checking…" : m_radios.Failed() ? L"Check Settings" : L"Unavailable") : on ? (wifi && !m_ssid.empty() ? m_ssid : L"On") : L"Off";
                 tile(r, wifi ? 0xE701 : 0xE702, on, has, wifi ? L"Wi-Fi" : L"Bluetooth", sub, (tk::kPad + 32 + 4) * s);
                 break;
             }

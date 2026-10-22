@@ -66,7 +66,7 @@ namespace {
 constexpr float kWStd = ui::kNotificationWidth;          // panel width when standalone (attached, it follows the Control Center)
 constexpr float kEdge = ui::kNotificationEdge;           // gap to the screen edge (right and top)
 constexpr float kPad = ui::kNotificationPad, kIcon = 32, kTextX = kPad + kIcon + ui::kS3, kRadius = ui::kNotificationRadius, kGap = ui::kNotificationGap;  // the Control Center's grid
-constexpr float kHeaderY = 16, kTitleY = 36, kBodyY = 56, kLine = 16, kMinH = 76, kCollapseH = 28;
+constexpr float kHeaderY = 16, kTitleY = 36, kBodyY = 56, kLine = 20, kMinH = 88, kCollapseH = 28;
 constexpr float kHeadH = 38, kMoreH = 28, kEmptyH = 56;
 constexpr float kCalHeadStd = 74, kCalNav = 26, kCalDow = 18, kCalRowStd = 26, kCalHStd = kCalHeadStd + kCalNav + 4 + kCalDow + 2 + 6 * kCalRowStd + 12;
 constexpr int kMaxCards = 6, kMaxCardsAttached = 3;
@@ -322,6 +322,7 @@ struct NotificationCenter::Impl {
     wuc::CompositionBrush noise{nullptr};
     std::vector<Card> cards;
     std::vector<Card> dying;
+    Card frame;  // Halo 2 shares one glass surface across alerts and calendar.
     float totalH = 0, winH = 0;
     int hoverCard = -1, hoverPart = 0;
     bool tracking = false;
@@ -358,7 +359,7 @@ struct NotificationCenter::Impl {
     void BuildFonts();
     std::vector<Row> BuildRows();
     void Update(bool firstShow);
-    void CreateCard(Card& c);
+    void CreateCard(Card& c, bool backgroundOnly = false);
     void Draw(Card& c, bool hover, int part);
     void DrawNotif(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, bool hover, bool closeHover, bool clearHover);
     void DrawHeader(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* br, Row const& r, int part);
@@ -717,6 +718,8 @@ LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_NCHITTEST: {
             POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
             ScreenToClient(h, &p);
+            if (settings::Get().halo2 && p.x >= motion::kPad * s && p.x < (motion::kPad + kW) * s &&
+                p.y >= motion::kPad * s && p.y < (motion::kPad + totalH) * s) return HTCLIENT;
             return CardAt(p.x / s - motion::kPad, p.y / s - motion::kPad, nullptr) >= 0 ? HTCLIENT : HTTRANSPARENT;
         }
         case WM_MOUSEMOVE: {
@@ -833,16 +836,16 @@ void NotificationCenter::Impl::BuildFonts() {
     mk(fApp, SB, 12, L_, false);
     mk(fTime, R, 12, DWRITE_TEXT_ALIGNMENT_TRAILING, false);
     mk(fTitle, SB, 14, L_, false);
-    mk(fBody, R, 12, L_, true);
+    mk(fBody, R, ui::kBody, L_, true);
     mk(fPill, SB, 12, C, false, true);
     mk(fCount, SB, 10.5f, C, false, true);
-    mk(fHead, SB, 15, L_, false, true);
+    mk(fHead, SB, ui::kHeading, L_, false, true);
     mk(fClear, SB, 12, C, false, true);
     mk(fBig, SB, 28, L_, false);
     mk(fCalDow, SB, 12, L_, false);
-    mk(fNav, SB, 13, L_, false, true);
-    mk(fDay, R, 13, C, false, true);
-    mk(fDayB, SB, 13, C, false, true);
+    mk(fNav, SB, ui::kBody, L_, false, true);
+    mk(fDay, R, ui::kBody, C, false, true);
+    mk(fDayB, SB, ui::kBody, C, false, true);
     mk(fDow, SB, 10.5f, C, false, true);
 }
 
@@ -882,14 +885,14 @@ wuc::CompositionBrush NotificationCenter::Impl::NoiseBrush(int w, int h) {
 
 // Same glass recipe as the dock pill and the Control Center: blurred backdrop, #16161A tint at 50%,
 // 2.5% grain, 1 px gradient rim.
-void NotificationCenter::Impl::CreateCard(Card& c) {
+void NotificationCenter::Impl::CreateCard(Card& c, bool backgroundOnly) {
     const float wPx = std::ceil(kW * s), hPx = std::ceil(c.row.h * s);
     c.outer = comp.CreateContainerVisual();
     c.outer.Size({wPx, hPx});
     c.outer.CenterPoint({wPx / 2, 0, 0});
 
-    const bool quiet = c.row.kind == K::Header || c.row.kind == K::Empty || c.row.kind == K::More || c.row.kind == K::Collapse;
-    if (!quiet) {
+    const bool quiet = !backgroundOnly && (settings::Get().halo2 || c.row.kind == K::Header || c.row.kind == K::Empty || c.row.kind == K::More || c.row.kind == K::Collapse);
+    if (!quiet && !backgroundOnly) {
         const float rr = (c.row.kind == K::Collapse || c.row.kind == K::More || c.row.kind == K::Header) ? c.row.h / 2 * s : kRadius * s;
         auto col = theme::P().shadow;
         col.a = static_cast<uint8_t>(col.a * 0.7f);
@@ -920,16 +923,30 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
             n.Brush(noise);
             c.vis.Children().InsertAtTop(n);
         }
+        if (backgroundOnly) {  // one static specular wash over the shared glass
+            auto sheen = comp.CreateLinearGradientBrush();
+            sheen.StartPoint({0, 0});
+            sheen.EndPoint({0, 1});
+            const auto white = theme::Dark() ? 0x18 : 0x48;
+            sheen.ColorStops().Append(comp.CreateColorGradientStop(0, winrt::Windows::UI::ColorHelper::FromArgb(white, 255, 255, 255)));
+            sheen.ColorStops().Append(comp.CreateColorGradientStop(ui::kNotificationGlossEnd, winrt::Windows::UI::ColorHelper::FromArgb(0, 255, 255, 255)));
+            auto gloss = comp.CreateSpriteVisual();
+            gloss.RelativeSizeAdjustment({1, 1});
+            gloss.Brush(sheen);
+            c.vis.Children().InsertAtTop(gloss);
+        }
     }
 
-    c.surf = gdev.CreateDrawingSurface({wPx, hPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+    if (!backgroundOnly) {
+        c.surf = gdev.CreateDrawingSurface({wPx, hPx}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                                        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-    c.content = comp.CreateSpriteVisual();
-    c.content.Size({wPx, hPx});
-    auto sb = comp.CreateSurfaceBrush(c.surf);
-    sb.Stretch(wuc::CompositionStretch::None);
-    c.content.Brush(sb);
-    c.vis.Children().InsertAtTop(c.content);
+        c.content = comp.CreateSpriteVisual();
+        c.content.Size({wPx, hPx});
+        auto sb = comp.CreateSurfaceBrush(c.surf);
+        sb.Stretch(wuc::CompositionStretch::None);
+        c.content.Brush(sb);
+        c.vis.Children().InsertAtTop(c.content);
+    }
 
     if (!quiet) {
         const float t = s;
@@ -952,7 +969,7 @@ void NotificationCenter::Impl::CreateCard(Card& c) {
     c.clip.CornerRadius({kRadius * s, kRadius * s});
     c.clip.Size({wPx, hPx});
     c.vis.Clip(comp.CreateGeometricClip(c.clip));
-    Draw(c, false, -1);
+    if (!backgroundOnly) Draw(c, false, -1);
 }
 
 void NotificationCenter::Impl::Draw(Card& c, bool hover, int part) {
@@ -968,8 +985,17 @@ void NotificationCenter::Impl::Draw(Card& c, bool hover, int part) {
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         winrt::com_ptr<ID2D1SolidColorBrush> br;
         dc->CreateSolidColorBrush(kText, br.put());
+        const bool box = settings::Get().halo2 && (r.kind == K::Notif || r.kind == K::Group || r.kind == K::Calendar);
+        if (box) {
+            const float inset = ui::kNotificationInset;
+            const auto shape = D2D1::RoundedRect(D2D1::RectF(inset, 0, kW - inset, r.h), ui::kRadiusSmall, ui::kRadiusSmall);
+            br->SetColor(theme::Dark() ? ColorF(1, 1, 1, hover ? 0.10f : 0.055f) : ColorF(1, 1, 1, hover ? 0.65f : 0.42f));
+            dc->FillRoundedRectangle(shape, br.get());
+            br->SetColor(theme::Dark() ? ColorF(1, 1, 1, 0.07f) : ColorF(0, 0, 0, 0.05f));
+            dc->DrawRoundedRectangle(shape, br.get(), 0.5f);
+        }
         const bool interactive = r.kind == K::Notif || r.kind == K::Group || r.kind == K::Collapse;
-        if (hover && interactive) {
+        if (hover && interactive && !box) {
             br->SetColor(theme::Dark() ? ColorF(1, 1, 1, 0.06f) : ColorF(1, 1, 1, 0.35f));
             dc->FillRectangle(D2D1::RectF(0, 0, kW, r.h), br.get());
         }
@@ -986,7 +1012,8 @@ void NotificationCenter::Impl::Draw(Card& c, bool hover, int part) {
             }
             case K::Empty:
                 br->SetColor(kDim);
-                dc->DrawText(L"No new notifications", 20, fPill.get(), D2D1::RectF(0, 0, kW, r.h), br.get());
+                { const std::wstring text = haveData ? L"You're all caught up" : L"Checking notifications…";
+                  dc->DrawText(text.c_str(), static_cast<UINT32>(text.size()), fPill.get(), D2D1::RectF(0, 0, kW, r.h), br.get()); }
                 break;
             case K::Header: DrawHeader(dc.get(), br.get(), r, hover ? part : -1); break;
             case K::Calendar: DrawCalendar(dc.get(), br.get(), hover ? part : -1); break;
@@ -1192,7 +1219,8 @@ void NotificationCenter::Impl::Update(bool firstShow) {
     auto src = BuildRows();
 
     std::vector<Row> rows;
-    float y = 0;
+    const float panelPad = settings::Get().halo2 ? ui::kNotificationPanelPad : 0;
+    float y = panelPad;
     auto add = [&](Row r, float h, float extra = 0) {
         r.h = h;
         r.y = y;
@@ -1213,8 +1241,8 @@ void NotificationCenter::Impl::Update(bool firstShow) {
         r.count = Visible();
         add(std::move(r), kHeadH);
     }
-    const float cardsAvail = availH - (attached ? 0 : kHeadH + kGap) - (kCalH + kGap);
-    if (haveData && src.empty()) {
+    const float cardsAvail = availH - 2 * panelPad - (attached ? 0 : kHeadH + kGap) - (kCalH + kGap);
+    if (src.empty()) {
         Row r;
         r.key = L"empty";
         r.kind = K::Empty;
@@ -1274,7 +1302,21 @@ void NotificationCenter::Impl::Update(bool firstShow) {
         r.kind = K::Calendar;
         add(std::move(r), kCalH);
     }
-    totalH = y - kGap;
+    totalH = y - kGap + panelPad;
+    if (settings::Get().halo2) {
+        const float w = std::ceil(kW * s), h = std::ceil(totalH * s);
+        if (!frame.outer) {
+            frame.row.h = totalH;
+            frame.row.kind = K::Calendar;
+            CreateCard(frame, true);
+            panelVis.Children().InsertAtBottom(frame.outer);
+        } else {
+            frame.outer.Size({w, h});
+            frame.vis.Size({w, h});
+            frame.clip.Size({w, h});
+            frame.rim.Size({w - s, h - s});
+        }
+    }
 
     std::vector<Card> next;
     for (auto& r : rows) {
@@ -1454,6 +1496,7 @@ void NotificationCenter::Impl::Teardown() {
     if (hwnd) { KillTimer(hwnd, kTimerGone); KillTimer(hwnd, kTimerClose); KillTimer(hwnd, kTimerLeave); }
     cards.clear();
     dying.clear();
+    frame = {};
     panelVis = nullptr;
     root = nullptr;
     target = nullptr;

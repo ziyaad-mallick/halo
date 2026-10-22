@@ -397,6 +397,7 @@ void Radios::Start(HWND notify, UINT msg) {
     Stop();
     m_notify = notify;
     m_msg = msg;
+    m_loading = true;
     Find(notify, msg, m_gen, *m_gen);
 }
 
@@ -406,6 +407,7 @@ void Radios::Stop() {
     m_btRev.revoke();
     m_wifi = nullptr;
     m_bt = nullptr;
+    m_loading = m_failed = false;
 }
 
 winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, std::shared_ptr<unsigned> live, unsigned gen) {
@@ -417,7 +419,11 @@ winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, std::shared_ptr<unsig
             if (r.Kind() == wdr::RadioKind::WiFi && !m_wifi) { m_wifi = r; m_wifiRev = r.StateChanged(winrt::auto_revoke, handler); }
             if (r.Kind() == wdr::RadioKind::Bluetooth && !m_bt) { m_bt = r; m_btRev = r.StateChanged(winrt::auto_revoke, handler); }
         }
-    } catch (...) {}
+    } catch (...) {
+        if (gen != *live) co_return;
+        m_failed = true;
+    }
+    m_loading = false;
     PostMessageW(notify, msg, 0, 0);
 }
 
