@@ -877,6 +877,19 @@ wuc::CompositionBrush Halo::FallbackIconBrush() {
 
 // Pinned apps first, then the running apps that aren't pinned.
 void Halo::RefreshDock() {
+    // Indices refer to the old app list. Clear them before ReleaseCapture,
+    // which synchronously reenters WM_CAPTURECHANGED.
+    m_hoverItem = -1;
+    m_pressed = -1;
+    m_pressedStart = false;
+    m_pressedWidget = Dock::Kind::None;
+    KillTimer(m_hwnd, kPreviewTimer);
+    KillTimer(m_hwnd, kPreviewGrace);
+    if (m_dock) m_dock->SetPressed(-1);
+    if (m_widgets) m_widgets->SetPressed(DockWidgets::Part::None);
+    if (GetCapture() == m_hwnd) ReleaseCapture();
+    HidePreviews(true);
+    if (m_label) m_label->Hide();
     // A new window (Paint, say) can land above us in the topmost band; take the top back
     // before the slow part, loading its icon.
     SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
