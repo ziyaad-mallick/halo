@@ -282,11 +282,20 @@ void SetDnd(bool on) {
 namespace brightness {
 namespace {
 
-std::atomic<int> g_level{-1};
-std::atomic<bool> g_supported{false};
-std::atomic<int> g_wanted{-1};
-std::mutex g_mutex;  // one WMI conversation at a time
-int g_applied = -2;
+struct State {
+    std::atomic<int> level{-1};
+    std::atomic<bool> supported{false};
+    std::mutex wmi;  // one WMI conversation at a time, including probes
+    std::mutex queue;
+    int wanted = -1, applied = -2;
+    unsigned request = 0;
+    bool running = false;
+};
+
+std::shared_ptr<State> Shared() {
+    static auto state = std::make_shared<State>();
+    return state;
+}
 
 winrt::com_ptr<IWbemServices> Connect() {
     winrt::com_ptr<IWbemLocator> loc;
@@ -316,30 +325,32 @@ winrt::com_ptr<IWbemClassObject> First(IWbemServices* svc, wchar_t const* cls) {
     return n ? obj : nullptr;
 }
 
-void Read() {
+void Read(State& state) {
     if (auto svc = Connect())
         if (auto obj = First(svc.get(), L"WmiMonitorBrightness")) {
             VARIANT v;
             VariantInit(&v);
             if (SUCCEEDED(obj->Get(L"CurrentBrightness", 0, &v, nullptr, nullptr)) && v.vt != VT_NULL) {
-                g_level = v.bVal;
-                g_supported = true;
+                state.level = v.bVal;
+                state.applied = v.bVal;
+                state.supported = true;
             }
             VariantClear(&v);
         }
 }
 
-void Write(int pct) {
+bool Write(int pct) {
     auto svc = Connect();
-    if (!svc) return;
+    if (!svc) return false;
     auto inst = First(svc.get(), L"WmiMonitorBrightnessMethods");
-    if (!inst) return;
+    if (!inst) return false;
     VARIANT path;
     VariantInit(&path);
     BSTR cls = SysAllocString(L"WmiMonitorBrightnessMethods");
     winrt::com_ptr<IWbemClassObject> clsObj, inDef, in;
     HRESULT hr = svc->GetObject(cls, 0, nullptr, clsObj.put(), nullptr);
     SysFreeString(cls);
+    bool ok = false;
     if (SUCCEEDED(hr) && SUCCEEDED(inst->Get(L"__PATH", 0, &path, nullptr, nullptr)) && path.vt == VT_BSTR &&
         SUCCEEDED(clsObj->GetMethod(L"WmiSetBrightness", 0, inDef.put(), nullptr)) &&
         SUCCEEDED(inDef->SpawnInstance(0, in.put()))) {
@@ -348,44 +359,84 @@ void Write(int pct) {
         VariantInit(&b);
         t.vt = VT_I4; t.lVal = 1;
         b.vt = VT_I4; b.lVal = pct;
-        in->Put(L"Timeout", 0, &t, 0);
-        in->Put(L"Brightness", 0, &b, 0);
+        const HRESULT timeoutHr = in->Put(L"Timeout", 0, &t, 0);
+        const HRESULT brightnessHr = in->Put(L"Brightness", 0, &b, 0);
         BSTR method = SysAllocString(L"WmiSetBrightness");
-        svc->ExecMethod(path.bstrVal, method, 0, nullptr, in.get(), nullptr, nullptr);
+        winrt::com_ptr<IWbemClassObject> result;
+        if (SUCCEEDED(timeoutHr) && SUCCEEDED(brightnessHr) && method &&
+            SUCCEEDED(svc->ExecMethod(path.bstrVal, method, 0, nullptr, in.get(), result.put(), nullptr)) && result) {
+            VARIANT value;
+            VariantInit(&value);
+            if (SUCCEEDED(result->Get(L"ReturnValue", 0, &value, nullptr, nullptr)))
+                ok = (value.vt == VT_I4 && value.lVal == 0) || (value.vt == VT_UI4 && value.ulVal == 0);
+            VariantClear(&value);
+        }
         SysFreeString(method);
     }
     VariantClear(&path);
+    return ok;
 }
 
 }  // namespace
 
 void Probe(HWND notify, UINT msg) {
-    std::thread([notify, msg] {
+    std::thread([notify, msg, state = Shared()] {
         if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-            { std::lock_guard<std::mutex> lock(g_mutex); Read(); }
+            { std::lock_guard<std::mutex> lock(state->wmi); Read(*state); }
             CoUninitialize();
         }
         PostMessageW(notify, msg, 0, 0);
     }).detach();
 }
 
-bool Supported() { return g_supported; }
-int Level() { return g_level; }
+bool Supported() { return Shared()->supported; }
+int Level() { return Shared()->level; }
 
 void Set(int percent) {
     percent = std::clamp(percent, 0, 100);
-    g_level = percent;
+    auto state = Shared();
+    state->level = percent;
     if (DryRun()) return Log(L"DRYRUN brightness -> " + std::to_wstring(percent));
-    g_wanted = percent;
-    std::thread([] {
-        if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            int v = g_wanted;  // a newer thread may already have applied this value
-            if (v != g_applied) { g_applied = v; Write(v); }
-        }
-        CoUninitialize();
-    }).detach();
+    std::lock_guard lock(state->queue);
+    state->wanted = percent;
+    ++state->request;
+    if (state->running) return;
+    state->running = true;
+    try {
+        std::thread([state] {
+            if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+                std::lock_guard lock(state->queue);
+                state->running = false;
+                return;
+            }
+            for (;;) {
+                int value;
+                unsigned request;
+                {
+                    std::lock_guard lock(state->queue);
+                    value = state->wanted;
+                    request = state->request;
+                }
+                {
+                    std::lock_guard lock(state->wmi);
+                    if (value != state->applied) {
+                        if (Write(value)) state->applied = value;
+                        else Log(L"brightness: write failed; target remains retryable");
+                    }
+                }
+                std::lock_guard lock(state->queue);
+                if (request == state->request) {
+                    // Stop before admitting another worker. The shared state stays alive even on exit.
+                    CoUninitialize();
+                    state->running = false;
+                    return;
+                }
+            }
+        }).detach();
+    } catch (std::exception const&) {
+        state->running = false;
+        Log(L"brightness: worker could not start");
+    }
 }
 
 }  // namespace brightness

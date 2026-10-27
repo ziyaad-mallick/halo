@@ -78,8 +78,8 @@ bool ReadDnd();
 void SetDnd(bool on);
 
 // ---- Brightness (WMI, built-in panel; unsupported on desktops and most external monitors) ---
-// Probe and Set run on short-lived worker threads (a WMI call takes 30-100 ms); the result
-// lands in Supported()/Level() and `msg` is posted to `notify`.
+// Probes run off the UI thread; writes share one worker per active burst and coalesce to the
+// latest requested value. Failed writes remain retryable. Probe results post `msg` to `notify`.
 namespace brightness {
 void Probe(HWND notify, UINT msg);
 bool Supported();
