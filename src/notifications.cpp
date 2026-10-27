@@ -785,10 +785,13 @@ LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 void NotificationCenter::Impl::Dismiss(Row const& r) {
     for (UINT id : r.ids) {
-        hidden.insert(id);
-        if (dry) { svc::Log(L"notifications: DRY RUN, would remove id " + std::to_wstring(id)); continue; }
-        try { wun::Management::UserNotificationListener::Current().RemoveNotification(id); }
-        catch (winrt::hresult_error const& e) { svc::Log(L"notifications: RemoveNotification failed, hidden locally: " + std::wstring(e.message().c_str())); }
+        if (dry) { hidden.insert(id); svc::Log(L"notifications: DRY RUN, would remove id " + std::to_wstring(id)); continue; }
+        try {
+            wun::Management::UserNotificationListener::Current().RemoveNotification(id);
+            hidden.insert(id);
+        } catch (winrt::hresult_error const& e) {
+            svc::Log(L"notifications: RemoveNotification failed, preserved: " + std::wstring(e.message().c_str()));
+        }
     }
     hoverCard = -1;
     Update(false);
@@ -801,19 +804,25 @@ void NotificationCenter::Impl::ClearAll() {
     svc::Log(L"notifications: clear all (" + std::to_wstring(r.ids.size()) + L")");
     if (dry || r.ids.empty()) { Dismiss(r); return; }
     // One call, not a RemoveNotification round trip per toast (each is a cross-process call: hundreds froze the panel).
-    for (UINT id : r.ids) hidden.insert(id);
-    try { wun::Management::UserNotificationListener::Current().ClearNotifications(); }
-    catch (winrt::hresult_error const& e) { svc::Log(L"notifications: ClearNotifications failed, hidden locally: " + std::wstring(e.message().c_str())); }
+    try {
+        wun::Management::UserNotificationListener::Current().ClearNotifications();
+        for (UINT id : r.ids) hidden.insert(id);
+    } catch (winrt::hresult_error const& e) {
+        svc::Log(L"notifications: ClearNotifications failed, preserved: " + std::wstring(e.message().c_str()));
+    }
     hoverCard = -1;
     Update(false);
 }
 
 void NotificationCenter::Impl::Activate(Row const& r) {
     if (dry) { svc::Log(L"notifications: DRY RUN, would open " + r.n.aumid + L" and remove id " + std::to_wstring(r.n.id)); return; }
-    if (!r.n.aumid.empty()) {
-        auto res = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + r.n.aumid).c_str(), nullptr, nullptr, SW_SHOWNORMAL));
-        svc::Log(L"notifications: open " + r.n.aumid + L" -> " + std::to_wstring(res));
+    if (r.n.aumid.empty()) {
+        svc::Log(L"notifications: missing app ID, preserved");
+        return;
     }
+    auto res = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + r.n.aumid).c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    svc::Log(L"notifications: open " + r.n.aumid + L" -> " + std::to_wstring(res));
+    if (res <= 32) return;
     Dismiss(r);  // Windows removes a toast once it has been clicked
 }
 
