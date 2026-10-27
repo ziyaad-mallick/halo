@@ -224,6 +224,24 @@ Dock::Entry Dock::MakeEntry(Item const& item, bool instant) {
 }
 
 void Dock::SetItems(std::vector<Item> const& items) {
+    // Running-state updates do not change the expression graph. Keep in-flight
+    // presence transitions on the full path until their entries are pruned.
+    bool sameGeometry = !items.empty() && items.size() == m_entries.size();
+    for (size_t i = 0; sameGeometry && i < items.size(); ++i) {
+        auto const& e = m_entries[i];
+        auto const& item = items[i];
+        sameGeometry = !e.leaving && e.key == item.key && e.extra == item.extra && e.brush == item.brush;
+    }
+    if (sameGeometry) {
+        for (size_t i = 0; i < items.size(); ++i) {
+            auto& e = m_entries[i];
+            if (e.running == items[i].running) continue;
+            e.running = items[i].running;
+            AnimateTo(e.dot, L"Opacity", e.running ? DotOpacity() : 0.0f, kFadeMs);
+            if (e.running) Settle(e);
+        }
+        return;
+    }
     const bool first = m_entries.empty();
     auto batch = m_compositor.CreateScopedBatch(CompositionBatchTypes::Animation);
 
