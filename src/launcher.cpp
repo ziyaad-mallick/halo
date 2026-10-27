@@ -1750,22 +1750,29 @@ void Launcher::ApplyRecent(bool redraw) {
     if (m_menuOpen) return;  // keep the visible rows and hit arrays on the same snapshot until the menu closes
     std::wstring before;
     for (auto const& f : m_allFiles) before += f.path + L"|";
+    bool iconsChanged = false;
     {
         std::lock_guard lock(m_recentRefresh->mutex);
         if (!m_recentRefresh->ready) return;
         m_recentRefresh->ready = false;
+        auto const& icons = m_recentRefresh->icons;
+        iconsChanged = icons.size() != m_fileIcons.size() ||
+            !std::equal(icons.begin(), icons.end(), m_fileIcons.begin(), [](auto const& a, auto const& b) {
+                return a.first == b.first && a.second.width == b.second.width &&
+                    a.second.height == b.second.height && a.second.bgra == b.second.bgra;
+            });
         m_allFiles = std::move(m_recentRefresh->files);
         m_fileIcons = std::move(m_recentRefresh->icons);
     }
     m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min<size_t>(m_allFiles.size(), kMaxFiles));
-    m_fileBrushes.clear();
+    if (iconsChanged) m_fileBrushes.clear();
     std::wstring after;
     for (auto const& f : m_allFiles) after += f.path + L"|";
     if (after != before) {
         Log(L"refreshed in the background, rebuilding");
         RunSearch();
     }
-    if (redraw && m_open) Relayout();  // replace any placeholder pixels even when the file list is unchanged
+    if (redraw && m_open && (after != before || iconsChanged)) Relayout();
 }
 
 // ---- Search -------------------------------------------------------------------------------------
