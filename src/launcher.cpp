@@ -152,6 +152,7 @@ constexpr int kMaxApps = 12, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKee
 constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2, kCaretTimer = 3, kServicesTimer = 4;  // kClockTimer: halo2, re-armed to each minute boundary
 constexpr int kListBuffer = 4, kScrollMs = 180;  // rows drawn past each end of the list; the scroll slide
 constexpr UINT kMsgAppsFolder = WM_APP + 1;  // lParam: a Launcher::Found* from the Apps folder thread, owned by the panel
+constexpr UINT kMsgRecent = WM_APP + 2;  // result stays in shared state; no owned message payload
 // halo2: service notifications for the right column (the Control Center's own numbering is its own window's business).
 constexpr UINT kMsgAudio = WM_APP + 10, kMsgRadios = WM_APP + 11, kMsgBright = WM_APP + 12, kMsgMedia = WM_APP + 13,
                kMsgWifi = WM_APP + 14, kMsgBt = WM_APP + 15, kMsgUsage = WM_APP + 16, kMsgMic = WM_APP + 17, kMsgLate = WM_APP + 18;
@@ -433,6 +434,10 @@ Launcher::Launcher(HINSTANCE inst, wuc::Compositor const& comp, wuc::Composition
 }
 
 Launcher::~Launcher() {
+    {
+        std::lock_guard lock(m_recentRefresh->mutex);
+        m_recentRefresh->notify = nullptr;
+    }
     if (m_dim) DestroyWindow(m_dim);
     if (m_hwnd) DestroyWindow(m_hwnd);
 }
@@ -526,11 +531,10 @@ void Launcher::Note(std::wstring const& target) {
 
 // The newest non-folder files in the shell's Recent folder, from their shortcuts: the panel shows the
 // first kMaxFiles, search looks through all kKeepFiles.
-void Launcher::LoadFiles() {
-    m_files.clear();
-    m_allFiles.clear();
+std::vector<Launcher::FileEntry> Launcher::LoadFiles() {
+    std::vector<FileEntry> files;
     wchar_t* dir = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_Recent, 0, nullptr, &dir))) return;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Recent, 0, nullptr, &dir))) return files;
     std::wstring folder = std::wstring(dir) + L"\\";
     CoTaskMemFree(dir);
 
@@ -551,11 +555,11 @@ void Launcher::LoadFiles() {
     std::sort(links.begin(), links.end(), [](Link const& a, Link const& b) { return a.time > b.time; });
 
     winrt::com_ptr<IShellLinkW> link;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, link.put_void()))) return;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, link.put_void()))) return files;
     auto file = link.as<IPersistFile>();
     size_t looked = 0;
     for (auto const& l : links) {
-        if (m_allFiles.size() >= kKeepFiles || ++looked > 160) break;
+        if (files.size() >= kKeepFiles || ++looked > 160) break;
         wchar_t target[MAX_PATH] = {};
         if (FAILED(file->Load(l.path.c_str(), STGM_READ)) ||
             FAILED(link->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH)) || !target[0])
@@ -568,11 +572,11 @@ void Launcher::LoadFiles() {
         DWORD attrs = GetFileAttributesW(target);
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::wstring path = target;
-        if (std::any_of(m_allFiles.begin(), m_allFiles.end(), [&](FileEntry const& e) { return !_wcsicmp(e.path.c_str(), path.c_str()); }))
+        if (std::any_of(files.begin(), files.end(), [&](FileEntry const& e) { return !_wcsicmp(e.path.c_str(), path.c_str()); }))
             continue;
-        m_allFiles.push_back({path.substr(path.find_last_of(L'\\') + 1), path});
+        files.push_back({path.substr(path.find_last_of(L'\\') + 1), path});
     }
-    m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min<size_t>(m_allFiles.size(), kMaxFiles));
+    return files;
 }
 
 // Every app, once: the Start-menu shortcuts (per user, then all users) now, then what the Apps folder has that
@@ -657,12 +661,7 @@ wuc::CompositionBrush Launcher::FileBrush(std::wstring const& path, float logica
     const auto bk = key + L"|" + std::to_wstring(px);
     if (auto it = m_fileBrushes.find(bk); it != m_fileBrushes.end()) return it->second;
     auto img = m_fileIcons.find(key);
-    if (img == m_fileIcons.end()) {  // a search hit outside the head of the list: its icon is loaded now
-        IconImage loaded;
-        if (!LoadJumboIcon(path, loaded) || !loaded.width) loaded = {};
-        if (m_fileIcons.size() >= 64) m_fileIcons.erase(m_fileIcons.begin());
-        img = m_fileIcons.emplace(key, std::move(loaded)).first;
-    }
+    if (img == m_fileIcons.end()) return nullptr;  // worker supplies pixels; never block input for a shell icon
     if (!img->second.width) return nullptr;
     try {
         auto surface = MakeSurface(static_cast<float>(px), static_cast<float>(px));
@@ -1457,6 +1456,8 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     m_ccFocus = m_ccHover = -1;
     m_drag = 0;
     m_demo = false;
+    m_menuOpen = false;
+    ApplyRecent(false);
 
     // Everything slow (Recent files, their icons, the account picture, the app index) is cached; Refresh() updates it after the show.
     try {
@@ -1666,15 +1667,7 @@ std::wstring Launcher::IconKey(std::wstring const& path) {
 
 // The slow content: Recent files, their icons, the account picture and name, the app index (once). Run at startup and after each Show.
 void Launcher::Prefetch() {
-    LoadFiles();
-    for (auto const& f : m_files) {
-        auto key = IconKey(f.path);
-        if (m_fileIcons.contains(key)) continue;
-        IconImage img;
-        if (!LoadJumboIcon(f.path, img) || !img.width) img = {};
-        if (m_fileIcons.size() >= 64) m_fileIcons.erase(m_fileIcons.begin());
-        m_fileIcons.emplace(key, std::move(img));
-    }
+    Refresh();
     if (!m_indexed) BuildIndex();
     wchar_t name[256] = {};
     ULONG n = ARRAYSIZE(name);
@@ -1706,18 +1699,73 @@ void Launcher::Relayout() {
 
 // After the panel is up: refresh the cached content, and rebuild only if something shows differently.
 void Launcher::Refresh() {
+    ApplyRecent();
+    auto state = m_recentRefresh;
+    {
+        std::lock_guard lock(state->mutex);
+        if (state->busy) return;
+        state->busy = true;
+        state->notify = m_hwnd;
+    }
+    try {
+        std::thread([state, icons = m_fileIcons]() mutable {
+            auto co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            std::vector<FileEntry> files;
+            bool ok = SUCCEEDED(co);
+            if (ok) {
+                try {
+                    files = LoadFiles();
+                    std::map<std::wstring, IconImage> fresh;
+                    for (auto const& f : files) {
+                        { std::lock_guard lock(state->mutex); if (!state->notify) { ok = false; break; } }
+                        auto key = IconKey(f.path);
+                        if (fresh.contains(key)) continue;
+                        if (auto it = icons.find(key); it != icons.end()) fresh.emplace(key, std::move(it->second));
+                        else {
+                            IconImage image;
+                            if (!LoadJumboIcon(f.path, image) || !image.width) image = {};
+                            fresh.emplace(key, std::move(image));
+                        }
+                    }
+                    icons = std::move(fresh);
+                } catch (...) { ok = false; }
+                CoUninitialize();
+            }
+            std::lock_guard lock(state->mutex);
+            state->busy = false;
+            if (!ok || !state->notify) return;
+            state->files = std::move(files);
+            state->icons = std::move(icons);
+            state->ready = true;
+            PostMessageW(state->notify, kMsgRecent, 0, 0);
+        }).detach();
+    } catch (...) {
+        std::lock_guard lock(state->mutex);
+        state->busy = false;
+        Log(L"recent refresh worker unavailable");
+    }
+}
+
+void Launcher::ApplyRecent(bool redraw) {
+    if (m_menuOpen) return;  // keep the visible rows and hit arrays on the same snapshot until the menu closes
     std::wstring before;
     for (auto const& f : m_allFiles) before += f.path + L"|";
-    bool hadAvatar = !m_avatar.empty();
-    Prefetch();
+    {
+        std::lock_guard lock(m_recentRefresh->mutex);
+        if (!m_recentRefresh->ready) return;
+        m_recentRefresh->ready = false;
+        m_allFiles = std::move(m_recentRefresh->files);
+        m_fileIcons = std::move(m_recentRefresh->icons);
+    }
+    m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min<size_t>(m_allFiles.size(), kMaxFiles));
+    m_fileBrushes.clear();
     std::wstring after;
     for (auto const& f : m_allFiles) after += f.path + L"|";
-    if (after != before || hadAvatar != !m_avatar.empty()) {
-        if (m_menuOpen) return;  // Relayout would not rebuild, and the rows must stay in step with m_results; next Show picks it up
+    if (after != before) {
         Log(L"refreshed in the background, rebuilding");
         RunSearch();
-        Relayout();
     }
+    if (redraw && m_open) Relayout();  // replace any placeholder pixels even when the file list is unchanged
 }
 
 // ---- Search -------------------------------------------------------------------------------------
@@ -2234,6 +2282,7 @@ LRESULT CALLBACK Launcher::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
     const float mx = static_cast<float>(static_cast<short>(LOWORD(l)));
     const float my = static_cast<float>(static_cast<short>(HIWORD(l)));
+    if (m == kMsgRecent) { ApplyRecent(); return 0; }
     if (m == kMsgLate) {
         std::unique_ptr<LateRead> r(reinterpret_cast<LateRead*>(l));
         if (m_servicesOn && r) {

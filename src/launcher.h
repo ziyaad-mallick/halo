@@ -26,6 +26,8 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -119,11 +121,12 @@ private:
     wuc::CompositionDrawingSurface MakeSurface(float w, float h);
     wuc::SpriteVisual MakeSurfaceVisual(wuc::CompositionDrawingSurface const& s, float w, float h);
     wuc::CompositionBrush FileBrush(std::wstring const& path, float logicalPx);
-    void LoadFiles();
+    static std::vector<FileEntry> LoadFiles();
     void BuildIndex();  // every app, once (the Apps folder arrives later, on kMsgAppsFolder)
     void AddToIndex(Found const& found);
     void Prefetch();
     void Refresh();
+    void ApplyRecent(bool redraw = true);
     void Relayout();
     void Place();
     void RunSearch();
@@ -277,6 +280,15 @@ private:
     winrt::com_ptr<IDWriteFactory> m_dwrite;
     std::map<std::wstring, IconImage> m_fileIcons;                 // by extension, or path for per-file icons
     std::map<std::wstring, wuc::CompositionBrush> m_fileBrushes;   // IconKey + px: the icon drawn at cell size
+    struct RecentRefresh {
+        std::mutex mutex;
+        HWND notify = nullptr;
+        bool busy = false;
+        bool ready = false;
+        std::vector<FileEntry> files;
+        std::map<std::wstring, IconImage> icons;
+    };
+    std::shared_ptr<RecentRefresh> m_recentRefresh = std::make_shared<RecentRefresh>();
 
     // Current layout (physical px).
     LauncherAnchor m_anchor;
