@@ -1,6 +1,7 @@
 #pragma once
 // Halo's out-of-process minimize / dock-restore animation. A click-through
-// overlay holds strips of DWM thumbnails which bend toward the dock icon.
+// overlay bends a live DWM thumbnail using compositor animation when supported;
+// a timer-driven thumbnail renderer handles unsupported Windows builds.
 // Windows that cannot supply DWM thumbnails may not animate. Restore from
 // outside Halo's dock is not intercepted. Reduced motion disables the effect.
 #include <windows.h>
@@ -11,6 +12,8 @@
 #include <utility>
 
 namespace halo {
+
+class SwoopDevice;
 
 class Swoop {
 public:
@@ -30,6 +33,9 @@ public:
 
     void OnMinimize(HWND hwnd);  // EVENT_SYSTEM_MINIMIZESTART
     void OnFrame();              // the overlay's timer
+#ifdef HALO_SWOOP_TEST
+    bool UsingCompositorForTest() const;
+#endif
 
 private:
     struct Anim;
@@ -41,6 +47,7 @@ private:
     void End();
 
     IconFor m_iconFor;
+    std::shared_ptr<SwoopDevice> m_device;
     bool m_on;
     std::map<HWND, bool> m_wins;           // every tracked window; true = we switched its transitions off
     std::map<HWND, ULONGLONG> m_modAsked;  // when the mod last asked about a window

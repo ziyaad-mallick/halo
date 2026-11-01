@@ -17,11 +17,11 @@ mkdir -p build
 COMMON=(${HALO_INCLUDE:+-I"$HALO_INCLUDE"} -include exception -D____FIReference_1_boolean_INTERFACE_DEFINED__ -std=c++23 -O2 -target x86_64-w64-mingw32 -municode -DUNICODE -D_UNICODE
         -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000008 -static -Wall)
 WINLIBS=(-lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldwrite -ldcomp -ldwmapi
-         -lole32 -luuid -loleaut32 -lpowrprof -ldxva2 -luser32 -lgdi32 -lshell32 -lshcore -lcomctl32 -lwindowscodecs -lsecur32 -ladvapi32)
+         -lole32 -luuid -loleaut32 -lpowrprof -ldxva2 -luser32 -lgdi32 -lshell32 -lshcore -lcomctl32 -lwindowscodecs -lsecur32 -ladvapi32 -lversion)
 
 build_halo() {
   echo "== halo.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/cluster.cpp src/icons.cpp src/apps.cpp src/winkey.cpp src/edge.cpp src/launcher.cpp src/usage.cpp src/previews.cpp src/menu.cpp src/pins.cpp src/swoop.cpp     src/control_center.cpp src/notifications.cpp src/services.cpp src/settings.cpp src/taskbar.cpp -lwbemuuid -lwlanapi -lpsapi -lpdh     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}" -lkernel32
+  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/cluster.cpp src/icons.cpp src/apps.cpp src/winkey.cpp src/edge.cpp src/launcher.cpp src/usage.cpp src/previews.cpp src/menu.cpp src/pins.cpp src/swoop.cpp src/swoop_compositor.cpp     src/control_center.cpp src/notifications.cpp src/services.cpp src/settings.cpp src/taskbar.cpp -lwbemuuid -lwlanapi -lpsapi -lpdh     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}" -lkernel32
 }
 
 build_guardian() {
@@ -59,12 +59,12 @@ build_dock_hit_test() {
 
 build_swoop_test() {
   echo "== swoop_test.exe"
-  "$CXX" "${COMMON[@]}" -DHALO_SWOOP_TEST src/swoop.cpp tools/swoop_test.cpp -o "${SWOOP_TEST_OUT:-build/swoop_test.exe}" -ldwmapi -lpsapi -luser32 -lgdi32
+  "$CXX" "${COMMON[@]}" -DHALO_SWOOP_TEST src/swoop.cpp src/swoop_compositor.cpp tools/swoop_test.cpp -o "${SWOOP_TEST_OUT:-build/swoop_test.exe}" -ldwmapi -ldcomp -ld3d11 -ldxgi -lole32 -luuid -lversion -luser32 -lgdi32
 }
 
 build_swoop_lamp_test() {
   echo "== swoop_lamp_test.exe"
-  "$CXX" "${COMMON[@]}" src/swoop.cpp tools/swoop_lamp_test.cpp -o build/swoop_lamp_test.exe -ldwmapi -luser32 -lgdi32
+  "$CXX" "${COMMON[@]}" -DHALO_SWOOP_TEST src/swoop.cpp src/swoop_compositor.cpp tools/swoop_lamp_test.cpp -o build/swoop_lamp_test.exe -ldwmapi -ldcomp -ld3d11 -ldxgi -lole32 -luuid -lversion -luser32 -lgdi32
   echo "== swoop_lamp_geometry_test.exe"
   "$CXX" "${COMMON[@]}" tools/swoop_lamp_geometry_test.cpp -o build/swoop_lamp_geometry_test.exe
 }

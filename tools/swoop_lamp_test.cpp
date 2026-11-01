@@ -3,6 +3,19 @@
 #include <string>
 #include "../src/swoop.h"
 
+static HWND FindOwnOverlay() {
+    HWND result = nullptr;
+    EnumWindows([](HWND h, LPARAM out) -> BOOL {
+        DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+        wchar_t name[64]{}; GetClassNameW(h, name, ARRAYSIZE(name));
+        if (pid == GetCurrentProcessId() && !wcscmp(name, L"HaloSwoop")) {
+            *reinterpret_cast<HWND*>(out) = h; return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&result));
+    return result;
+}
+
 static LRESULT CALLBACK TestProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_PAINT) {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
@@ -43,8 +56,9 @@ int wmain(int argc, wchar_t**) {
     if (argc > 1) {
         WNDCLASSW wc{}; wc.lpfnWndProc = TestProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"HaloLampChild";
         RegisterClassW(&wc);
+        bool large = GetEnvironmentVariableW(L"HALO_LAMP_LARGE_TEST", nullptr, 0) != 0;
         CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Halo lamp test", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                        200, 100, 500, 400, nullptr, nullptr, wc.hInstance, nullptr);
+                        200, 100, large ? 1920 : 500, large ? 1080 : 400, nullptr, nullptr, wc.hInstance, nullptr);
         MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
         return 0;
     }
@@ -68,15 +82,20 @@ int wmain(int argc, wchar_t**) {
         s.Forget(child);
         ULONGLONG closeMs = GetTickCount64() - closeAt;
         printf("stalled renderer cleanup returned in %llu ms\n", closeMs);
-        if (closeMs > 120 || FindWindowW(L"HaloSwoop", nullptr)) ++fail;
+        if (closeMs > 120 || FindOwnOverlay()) ++fail;
         Pump(300);
 #else
         ProbeCapture(child, "visible");
         SendMessageTimeoutW(child, WM_SYSCOMMAND, SC_MINIMIZE, 0, SMTO_ABORTIFHUNG, 500, nullptr);
         Pump(60);
-        bool minimizing = FindWindowW(L"HaloSwoop", nullptr) != nullptr;
+        bool minimizing = FindOwnOverlay() != nullptr;
         printf("lamp overlay on minimize: %s\n", minimizing ? "yes" : "no");
         if (!minimizing) ++fail;
+#ifdef HALO_SWOOP_TEST
+        bool compositor = s.UsingCompositorForTest();
+        printf("compositor active: %s\n", compositor ? "yes" : "no");
+        if (GetEnvironmentVariableW(L"HALO_REQUIRE_COMPOSITOR", nullptr, 0) && !compositor) ++fail;
+#endif
 #ifdef HALO_SWOOP_PROFILE
         Sleep(200);  // Simulate a busy dock thread; the renderer must keep advancing.
 #endif
@@ -86,28 +105,37 @@ int wmain(int argc, wchar_t**) {
         ULONGLONG startedAt = GetTickCount64(), restoredAt = 0;
         bool started = s.Restore(child, [&] { restored = true; restoredAt = GetTickCount64() - startedAt; ShowWindowAsync(child, SW_RESTORE); });
         Pump(80);
-        bool overlay = FindWindowW(L"HaloSwoop", nullptr) != nullptr;
+        bool overlay = FindOwnOverlay() != nullptr;
+#ifdef HALO_SWOOP_TEST
+        bool restoreCompositor = s.UsingCompositorForTest();
+        printf("compositor active on restore: %s\n", restoreCompositor ? "yes" : "no");
+        if (GetEnvironmentVariableW(L"HALO_REQUIRE_COMPOSITOR", nullptr, 0) && !restoreCompositor) ++fail;
+#endif
         Pump(600);
         printf("lamp restore started=%d overlay=%d callback=%d at=%llu ms iconic=%d\n", started, overlay, restored, restoredAt, IsIconic(child));
         if (!started || !overlay || !restored || restoredAt < 350 || restoredAt > 650 || IsIconic(child)) ++fail;
-        if (FindWindowW(L"HaloSwoop", nullptr)) ++fail;
+        if (FindOwnOverlay()) ++fail;
         s.SetEnabled(false);
         SendMessageTimeoutW(child, WM_SYSCOMMAND, SC_MINIMIZE, 0, SMTO_ABORTIFHUNG, 500, nullptr);
         Pump(100);
-        bool suppressed = !FindWindowW(L"HaloSwoop", nullptr) && !s.Restore(child, [] {});
+        bool suppressed = !FindOwnOverlay() && !s.Restore(child, [] {});
         printf("reduced motion suppresses lamp: %s\n", suppressed ? "yes" : "no");
         if (!suppressed) ++fail;
         ShowWindowAsync(child, SW_RESTORE); Pump(150); s.SetEnabled(true);
         int interruptionFailures = 0;
+        ULONGLONG maxCleanupMs = 0;
         for (int i = 0; i < 12; ++i) {
             SendMessageTimeoutW(child, WM_SYSCOMMAND, SC_MINIMIZE, 0, SMTO_ABORTIFHUNG, 500, nullptr);
             Pump(25);
+            auto cleanupStart = GetTickCount64();
             s.Forget(child);
-            if (FindWindowW(L"HaloSwoop", nullptr)) ++interruptionFailures;
+            maxCleanupMs = std::max(maxCleanupMs, GetTickCount64()-cleanupStart);
+            if (FindOwnOverlay()) ++interruptionFailures;
             ShowWindowAsync(child, SW_RESTORE); Pump(75);
             s.Track(child);
         }
         printf("interrupted animation cleanup failures: %d\n", interruptionFailures);
+        printf("maximum interruption cleanup: %llu ms\n", maxCleanupMs);
         fail += interruptionFailures;
 #endif
     }

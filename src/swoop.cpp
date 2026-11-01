@@ -14,6 +14,7 @@
 
 #include "tokens.h"
 #include "lamp_geometry.h"
+#include "swoop_compositor.h"
 
 namespace halo {
 namespace {
@@ -88,6 +89,7 @@ struct Swoop::Anim {
     HWND overlay{};
     struct Strip { HTHUMBNAIL thumb{}; RECT source{}; };
     std::vector<Strip> strips;
+    std::unique_ptr<SwoopCompositor> compositor;
     RECT from{}, to{}, bounds{};
     bool leaving = true;
     bool acted = false;
@@ -109,6 +111,10 @@ struct Swoop::Anim {
 #endif
 };
 
+#ifdef HALO_SWOOP_TEST
+bool Swoop::UsingCompositorForTest() const { return m_anim && m_anim->compositor != nullptr; }
+#endif
+
 DWORD WINAPI Swoop::FrameThread(void* context) {
     std::unique_ptr<std::shared_ptr<Anim>> owner(static_cast<std::shared_ptr<Anim>*>(context));
     auto a = std::move(*owner);
@@ -127,6 +133,7 @@ DWORD WINAPI Swoop::FrameThread(void* context) {
 }
 
 Swoop::Swoop(IconFor iconFor, bool enabled) : m_iconFor(std::move(iconFor)), m_on(enabled) {
+    if (enabled) m_device = WarmSwoopDevice();
     g_self = this;
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = OverlayProc;
@@ -165,6 +172,8 @@ void Swoop::SetEnabled(bool on) {
     if (on == m_on) return;
     m_on = on;
     if (!on) End();
+    if (on && !m_device) m_device = WarmSwoopDevice();
+    if (!on) m_device.reset();
     for (auto& [hwnd, off] : m_wins) {
         if (on) Disable(hwnd);
         else if (off) { Enable(hwnd); off = false; }
@@ -231,28 +240,40 @@ bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, s
                                  a->bounds.bottom - a->bounds.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!a->overlay) return false;
     SetLayeredWindowAttributes(a->overlay, 0, 255, LWA_ALPHA);
-    HTHUMBNAIL first{};
-    SIZE source{};
-    if (FAILED(DwmRegisterThumbnail(a->overlay, hwnd, &first))) {
-        DestroyWindow(a->overlay);
-        return false;
-    }
-    if (FAILED(DwmQueryThumbnailSourceSize(first, &source)) || source.cx < 1 || source.cy < 1) {
-        DwmUnregisterThumbnail(first);
-        DestroyWindow(a->overlay);
-        return false;
-    }
-    const int count = std::min(kLampStrips, (int)source.cy);
-    a->strips.reserve(count);
-    for (int i = 0; i < count; ++i) {
-        HTHUMBNAIL thumb = i == 0 ? first : nullptr;
-        if (i && FAILED(DwmRegisterThumbnail(a->overlay, hwnd, &thumb))) {
-            for (auto& strip : a->strips) DwmUnregisterThumbnail(strip.thumb);
-            a->strips.clear();
+#ifndef HALO_SWOOP_FORCE_THUMBNAILS
+#ifdef HALO_SWOOP_TEST
+    auto setupStarted = Clock::now();
+#endif
+    a->compositor = SwoopCompositor::Create(m_device, a->overlay, hwnd, from, icon, a->bounds, leaving);
+#ifdef HALO_SWOOP_TEST
+    fprintf(stderr, "compositor setup: active=%d elapsed=%.1fms\n", a->compositor != nullptr,
+            std::chrono::duration<double, std::milli>(Clock::now()-setupStarted).count());
+#endif
+#endif
+    if (!a->compositor) {
+        HTHUMBNAIL first{};
+        SIZE source{};
+        if (FAILED(DwmRegisterThumbnail(a->overlay, hwnd, &first))) {
             DestroyWindow(a->overlay);
             return false;
         }
-        a->strips.push_back({thumb, {0, source.cy * i / count, source.cx, source.cy * (i + 1) / count}});
+        if (FAILED(DwmQueryThumbnailSourceSize(first, &source)) || source.cx < 1 || source.cy < 1) {
+            DwmUnregisterThumbnail(first);
+            DestroyWindow(a->overlay);
+            return false;
+        }
+        const int count = std::min(kLampStrips, (int)source.cy);
+        a->strips.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            HTHUMBNAIL thumb = i == 0 ? first : nullptr;
+            if (i && FAILED(DwmRegisterThumbnail(a->overlay, hwnd, &thumb))) {
+                for (auto& strip : a->strips) DwmUnregisterThumbnail(strip.thumb);
+                a->strips.clear();
+                DestroyWindow(a->overlay);
+                return false;
+            }
+            a->strips.push_back({thumb, {0, source.cy * i / count, source.cx, source.cy * (i + 1) / count}});
+        }
     }
     a->t0 = Clock::now();
     m_anim = std::move(a);
@@ -263,12 +284,17 @@ bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, s
         return false;
     }
     Anim& started = *m_anim;
+    if (started.compositor) {
+        started.t0 = Clock::now();
+        if (!started.compositor->Start()) { End(); return false; }
+    }
 #ifndef HALO_SWOOP_FORCE_LOWRES
     started.frameTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 #endif
     started.frameStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    LARGE_INTEGER due{}; due.QuadPart = -static_cast<LONGLONG>(kFrameMs) * 10000;
-    if (started.frameTimer && started.frameStop && SetWaitableTimer(started.frameTimer, &due, kFrameMs, nullptr, nullptr, FALSE)) {
+    LARGE_INTEGER due{}; due.QuadPart = -static_cast<LONGLONG>(started.compositor ? kLampMs : kFrameMs) * 10000;
+    bool armed = started.frameTimer && SetWaitableTimer(started.frameTimer, &due, kFrameMs, nullptr, nullptr, FALSE);
+    if (armed && started.frameStop) {
         auto* context = new (std::nothrow) std::shared_ptr<Anim>(m_anim);
         if (context) {
             started.frameThread = CreateThread(nullptr, 0, FrameThread, context, 0, nullptr);
@@ -281,6 +307,7 @@ bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, s
 }
 
 bool Swoop::RenderFrame(Anim& a, float t) {
+    if (a.compositor) return true;  // the compositor owns the complete timeline
 #ifdef HALO_SWOOP_TEST_STALL
     if (t > .02f && t < 1) Sleep(200);  // model a delayed DWM call on the render worker
 #endif
@@ -357,6 +384,10 @@ void Swoop::End() {
 #endif
     if (stopped != WAIT_OBJECT_0) Log(L"frame worker is still finishing; cleanup deferred");
     DestroyWindow(a->overlay);
+    // When the frame worker has stopped, transfer potentially expensive DWM
+    // visual cleanup to a thread-pool worker. If it is still running, its shared
+    // animation owns the compositor until it exits.
+    if (stopped == WAIT_OBJECT_0 && a->compositor) SwoopCompositor::DisposeAsync(std::move(a->compositor));
     if (!a->leaving && !a->acted && a->action) {
         try { a->action(); } catch (...) { Log(L"restore threw"); }
     }

@@ -30,4 +30,19 @@ inline LampPoint LampVertex(double tx, double ty, double p, LampRect w, LampRect
     if (mirror) out.y = -out.y;
     return out;
 }
+
+// An affine strip follows the centre line at both edges while using the mean
+// width of those edges. This reduces stair-stepping without per-frame CPU work.
+struct LampAffine { double sx, shear, tx, sy, ty; };
+inline LampAffine LampStripAffine(double top, double bottom, double p, LampRect w, LampRect icon,
+                                 double sourceWidth, double sourceHeight) {
+    auto l0 = LampVertex(0, top, p, w, icon), r0 = LampVertex(1, top, p, w, icon);
+    auto l1 = LampVertex(0, bottom, p, w, icon), r1 = LampVertex(1, bottom, p, w, icon);
+    double srcTop = sourceHeight * top, srcH = sourceHeight * (bottom-top);
+    double width = ((r0.x-l0.x)+(r1.x-l1.x))/2;
+    double center0 = (l0.x+r0.x)/2, center1 = (l1.x+r1.x)/2;
+    double shear = (center1-center0)/srcH, sy = (l1.y-l0.y)/srcH;
+    return {width/sourceWidth, shear, center0-width/2-w.x-shear*srcTop,
+            sy, l0.y-w.y-sy*srcTop};
+}
 }  // namespace halo
