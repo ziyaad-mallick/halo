@@ -1,13 +1,8 @@
 #pragma once
-// Minimize / restore swoop for windows the Halo Genie Windhawk mod can't reach (Chromium apps never load
-// windhawk.dll; a machine without Windhawk has no mod at all).
-//
-// For each tracked window whose process hasn't loaded the mod, DWM's own transitions are switched off (so the
-// stock minimize doesn't double up), and Halo draws the move itself: a click-through topmost overlay holding a
-// DWM thumbnail of the window, shrinking and fading into its dock icon (and growing back out of it on a dock
-// click). The overlay lives only while an animation runs, driven by a timer that exists only for that time:
-// idle costs nothing. A window that is hung or elevated, a hidden dock, another monitor, or reduce_motion all
-// mean no swoop (the window just minimizes, with no stock animation either).
+// Halo's out-of-process minimize / dock-restore animation. A click-through
+// overlay holds strips of DWM thumbnails which bend toward the dock icon.
+// Windows that cannot supply DWM thumbnails may not animate. Restore from
+// outside Halo's dock is not intercepted. Reduced motion disables the effect.
 #include <windows.h>
 
 #include <functional>
@@ -47,7 +42,6 @@ private:
     bool m_on;
     std::map<HWND, bool> m_wins;           // every tracked window; true = we switched its transitions off
     std::map<HWND, ULONGLONG> m_modAsked;  // when the mod last asked about a window
-    std::map<DWORD, std::pair<ULONGLONG, bool>> m_hasMod;  // pid -> (when checked, mod loaded or unknowable)
     std::unique_ptr<Anim> m_anim;
     void* m_hook = nullptr;
 };

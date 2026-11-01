@@ -1,8 +1,6 @@
 #include "swoop.h"
 
 #include <dwmapi.h>
-#define PSAPI_VERSION 1  // psapi.dll's own exports; the K32 names need a newer import library than MinGW has
-#include <psapi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -13,14 +11,16 @@
 #include <vector>
 
 #include "tokens.h"
+#include "lamp_geometry.h"
 
 namespace halo {
 namespace {
 
 constexpr ULONGLONG kModGraceMs = 300;    // the mod asked about a window this recently: it is animating it
-constexpr ULONGLONG kModCacheMs = 60000;  // a pid's answer is reused this long (pids are recycled)
 constexpr float kRestoreAt = 0.65f;       // the real restore starts this far into the grow, so it lands under the ghost
 constexpr float kHoldMaxMs = 150;         // extra time the ghost waits for a slow app to un-minimize
+constexpr float kLampMs = 380;
+constexpr int kLampStrips = 32;
 constexpr UINT_PTR kFrameTimer = 1;
 constexpr UINT kFrameMs = 8;              // clamped to the system timer; progress is by clock, so jitter is invisible
 constexpr wchar_t kClass[] = L"HaloSwoop";
@@ -34,37 +34,6 @@ void Log(std::wstring const& msg) {
     OutputDebugStringW(line.c_str());
     fputws(line.c_str(), stderr);
     fflush(stderr);
-}
-
-// True if the process has the genie mod loaded, or if we can't tell (elevated, protected, suspended): in both
-// cases the stock behaviour is left alone.
-bool ModLoaded(DWORD pid) {
-#ifdef HALO_SWOOP_TEST
-    (void)pid;
-    return false;  // tools/swoop_test.cpp: the test window is injected with the real mod on a Windhawk machine
-#endif
-    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!h) return true;
-    bool found = false, ok = false;
-    std::vector<HMODULE> mods(512);
-    DWORD need = 0;
-    for (int tries = 0; tries < 2; tries++) {
-        ok = EnumProcessModulesEx(h, mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &need, LIST_MODULES_ALL) != 0;
-        if (!ok || need <= mods.size() * sizeof(HMODULE)) break;
-        mods.resize(need / sizeof(HMODULE) + 16);  // it loaded more since the first call
-    }
-    if (ok) {
-        mods.resize(std::min<size_t>(mods.size(), need / sizeof(HMODULE)));
-        for (HMODULE m : mods) {
-            wchar_t name[MAX_PATH];
-            DWORD n = GetModuleBaseNameW(h, m, name, ARRAYSIZE(name));
-            std::wstring s(name, n);
-            for (auto& c : s) c = static_cast<wchar_t>(std::towlower(c));
-            if (s.find(L"halo-genie") != std::wstring::npos) { found = true; break; }
-        }
-    }
-    CloseHandle(h);
-    return found || !ok;
 }
 
 // The window's rect as it is when restored, in screen px. A window minimized from maximized grew from the
@@ -108,7 +77,8 @@ void CALLBACK HookProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG idObject, LONG idCh
 struct Swoop::Anim {
     HWND src{};
     HWND overlay{};
-    HTHUMBNAIL thumb{};
+    struct Strip { HTHUMBNAIL thumb{}; RECT source{}; };
+    std::vector<Strip> strips;
     RECT from{}, to{}, bounds{};
     bool leaving = true;
     bool acted = false;
@@ -140,14 +110,6 @@ void Swoop::Disable(HWND hwnd) {
     if (it == m_wins.end() || it->second || IsHungAppWindow(hwnd)) return;
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    ULONGLONG now = GetTickCount64();
-    std::erase_if(m_hasMod, [now](auto const& entry) { return now - entry.second.first > kModCacheMs; });
-    auto& c = m_hasMod[pid];
-    if (c.first == 0 || now - c.first > kModCacheMs) {
-        c = {now, ModLoaded(pid)};
-        if (c.second) Log(L"pid " + std::to_wstring(pid) + L" left to its own animation (mod loaded, or process unreadable)");
-    }
-    if (c.second) return;
     BOOL off = TRUE;
     HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &off, sizeof(off));
     if (SUCCEEDED(hr)) it->second = true;
@@ -196,8 +158,12 @@ void Swoop::OnMinimize(HWND hwnd) {
     auto asked = m_modAsked.find(hwnd);
     if (asked != m_modAsked.end() && GetTickCount64() - asked->second < kModGraceMs) return;
     RECT from, icon;
-    if (!NormalRect(hwnd, from) || !m_iconFor(hwnd, from, icon)) return;
-    Start(hwnd, from, icon, true, nullptr);
+    if (!NormalRect(hwnd, from) || !m_iconFor(hwnd, from, icon) || !Start(hwnd, from, icon, true, nullptr)) {
+        // If there is no target or DWM refuses the overlay, retain the native
+        // transition for future gestures instead of leaving this window stuck.
+        Enable(hwnd);
+        it->second = false;
+    }
 }
 
 bool Swoop::Restore(HWND hwnd, std::function<void()> restore) {
@@ -216,24 +182,47 @@ bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, s
     a->from = from;
     a->to = icon;
     UnionRect(&a->bounds, &from, &icon);
+    int pad = std::max(from.right - from.left, from.bottom - from.top) / 4 + 32;
+    InflateRect(&a->bounds, pad, pad);
     a->leaving = leaving;
-    a->action = std::move(action);
     a->overlay = CreateWindowExW(WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
                                      WS_EX_NOREDIRECTIONBITMAP,
                                  kClass, L"", WS_POPUP, a->bounds.left, a->bounds.top, a->bounds.right - a->bounds.left,
                                  a->bounds.bottom - a->bounds.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!a->overlay) return false;
     SetLayeredWindowAttributes(a->overlay, 0, 255, LWA_ALPHA);
-    if (FAILED(DwmRegisterThumbnail(a->overlay, hwnd, &a->thumb))) {
+    HTHUMBNAIL first{};
+    SIZE source{};
+    if (FAILED(DwmRegisterThumbnail(a->overlay, hwnd, &first))) {
         DestroyWindow(a->overlay);
         return false;
+    }
+    if (FAILED(DwmQueryThumbnailSourceSize(first, &source)) || source.cx < 1 || source.cy < 1) {
+        DwmUnregisterThumbnail(first);
+        DestroyWindow(a->overlay);
+        return false;
+    }
+    const int count = std::min(kLampStrips, (int)source.cy);
+    a->strips.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        HTHUMBNAIL thumb = i == 0 ? first : nullptr;
+        if (i && FAILED(DwmRegisterThumbnail(a->overlay, hwnd, &thumb))) {
+            for (auto& strip : a->strips) DwmUnregisterThumbnail(strip.thumb);
+            DestroyWindow(a->overlay);
+            return false;
+        }
+        a->strips.push_back({thumb, {0, source.cy * i / count, source.cx, source.cy * (i + 1) / count}});
     }
     a->t0 = Clock::now();
     m_anim = std::move(a);
     OnFrame();  // first frame before the overlay is shown: the ghost starts exactly where the window was
     if (!m_anim) return false;
-    SetWindowPos(m_anim->overlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    SetTimer(m_anim->overlay, kFrameTimer, kFrameMs, nullptr);
+    if (!SetWindowPos(m_anim->overlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+        End();
+        return false;
+    }
+    if (!SetTimer(m_anim->overlay, kFrameTimer, kFrameMs, nullptr)) { End(); return false; }
+    m_anim->action = std::move(action);
     return true;
 }
 
@@ -243,23 +232,39 @@ void Swoop::OnFrame() {
     Anim& a = *m_anim;
     try {
         float ms = std::chrono::duration<float, std::milli>(Clock::now() - a.t0).count();
-        float t = std::min(1.0f, ms / ui::kSlowMs);
+        float t = std::min(1.0f, ms / kLampMs);
         if (!a.leaving && !a.acted && t >= kRestoreAt) {
             a.acted = true;
             if (a.action) a.action();
         }
         // done; a restore also waits (briefly) for a slow app to be un-minimized, so the ghost never leaves a gap
-        if (t >= 1.0f && (a.leaving || !IsIconic(a.src) || ms > ui::kSlowMs + kHoldMaxMs)) return End();
-        float p = a.leaving ? t * t : (1 - t) * (1 - t) * (1 - t);  // 0 = at the window, 1 = in the icon
-        float alpha = 1 - std::clamp((p - 0.45f) / 0.55f, 0.0f, 1.0f);
-        DWM_THUMBNAIL_PROPERTIES props{};
-        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE;
-        props.fVisible = TRUE;
-        props.opacity = static_cast<BYTE>(std::lround(alpha * 255));
-        auto at = [&](LONG f, LONG g, LONG origin) { return static_cast<LONG>(std::lround(f + (g - f) * p)) - origin; };
-        props.rcDestination = {at(a.from.left, a.to.left, a.bounds.left), at(a.from.top, a.to.top, a.bounds.top),
-                               at(a.from.right, a.to.right, a.bounds.left), at(a.from.bottom, a.to.bottom, a.bounds.top)};
-        if (FAILED(DwmUpdateThumbnailProperties(a.thumb, &props))) End();  // the window is gone
+        if (t >= 1.0f && (a.leaving || !IsIconic(a.src) || ms > kLampMs + kHoldMaxMs)) return End();
+        double u = a.leaving ? t : 1 - t;
+        double p = u * u * (3 - 2 * u);
+        double fade = std::clamp((p - .7) / .3, 0.0, 1.0);
+        BYTE opacity = static_cast<BYTE>(std::lround(255 * (1 - fade * fade * (3 - 2 * fade))));
+        LampRect w{(double)a.from.left, (double)a.from.top, (double)(a.from.right-a.from.left), (double)(a.from.bottom-a.from.top)};
+        LampRect icon{(double)a.to.left, (double)a.to.top, (double)(a.to.right-a.to.left), (double)(a.to.bottom-a.to.top)};
+        int sourceHeight = a.strips.back().source.bottom;
+        for (auto const& strip : a.strips) {
+            double top = (double)strip.source.top / sourceHeight, bottom = (double)strip.source.bottom / sourceHeight;
+            auto left = LampVertex(0, top, p, w, icon);
+            auto right = LampVertex(1, top, p, w, icon);
+            auto lower = LampVertex(0, bottom, p, w, icon);
+            DWM_THUMBNAIL_PROPERTIES props{};
+            props.dwFlags = DWM_TNP_RECTSOURCE | DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE;
+            props.fVisible = TRUE;
+            props.opacity = opacity;
+            props.rcSource = strip.source;
+            props.rcDestination = {(LONG)std::lround(left.x)-a.bounds.left, (LONG)std::lround(left.y)-a.bounds.top,
+                                   (LONG)std::lround(right.x)-a.bounds.left, (LONG)std::lround(lower.y)-a.bounds.top};
+            // DWM rejects collapsed rectangles at the icon; the fade has reached zero there.
+            if (props.rcDestination.right <= props.rcDestination.left || props.rcDestination.bottom <= props.rcDestination.top) {
+                props.fVisible = FALSE;
+                props.dwFlags = DWM_TNP_VISIBLE;
+            }
+            if (FAILED(DwmUpdateThumbnailProperties(strip.thumb, &props))) return End();
+        }
     } catch (...) {
         Log(L"frame threw");
         End();
@@ -271,7 +276,7 @@ void Swoop::End() {
     if (!m_anim) return;
     std::unique_ptr<Anim> a = std::move(m_anim);
     KillTimer(a->overlay, kFrameTimer);
-    if (a->thumb) DwmUnregisterThumbnail(a->thumb);
+    for (auto& strip : a->strips) DwmUnregisterThumbnail(strip.thumb);
     DestroyWindow(a->overlay);
     if (!a->leaving && !a->acted && a->action) {
         try { a->action(); } catch (...) { Log(L"restore threw"); }
