@@ -2,7 +2,7 @@
 // @id              halo-genie
 // @name            Halo Genie
 // @description     Lamp-style minimize/restore into Halo's dock icons (GPU compositor), plus a zoom for maximize/un-maximize.
-// @version         2.2.0
+// @version         2.2.1
 // @author          Ziyaad Mallick (fork of MacOS Minimize Animation by Abdullah Masood)
 // @include         *
 // @exclude         halo.exe
@@ -18,7 +18,7 @@
 
 The lamp minimize effect for [Halo](https://github.com/ziyaad-mallick/halo),
 the dock that replaces the Windows taskbar. Minimizing bends the window
-toward the app's dock icon (about 320 ms, fading out over the last 30%);
+toward the app's dock icon (about 380 ms, fading out over the last 30%);
 restoring reverses the effect.
 Maximize and un-maximize get a matching zoom (the window scales between its two
 rects, ease-out, no flash).
@@ -52,8 +52,8 @@ with SendMessageTimeoutW (SMTO_ABORTIFHUNG, 50 ms):
   The position is where the icon sits when the dock is shown at rest, not
   its hidden, slid-off position. The reply needs a 64-bit LRESULT, so the
   mod is x86-64 only.
-- On 1 and 2 Halo also reveals the dock and keeps it up until 300 ms after
-  the animation (it assumes the 320 ms animation) so the swoop lands in a visible icon.
+- On 1 and 2 Halo also reveals the dock and holds it for 620 ms, so the
+  380 ms swoop lands in a visible icon.
 
 Halo replies 0 (no dock icon): the mod lets Windows do its own animation.
 No Halo window: the taskbar fallback above.
@@ -110,7 +110,7 @@ IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-constexpr int kGenieMs = 320;  // Halo keeps the dock up for this + 300 ms
+constexpr int kGenieMs = 380;  // Halo holds the dock for 620 ms, leaving 240 ms after the animation
 constexpr int kZoomMs = 280;
 constexpr float kPi = 3.14159265f;
 
@@ -333,7 +333,7 @@ static double Bezier(double x1, double y1, double x2, double y2, double u) {
     if (u <= 0) return 0;
     if (u >= 1) return 1;
     double lo = 0, hi = 1, s = u;
-    for (int i = 0; i < 40; i++) {
+    for (int i = 0; i < 24; i++) {
         s = (lo + hi) / 2;
         double x = 3 * (1 - s) * (1 - s) * s * x1 + 3 * (1 - s) * s * s * x2 + s * s * s;
         (x < u ? lo : hi) = s;
@@ -498,8 +498,7 @@ static DWORD WINAPI Worker(LPVOID param) {
     const double dur = durMs / 1000.0;
 
     // Canvas: a transparent window over everything the window can touch. The
-    // genie only shrinks toward the icon (plus a 1.5% spring overshoot), so the
-    // union of the two rects with a margin is enough.
+    // The union of the two rects with a margin accommodates the lamp's sway.
     RECT dest = zoom ? a->toEst : RECT{(LONG)a->icon.x, (LONG)a->icon.y, (LONG)(a->icon.x + a->icon.width), (LONG)(a->icon.y + a->icon.height)};
     RECT box = Union(a->from, dest);
     int pad = zoom ? 48 : (int)(std::max(sw, sh) * 0.25) + 32;
@@ -587,7 +586,7 @@ static DWORD WINAPI Worker(LPVOID param) {
         // Horizontal strips share one GPU surface. Each strip follows the lamp
         // curve independently; DWM evaluates the timelines at display refresh.
         if (!zoom) {
-            constexpr int count = 32;
+            constexpr int count = 48;
             Geometry win{(float)a->from.left, (float)a->from.top, (float)sw, (float)sh};
             auto value = [=](int row, int property, double u) {
                 double p = rising ? CurveX(1 - u) : CurveX(u);
@@ -655,6 +654,9 @@ static DWORD WINAPI Worker(LPVOID param) {
 
     if (built && !a->abort.load() && !g_unloading.load()) {
         // Hand the whole timeline to the compositor: set once, commit once.
+        LARGE_INTEGER setupFreq, setupStart, setupEnd;
+        QueryPerformanceFrequency(&setupFreq);
+        QueryPerformanceCounter(&setupStart);
         IDCompositionAnimation *asx = MakeAnim(dev, sx, dur), *asy = MakeAnim(dev, sy, dur), *atx = MakeAnim(dev, tx, dur),
                                *aty = MakeAnim(dev, ty, dur), *aop = MakeAnim(dev, op, dur);
         bool ok = asx && asy && atx && aty && aop &&
@@ -691,6 +693,8 @@ static DWORD WINAPI Worker(LPVOID param) {
             }
         }
         if (ok) ok = SUCCEEDED(dev->Commit());
+        QueryPerformanceCounter(&setupEnd);
+        Wh_Log(L"genie timeline setup %.1f ms", (setupEnd.QuadPart - setupStart.QuadPart) * 1000.0 / setupFreq.QuadPart);
         Rel(asx); Rel(asy); Rel(atx); Rel(aty); Rel(aop);
         LARGE_INTEGER freq, t0, now;
         QueryPerformanceFrequency(&freq);
