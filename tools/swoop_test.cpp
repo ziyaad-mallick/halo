@@ -154,7 +154,7 @@ int wmain(int argc, wchar_t** argv) {
             if (restored && !actedAt) actedAt = GetTickCount64() - t0;
         }
         printf("  restore action ran at %llu ms\n", actedAt);
-        Check(restored && actedAt < 300, "restore ran within 300 ms");
+        Check(restored && actedAt >= 350 && actedAt < 650, "restore runs once the ghost reaches the full window");
         Check(!IsIconic(child), "window is restored");
         Check(seen > 0, "overlay exists while restoring");
         Check(FindWindowW(L"HaloSwoop", nullptr) == nullptr, "overlay destroyed after restore");

@@ -12,7 +12,10 @@ struct LampPoint { double x, y; };
 inline LampPoint LampVertex(double tx, double ty, double p, LampRect w, LampRect icon) {
     const bool mirror = icon.y + icon.height / 2 < w.y + w.height / 2;
     if (mirror) { w.y = -w.y - w.height; icon.y = -icon.y - icon.height; ty = 1 - ty; }
-    const double k = std::min(p / .3, 1.0), j = std::max((p - .3) / .7, 0.0);
+    // Blend the stretch and collapse phases, rather than switching abruptly
+    // from one to the other at p=.3. Both have zero slope at their endpoints.
+    auto smooth = [](double x) { x = std::clamp(x, 0.0, 1.0); return x*x*(3-2*x); };
+    const double k = smooth(p / .55), j = smooth((p - .12) / .88);
     const double extra = icon.y - w.y - w.height;
     const double full = icon.y - w.y - extra * (1 - k);
     const double height = full * (1 - j), y = ty * height;

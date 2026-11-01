@@ -3,10 +3,12 @@
 #include <dwmapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cwctype>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -17,12 +19,16 @@ namespace halo {
 namespace {
 
 constexpr ULONGLONG kModGraceMs = 300;    // the mod asked about a window this recently: it is animating it
-constexpr float kRestoreAt = 0.65f;       // the real restore starts this far into the grow, so it lands under the ghost
+constexpr float kRestoreAt = 1.0f;        // reveal the real window only once the ghost covers its full rectangle
 constexpr float kHoldMaxMs = 150;         // extra time the ghost waits for a slow app to un-minimize
 constexpr float kLampMs = 380;
 constexpr int kLampStrips = 32;
 constexpr UINT_PTR kFrameTimer = 1;
-constexpr UINT kFrameMs = 8;              // clamped to the system timer; progress is by clock, so jitter is invisible
+constexpr UINT kFrameMs = 8;              // high-resolution worker cadence; WM_TIMER is the fallback
+constexpr UINT kFrameMessage = WM_APP + 30;
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 constexpr wchar_t kClass[] = L"HaloSwoop";
 
 using Clock = std::chrono::steady_clock;
@@ -64,6 +70,9 @@ LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == kFrameTimer && g_self) g_self->OnFrame();
             return 0;
+        case kFrameMessage:
+            if (g_self) g_self->OnFrame();
+            return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
@@ -84,7 +93,38 @@ struct Swoop::Anim {
     bool acted = false;
     Clock::time_point t0;
     std::function<void()> action;  // restore: runs once, near the end of the grow
+    HANDLE frameTimer{}, frameStop{}, frameThread{};
+    std::atomic<bool> frameQueued{false};
+    std::atomic<bool> renderFailed{false};
+    ~Anim() {
+        for (auto& strip : strips) if (strip.thumb) DwmUnregisterThumbnail(strip.thumb);
+        if (frameTimer) { CancelWaitableTimer(frameTimer); CloseHandle(frameTimer); }
+        if (frameStop) CloseHandle(frameStop);
+        if (frameThread) CloseHandle(frameThread);
+    }
+#ifdef HALO_SWOOP_PROFILE
+    Clock::time_point lastFrame{};
+    double maxGap = 0, maxWork = 0, totalWork = 0;
+    int frames = 0;
+#endif
 };
+
+DWORD WINAPI Swoop::FrameThread(void* context) {
+    std::unique_ptr<std::shared_ptr<Anim>> owner(static_cast<std::shared_ptr<Anim>*>(context));
+    auto a = std::move(*owner);
+    HANDLE waiters[] = {a->frameStop, a->frameTimer};
+    while (WaitForMultipleObjects(2, waiters, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+        float ms = std::chrono::duration<float, std::milli>(Clock::now() - a->t0).count();
+        float t = std::min(1.0f, ms / kLampMs);
+        if (!RenderFrame(*a, t)) a->renderFailed = true;
+        if (WaitForSingleObject(a->frameStop, 0) == WAIT_OBJECT_0) break;
+        // Only lifecycle events need the dock thread. Frame updates remain here
+        // even while the dock is processing input or another window is slow.
+        if ((a->renderFailed || t >= 1 || (!a->leaving && t >= kRestoreAt)) &&
+            !a->frameQueued.exchange(true) && !PostMessageW(a->overlay, kFrameMessage, 0, 0)) a->frameQueued = false;
+    }
+    return 0;
+}
 
 Swoop::Swoop(IconFor iconFor, bool enabled) : m_iconFor(std::move(iconFor)), m_on(enabled) {
     g_self = this;
@@ -177,7 +217,7 @@ bool Swoop::Restore(HWND hwnd, std::function<void()> restore) {
 
 // Builds the overlay over the union of the two rects and plays the first frame. False if DWM won't thumbnail.
 bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, std::function<void()> action) {
-    auto a = std::make_unique<Anim>();
+    auto a = std::make_shared<Anim>();
     a->src = hwnd;
     a->from = from;
     a->to = icon;
@@ -208,6 +248,7 @@ bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, s
         HTHUMBNAIL thumb = i == 0 ? first : nullptr;
         if (i && FAILED(DwmRegisterThumbnail(a->overlay, hwnd, &thumb))) {
             for (auto& strip : a->strips) DwmUnregisterThumbnail(strip.thumb);
+            a->strips.clear();
             DestroyWindow(a->overlay);
             return false;
         }
@@ -221,24 +262,34 @@ bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, s
         End();
         return false;
     }
-    if (!SetTimer(m_anim->overlay, kFrameTimer, kFrameMs, nullptr)) { End(); return false; }
+    Anim& started = *m_anim;
+#ifndef HALO_SWOOP_FORCE_LOWRES
+    started.frameTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
+    started.frameStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    LARGE_INTEGER due{}; due.QuadPart = -static_cast<LONGLONG>(kFrameMs) * 10000;
+    if (started.frameTimer && started.frameStop && SetWaitableTimer(started.frameTimer, &due, kFrameMs, nullptr, nullptr, FALSE)) {
+        auto* context = new (std::nothrow) std::shared_ptr<Anim>(m_anim);
+        if (context) {
+            started.frameThread = CreateThread(nullptr, 0, FrameThread, context, 0, nullptr);
+            if (!started.frameThread) delete context;
+        }
+    }
+    if (!started.frameThread && !SetTimer(started.overlay, kFrameTimer, kFrameMs, nullptr)) { End(); return false; }
     m_anim->action = std::move(action);
     return true;
 }
 
-// One frame, by the clock: leaving accelerates into the icon, entering decelerates out of it.
-void Swoop::OnFrame() {
-    if (!m_anim) return;
-    Anim& a = *m_anim;
+bool Swoop::RenderFrame(Anim& a, float t) {
+#ifdef HALO_SWOOP_TEST_STALL
+    if (t > .02f && t < 1) Sleep(200);  // model a delayed DWM call on the render worker
+#endif
+#ifdef HALO_SWOOP_PROFILE
+    auto frameStart = Clock::now();
+    if (a.frames) a.maxGap = std::max(a.maxGap, std::chrono::duration<double, std::milli>(frameStart - a.lastFrame).count());
+    a.lastFrame = frameStart;
+#endif
     try {
-        float ms = std::chrono::duration<float, std::milli>(Clock::now() - a.t0).count();
-        float t = std::min(1.0f, ms / kLampMs);
-        if (!a.leaving && !a.acted && t >= kRestoreAt) {
-            a.acted = true;
-            if (a.action) a.action();
-        }
-        // done; a restore also waits (briefly) for a slow app to be un-minimized, so the ghost never leaves a gap
-        if (t >= 1.0f && (a.leaving || !IsIconic(a.src) || ms > kLampMs + kHoldMaxMs)) return End();
         double u = a.leaving ? t : 1 - t;
         double p = u * u * (3 - 2 * u);
         double fade = std::clamp((p - .7) / .3, 0.0, 1.0);
@@ -263,20 +314,48 @@ void Swoop::OnFrame() {
                 props.fVisible = FALSE;
                 props.dwFlags = DWM_TNP_VISIBLE;
             }
-            if (FAILED(DwmUpdateThumbnailProperties(strip.thumb, &props))) return End();
+            if (FAILED(DwmUpdateThumbnailProperties(strip.thumb, &props))) return false;
         }
-    } catch (...) {
-        Log(L"frame threw");
-        End();
+#ifdef HALO_SWOOP_PROFILE
+        double work = std::chrono::duration<double, std::milli>(Clock::now() - frameStart).count();
+        a.maxWork = std::max(a.maxWork, work);
+        a.totalWork += work;
+        ++a.frames;
+#endif
+        return true;
+    } catch (...) { return false; }
+}
+
+// The dock thread only performs restore and cleanup; the timer thread renders.
+void Swoop::OnFrame() {
+    if (!m_anim) return;
+    Anim& a = *m_anim;
+    a.frameQueued = false;
+    float ms = std::chrono::duration<float, std::milli>(Clock::now() - a.t0).count();
+    float t = std::min(1.0f, ms / kLampMs);
+    if (a.renderFailed) return End();
+    if (!a.leaving && !a.acted && t >= kRestoreAt) {
+        a.acted = true;
+        if (a.action) a.action();
+        if (!m_anim || m_anim.get() != &a) return;
     }
+    if (t >= 1.0f && (a.leaving || !IsIconic(a.src) || ms > kLampMs + kHoldMaxMs)) return End();
+    if (!a.frameThread && !RenderFrame(a, t)) End();
 }
 
 // Destroys the overlay whatever state the animation is in. A restore that hadn't run yet runs now.
 void Swoop::End() {
     if (!m_anim) return;
-    std::unique_ptr<Anim> a = std::move(m_anim);
+    std::shared_ptr<Anim> a = std::move(m_anim);
     KillTimer(a->overlay, kFrameTimer);
-    for (auto& strip : a->strips) DwmUnregisterThumbnail(strip.thumb);
+    if (a->frameStop) SetEvent(a->frameStop);
+    DWORD stopped = a->frameThread ? WaitForSingleObject(a->frameThread, 50) : WAIT_OBJECT_0;
+#ifdef HALO_SWOOP_PROFILE
+    if (stopped == WAIT_OBJECT_0)
+        fprintf(stderr, "swoop profile: frames=%d max-gap=%.2fms mean-work=%.2fms max-work=%.2fms\n", a->frames, a->maxGap,
+                a->frames ? a->totalWork / a->frames : 0, a->maxWork);
+#endif
+    if (stopped != WAIT_OBJECT_0) Log(L"frame worker is still finishing; cleanup deferred");
     DestroyWindow(a->overlay);
     if (!a->leaving && !a->acted && a->action) {
         try { a->action(); } catch (...) { Log(L"restore threw"); }

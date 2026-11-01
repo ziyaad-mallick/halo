@@ -33,6 +33,8 @@ public:
 
 private:
     struct Anim;
+    static DWORD WINAPI FrameThread(void* context);
+    static bool RenderFrame(Anim& animation, float t);
     void Disable(HWND hwnd);
     void Enable(HWND hwnd);
     bool Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, std::function<void()> action);
@@ -42,7 +44,7 @@ private:
     bool m_on;
     std::map<HWND, bool> m_wins;           // every tracked window; true = we switched its transitions off
     std::map<HWND, ULONGLONG> m_modAsked;  // when the mod last asked about a window
-    std::unique_ptr<Anim> m_anim;
+    std::shared_ptr<Anim> m_anim;
     void* m_hook = nullptr;
 };
 
