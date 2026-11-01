@@ -43,7 +43,8 @@ private:
     static bool RenderFrame(Anim& animation, float t);
     void Disable(HWND hwnd);
     void Enable(HWND hwnd);
-    bool Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, std::function<void()> action);
+    bool Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, std::function<void()> action, POINT home = {LONG_MIN, 0});
+    static void MoveHome(Anim& animation);
     void End();
 
     IconFor m_iconFor;

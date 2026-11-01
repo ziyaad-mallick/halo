@@ -16,8 +16,8 @@
 
 namespace halo {
 namespace {
-constexpr int kRows = 48;
-constexpr double kDuration = .38;
+constexpr int kRows = 64;
+constexpr double kDuration = kLampSeconds;
 constexpr DWORD kEnable3D = 0x04000000;
 template<class T> void Release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
@@ -72,10 +72,17 @@ bool BuildCurves(IDCompositionDesktopDevice* dev, const std::function<std::array
                  IDCompositionAnimation* (&out)[5]) {
     static const std::vector<double> knots = [] {
         std::vector<double> k;
-        for (int i = 0; i <= 16; ++i) k.push_back(i / 16.0);
-        // Times where smoothstep(time) crosses the lamp's two phase edges.
-        for (double t : {.21618437233106985, .5333829368376322}) { k.push_back(t); k.push_back(1-t); }
+        // The lamp's phase edges (stretch end, collapse start, fade ends) and their mirrors for
+        // restore get a knot each; the even grid fills in between, minus points hugging an edge.
+        std::vector<double> edges;
+        for (double t : {kCollapseStart, kStretchEnd, kFadeStart, kFadeEnd}) { edges.push_back(t); edges.push_back(1-t); }
+        k = edges;
+        for (int i = 0; i <= 16; ++i) {
+            double g = i / 16.0;
+            if (std::none_of(edges.begin(), edges.end(), [&](double e) { return std::abs(e-g) < .012; })) k.push_back(g);
+        }
         std::sort(k.begin(), k.end());
+        k.erase(std::unique(k.begin(), k.end(), [](double a, double b) { return b-a < 1e-9; }), k.end());
         return k;
     }();
     constexpr double eps = .0001;
@@ -247,7 +254,7 @@ std::unique_ptr<SwoopCompositor> SwoopCompositor::Create(const std::shared_ptr<S
         if (SUCCEEDED(hr)) hr = clip->SetLeft(0.f);
         if (SUCCEEDED(hr)) hr = clip->SetRight((float)size.cx);
         if (SUCCEEDED(hr)) hr = clip->SetTop((float)(size.cy * row / (double)kRows));
-        if (SUCCEEDED(hr)) hr = clip->SetBottom((float)(size.cy * (row+1) / (double)kRows));
+        if (SUCCEEDED(hr)) hr = clip->SetBottom((float)std::min<double>(size.cy, size.cy * (row+1) / (double)kRows + 1));
         if (SUCCEEDED(hr)) hr = s.visual->SetClip(clip);
         Release(clip);
         if (SUCCEEDED(hr)) hr = impl->device->CreateMatrixTransform(&s.transform);
@@ -257,8 +264,9 @@ std::unique_ptr<SwoopCompositor> SwoopCompositor::Create(const std::shared_ptr<S
         if (row == 5) hr = E_FAIL;  // exercise cleanup and public-thumbnail fallback
 #endif
         auto value = [=](double u) -> std::array<double, 5> {
-            double time = leaving ? u : 1-u, p = time*time*(3-2*time);
-            double y0 = row/(double)kRows, y1 = (row+1)/(double)kRows;
+            double p = leaving ? u : 1-u;
+            // Each strip reaches 1px into its lower neighbour: no hairline gaps where the rows shear apart.
+            double y0 = row/(double)kRows, y1 = std::min(1.0, (row+1)/(double)kRows + 1.0/size.cy);
             auto m = LampStripAffine(y0, y1, p, w, dock, size.cx, size.cy);
             return {m.sx, m.shear, m.tx, m.sy, m.ty};
         };
@@ -268,9 +276,7 @@ std::unique_ptr<SwoopCompositor> SwoopCompositor::Create(const std::shared_ptr<S
         if (SUCCEEDED(hr) && !BuildCurves(impl->device, value, s.curves)) hr = E_FAIL;
     }
     auto fade = [=](double u) {
-        double time = leaving ? u : 1-u, p = time*time*(3-2*time);
-        double f = std::clamp((p-.7)/.3, 0.0, 1.0);
-        return 1-f*f*(3-2*f);
+        return LampOpacity(leaving ? u : 1-u);
     };
     if (SUCCEEDED(hr)) hr = impl->effect->SetOpacity((float)fade(0));
     if (SUCCEEDED(hr)) { impl->opacity = Track(impl->device, fade); if (!impl->opacity) hr = E_FAIL; }

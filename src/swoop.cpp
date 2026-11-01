@@ -21,8 +21,9 @@ namespace {
 
 constexpr ULONGLONG kModGraceMs = 300;    // the mod asked about a window this recently: it is animating it
 constexpr float kRestoreAt = 1.0f;        // reveal the real window only once the ghost covers its full rectangle
+constexpr float kSettleMs = 48;           // ghost stays over the real window this long after it un-minimizes: DWM needs a few frames to compose it
 constexpr float kHoldMaxMs = 150;         // extra time the ghost waits for a slow app to un-minimize
-constexpr float kLampMs = 380;
+constexpr float kLampMs = static_cast<float>(kLampSeconds * 1000);
 constexpr int kLampStrips = 32;
 constexpr UINT_PTR kFrameTimer = 1;
 constexpr UINT kFrameMs = 8;              // high-resolution worker cadence; WM_TIMER is the fallback
@@ -93,7 +94,10 @@ struct Swoop::Anim {
     RECT from{}, to{}, bounds{};
     bool leaving = true;
     bool acted = false;
-    Clock::time_point t0;
+    bool shown = false;           // restore: the real window is no longer minimized
+    bool parked = false;          // restore: the real window is coming back off-screen, then slides home
+    POINT home{};                 // where the parked window belongs (its window-rect top-left, screen px)
+    Clock::time_point t0, shownAt;
     std::function<void()> action;  // restore: runs once, near the end of the grow
     HANDLE frameTimer{}, frameStop{}, frameThread{};
     std::atomic<bool> frameQueued{false};
@@ -183,6 +187,7 @@ void Swoop::SetEnabled(bool on) {
 void Swoop::Track(HWND hwnd) {
     m_wins.emplace(hwnd, false);
     if (m_on) Disable(hwnd);
+    else Enable(hwnd);  // off: clear a stale "transitions disabled" an earlier build may have left on this window
 }
 
 void Swoop::Forget(HWND hwnd) {
@@ -215,17 +220,46 @@ void Swoop::OnMinimize(HWND hwnd) {
     }
 }
 
+// A live thumbnail goes blank for a frame when its window leaves the minimized state. Done at the start of the grow
+// that frame lands where the ghost is still transparent, so the window is restored early and kept off-screen
+// (invisible, but still composed, so the ghost shows its live pixels) until the ghost is full size.
+// A window that restores maximized can't be moved, so it keeps the late restore.
+bool ParkMinimized(HWND hwnd, RECT const& from) {
+    WINDOWPLACEMENT wp{sizeof(wp)};
+    if (!GetWindowPlacement(hwnd, &wp) || wp.showCmd != SW_SHOWMINIMIZED || (wp.flags & WPF_RESTORETOMAXIMIZED)) return false;
+    int width = from.right - from.left;
+    int x = GetSystemMetrics(SM_XVIRTUALSCREEN) - width - 200;
+    OffsetRect(&wp.rcNormalPosition, x - from.left, 0);
+    return SetWindowPlacement(hwnd, &wp) != 0;
+}
+
+void Swoop::MoveHome(Anim& a) {
+    if (!a.parked) return;
+    a.parked = false;
+    RECT r{};
+    // Only a window still sitting where we parked it: one the app moved itself stays where the app put it.
+    if (GetWindowRect(a.src, &r) && r.right < GetSystemMetrics(SM_XVIRTUALSCREEN) + 1)
+        SetWindowPos(a.src, nullptr, a.home.x, a.home.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 bool Swoop::Restore(HWND hwnd, std::function<void()> restore) {
     auto it = m_wins.find(hwnd);
     if (!m_on || it == m_wins.end() || !it->second || !IsIconic(hwnd) || IsHungAppWindow(hwnd)) return false;
     End();  // one ghost at a time; a half-played one finishes its restore first
     RECT from, icon;
     if (!NormalRect(hwnd, from) || !m_iconFor(hwnd, from, icon)) return false;
-    return Start(hwnd, from, icon, false, std::move(restore));
+    WINDOWPLACEMENT original{sizeof(original)};
+    GetWindowPlacement(hwnd, &original);
+    bool park = ParkMinimized(hwnd, from);
+    if (!Start(hwnd, from, icon, false, std::move(restore), park ? POINT{from.left, from.top} : POINT{LONG_MIN, 0})) {
+        if (park) SetWindowPlacement(hwnd, &original);
+        return false;
+    }
+    return true;
 }
 
 // Builds the overlay over the union of the two rects and plays the first frame. False if DWM won't thumbnail.
-bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, std::function<void()> action) {
+bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, std::function<void()> action, POINT home) {
     auto a = std::make_shared<Anim>();
     a->src = hwnd;
     a->from = from;
@@ -303,6 +337,13 @@ bool Swoop::Start(HWND hwnd, RECT const& from, RECT const& icon, bool leaving, s
     }
     if (!started.frameThread && !SetTimer(started.overlay, kFrameTimer, kFrameMs, nullptr)) { End(); return false; }
     m_anim->action = std::move(action);
+    if (home.x != LONG_MIN) {  // parked restore: switch the window to its live state now, while the ghost is still invisible
+        m_anim->parked = true;
+        m_anim->home = home;
+        m_anim->acted = true;
+        auto restore = std::move(m_anim->action);
+        if (restore) restore();
+    }
     return true;
 }
 
@@ -317,10 +358,8 @@ bool Swoop::RenderFrame(Anim& a, float t) {
     a.lastFrame = frameStart;
 #endif
     try {
-        double u = a.leaving ? t : 1 - t;
-        double p = u * u * (3 - 2 * u);
-        double fade = std::clamp((p - .7) / .3, 0.0, 1.0);
-        BYTE opacity = static_cast<BYTE>(std::lround(255 * (1 - fade * fade * (3 - 2 * fade))));
+        double p = a.leaving ? t : 1 - t;
+        BYTE opacity = static_cast<BYTE>(std::lround(255 * LampOpacity(p)));
         LampRect w{(double)a.from.left, (double)a.from.top, (double)(a.from.right-a.from.left), (double)(a.from.bottom-a.from.top)};
         LampRect icon{(double)a.to.left, (double)a.to.top, (double)(a.to.right-a.to.left), (double)(a.to.bottom-a.to.top)};
         int sourceHeight = a.strips.back().source.bottom;
@@ -366,7 +405,14 @@ void Swoop::OnFrame() {
         if (a.action) a.action();
         if (!m_anim || m_anim.get() != &a) return;
     }
-    if (t >= 1.0f && (a.leaving || !IsIconic(a.src) || ms > kLampMs + kHoldMaxMs)) return End();
+    if (t >= 1.0f && a.leaving) return End();
+    if (t >= 1.0f && !a.shown && (!IsIconic(a.src) || ms > kLampMs + kHoldMaxMs)) {
+        MoveHome(a);  // the ghost covers the full rectangle and shows this window's own pixels: the move is invisible
+        a.shown = true;
+        a.shownAt = Clock::now();
+    }
+    // The ghost is a live thumbnail of the same pixels, so keeping it a few frames costs nothing and hides the compose gap.
+    if (a.shown && std::chrono::duration<float, std::milli>(Clock::now() - a.shownAt).count() >= kSettleMs) return End();
     if (!a.frameThread && !RenderFrame(a, t)) End();
 }
 
@@ -383,6 +429,7 @@ void Swoop::End() {
                 a->frames ? a->totalWork / a->frames : 0, a->maxWork);
 #endif
     if (stopped != WAIT_OBJECT_0) Log(L"frame worker is still finishing; cleanup deferred");
+    MoveHome(*a);
     DestroyWindow(a->overlay);
     // When the frame worker has stopped, transfer potentially expensive DWM
     // visual cleanup to a thread-pool worker. If it is still running, its shared

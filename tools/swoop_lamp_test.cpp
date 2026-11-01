@@ -113,7 +113,10 @@ int wmain(int argc, wchar_t**) {
 #endif
         Pump(600);
         printf("lamp restore started=%d overlay=%d callback=%d at=%llu ms iconic=%d\n", started, overlay, restored, restoredAt, IsIconic(child));
-        if (!started || !overlay || !restored || restoredAt < 350 || restoredAt > 650 || IsIconic(child)) ++fail;
+        if (!started || !overlay || !restored || restoredAt > 200 || IsIconic(child)) ++fail;  // restores early, parked off-screen, then slides home
+        RECT homeRect{}; GetWindowRect(child, &homeRect);
+        printf("window home rect: %ld,%ld %ldx%ld\n", homeRect.left, homeRect.top, homeRect.right-homeRect.left, homeRect.bottom-homeRect.top);
+        if (homeRect.left != 200 || homeRect.top != 100 || homeRect.right-homeRect.left != 500 || homeRect.bottom-homeRect.top != 400) ++fail;
         if (FindOwnOverlay()) ++fail;
         s.SetEnabled(false);
         SendMessageTimeoutW(child, WM_SYSCOMMAND, SC_MINIMIZE, 0, SMTO_ABORTIFHUNG, 500, nullptr);

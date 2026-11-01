@@ -4,7 +4,7 @@
 
 static double Sample(double u, double tx, double ty, halo::LampRect w, halo::LampRect icon, int axis, bool reverse) {
     double t = reverse ? 1-u : u;
-    auto p = halo::LampVertex(tx, ty, t*t*(3-2*t), w, icon);
+    auto p = halo::LampVertex(tx, ty, t, w, icon);
     return axis ? p.y : p.x;
 }
 
@@ -24,12 +24,12 @@ int wmain() {
                 auto end = halo::LampVertex(tx, ty, 1, w, icon);
                 double targetY = icon.y + (icon.y < w.y ? icon.height : 0);
                 if (std::abs(end.x - (icon.x + tx*icon.width)) > .01 || std::abs(end.y - targetY) > .01) ++failures;
-                for (double boundary : {.12, .3, .55}) {
+                for (double boundary : {halo::kCollapseStart, halo::kStretchEnd}) {
                     const double e = .0001;
                     auto a = halo::LampVertex(tx, ty, boundary-e, w, icon);
                     auto b = halo::LampVertex(tx, ty, boundary, w, icon);
                     auto c = halo::LampVertex(tx, ty, boundary+e, w, icon);
-                    // A velocity discontinuity produces a visible jerk in a 380ms motion.
+                    // A velocity discontinuity produces a visible jerk in the lamp motion.
                     if (std::abs((b.x-a.x) - (c.x-b.x)) > .002 || std::abs((b.y-a.y) - (c.y-b.y)) > .002) ++failures;
                 }
             }
@@ -37,8 +37,9 @@ int wmain() {
     }
     std::vector<double> knots;
     for (int i = 0; i <= 16; ++i) knots.push_back(i/16.0);
-    for (double v : {.21618437233106985, .5333829368376322}) { knots.push_back(v); knots.push_back(1-v); }
+    for (double v : {halo::kCollapseStart, halo::kStretchEnd, halo::kFadeStart, halo::kFadeEnd}) { knots.push_back(v); knots.push_back(1-v); }
     std::sort(knots.begin(), knots.end());
+    knots.erase(std::unique(knots.begin(), knots.end(), [](double x, double y) { return y-x < 1e-9; }), knots.end());
     double maxError = 0;
     for (auto pair : {std::pair{halo::LampRect{0,0,1920,1080},halo::LampRect{1400,1040,64,64}},
                       std::pair{halo::LampRect{0,0,600,400},halo::LampRect{1200,900,48,48}},
@@ -65,7 +66,7 @@ int wmain() {
         auto error = [&](int rows, bool affine) {
             double worst = 0;
             for (int row=0; row<rows; ++row) for (int step=0; step<=100; ++step) {
-                double u=step/100.0, p=u*u*(3-2*u), top=row/(double)rows, bottom=(row+1)/(double)rows;
+                double p=step/100.0, top=row/(double)rows, bottom=(row+1)/(double)rows;
                 auto m=halo::LampStripAffine(top,bottom,p,pair.first,pair.second,pair.first.width,pair.first.height);
                 for (int x=0; x<=1; ++x) for (int fraction=0; fraction<=4; ++fraction) {
                     double ty=(row+fraction/4.0)/rows, srcY=ty*pair.first.height;

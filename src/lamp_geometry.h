@@ -9,13 +9,23 @@ namespace halo {
 struct LampRect { double x, y, width, height; };
 struct LampPoint { double x, y; };
 
+// One timeline for every renderer. `p` is linear in time: the stretch (k) and
+// collapse (j) phases below each carry their own ease, so easing time as well
+// compounds into a dead start, a burst, and a long sliver at the end.
+inline constexpr double kLampSeconds = .48;
+inline constexpr double kStretchEnd = .5;     // k reaches 1 here
+inline constexpr double kCollapseStart = .06; // j leaves 0 here
+inline constexpr double kFadeStart = .6, kFadeEnd = .92;
+
+inline double LampSmooth(double x) { x = std::clamp(x, 0.0, 1.0); return x*x*(3-2*x); }
+inline double LampOpacity(double p) { return 1 - LampSmooth((p - kFadeStart) / (kFadeEnd - kFadeStart)); }
+
 inline LampPoint LampVertex(double tx, double ty, double p, LampRect w, LampRect icon) {
     const bool mirror = icon.y + icon.height / 2 < w.y + w.height / 2;
     if (mirror) { w.y = -w.y - w.height; icon.y = -icon.y - icon.height; ty = 1 - ty; }
-    // Blend the stretch and collapse phases, rather than switching abruptly
-    // from one to the other at p=.3. Both have zero slope at their endpoints.
-    auto smooth = [](double x) { x = std::clamp(x, 0.0, 1.0); return x*x*(3-2*x); };
-    const double k = smooth(p / .55), j = smooth((p - .12) / .88);
+    // Stretch toward the icon, then collapse into it; the phases overlap and
+    // both have zero slope at their endpoints, so there is no velocity jump.
+    const double k = LampSmooth(p / kStretchEnd), j = LampSmooth((p - kCollapseStart) / (1 - kCollapseStart));
     const double extra = icon.y - w.y - w.height;
     const double full = icon.y - w.y - extra * (1 - k);
     const double height = full * (1 - j), y = ty * height;

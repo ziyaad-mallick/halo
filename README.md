@@ -32,16 +32,22 @@ next to nothing when idle.
 Measured on a Core Ultra 7 258V (2026-10-18, process counters over 30 s idle, two runs):
 **0–16 ms CPU, 29.9–35.2 MB private memory**; the guardian uses 1.4 MB.
 
-## Requirements
+## Install or update (no compiler, 1 MB)
 
-- Windows 11 (x64)
-- [Git for Windows](https://git-scm.com/download/win)
+Run this in **PowerShell**. The same command installs Halo the first time and updates it over the old
+version later (your settings are kept; the previous `halo.exe` stays as `halo.previous.exe`):
 
-That's all. No Visual Studio, no Windows SDK, nothing else to install.
+```powershell
+irm https://github.com/ziyaad-mallick/halo/releases/latest/download/halo-win-x64.zip -OutFile "$env:TEMP\halo.zip"; Expand-Archive "$env:TEMP\halo.zip" "$env:TEMP\halo-install" -Force; powershell -ExecutionPolicy Bypass -File "$env:TEMP\halo-install\install.ps1"
+```
 
-## Install
+The taskbar disappears for a few seconds while Halo restarts, then the dock is back. To remove Halo:
+`powershell -ExecutionPolicy Bypass -File "$env:TEMP\halo-install\uninstall.ps1"`.
 
-Three steps, in **Git Bash**:
+## Build from source
+
+Needs Windows 11 (x64) and [Git for Windows](https://git-scm.com/download/win). No Visual Studio, no
+Windows SDK, nothing else to install. Three steps, in **Git Bash**:
 
 ```sh
 git clone https://github.com/ziyaad-mallick/halo.git && cd halo
@@ -67,7 +73,7 @@ of C++/WinRT headers if it has none).
 & "$env:LOCALAPPDATA\Halo\app\guardian.exe" --autostart on    # off removes it
 ```
 
-**Update** later with `git pull`, `tools/build.sh all`, then `tools/install.ps1` again.
+**Update** a source install with `git pull`, `tools/build.sh all`, then `tools/install.ps1` again.
 
 **Just try it** without installing: run `build/guardian.exe` straight from the build folder.
 

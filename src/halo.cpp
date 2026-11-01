@@ -107,7 +107,9 @@ constexpr UINT kMsgEdge = WM_APP + 40;  // halo::edge gesture: wParam kTop (Cont
 constexpr UINT kMsgTestNotifCenter = WM_APP + 21;  // HALO_TEST=1: toggle the Notification Center
 constexpr UINT kMsgTestMenu = WM_APP + 31;    // HALO_TEST=1: wParam = dock item; lParam 0 = open its menu, 1 = close, 100+r = hover row r, 200+r = choose row r
 constexpr UINT kMsgTestBounce = WM_APP + 30;  // HALO_TEST=1: wParam = dock item to bounce (no launch)
-constexpr UINT kGenieHoldMs = 620;  // dock stays up for the 320 ms scale effect + 300 ms (mods/halo-genie.wh.cpp)
+// Halo's own lamp/genie minimize+restore. Off: windows keep Windows' native animation (the lamp was laggy and unreliable).
+constexpr bool kLampGenie = false;
+constexpr UINT kGenieHoldMs = 750;  // dock stays up for the 480 ms lamp (lamp_geometry.h) + a slow app's restore wait + slack
 constexpr int kHotkeyQuit = 1;
 constexpr UINT_PTR kHideTimer = 1;
 constexpr UINT_PTR kPreviewTimer = 21;  // the pointer rested on a running app
@@ -671,7 +673,7 @@ void Halo::ApplySettings(bool themeFlipped) {
         Log(std::wstring(L"settings: HALO 2.0 ") + (c.halo2 ? L"on" : L"off"));
     }
     halo::edge::Configure(c.cc.hotCorner, c.cc.cornerWidth, c.cc.cornerDelay);
-    if (m_swoop) m_swoop->SetEnabled(!c.reduceMotion);
+    if (m_swoop) m_swoop->SetEnabled(kLampGenie && !c.reduceMotion);
     m_autoHide = !_wgetenv(L"HALO_TEST") && c.taskbar.autohide;
     if (!c.taskbar.autohide) Reveal();
     else if (!prev.taskbar.autohide && !m_trackingMouse) PointerLeave();
@@ -822,7 +824,7 @@ void Halo::BuildDock() {
     if (!m_tracker) {
         m_tracker = std::make_unique<WindowTracker>(m_hwnd, kMsgAppsChanged);
         m_swoop = std::make_unique<halo::Swoop>([this](HWND w, RECT const& from, RECT& icon) { return SwoopTarget(w, from, icon); },
-                                                !m_cfg.reduceMotion);
+                                                kLampGenie && !m_cfg.reduceMotion);
         for (HWND w : m_tracker->Windows()) m_swoop->Track(w);
         m_tracker->onWindow = [this](HWND w, bool added) {
             if (!m_swoop) return;

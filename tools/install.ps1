@@ -5,9 +5,11 @@
 param([string]$Halo = '', [string]$Guardian = '', [string]$Settings = '')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot
-if (!$Halo) { $Halo = Join-Path $repo 'build\halo.exe' }
-if (!$Guardian) { $Guardian = Join-Path $repo 'build\guardian.exe' }
-if (!$Settings) { $Settings = Join-Path $repo 'build\halo-settings.exe' }
+# Inside the release zip the exes sit next to this script; in a clone they are in build\.
+$bin = if (Test-Path (Join-Path $PSScriptRoot 'halo.exe')) { $PSScriptRoot } else { Join-Path $repo 'build' }
+if (!$Halo) { $Halo = Join-Path $bin 'halo.exe' }
+if (!$Guardian) { $Guardian = Join-Path $bin 'guardian.exe' }
+if (!$Settings) { $Settings = Join-Path $bin 'halo-settings.exe' }
 $app = Join-Path $env:LOCALAPPDATA 'Halo\app'
 New-Item -ItemType Directory -Force $app | Out-Null
 
@@ -21,6 +23,11 @@ if (Get-Process guardian -ErrorAction SilentlyContinue) {
 }
 # The guardian may have just TerminateProcess'd a halo that ignored WM_CLOSE; the
 # image stays locked for a moment after the process is gone.
+# One step back: the exe being replaced stays as halo.previous.exe (skipped when that file is what's being installed).
+$installed = Join-Path $app 'halo.exe'
+if ((Test-Path $installed) -and ((Resolve-Path $Halo).Path -ne (Join-Path $app 'halo.previous.exe'))) {
+    Copy-Item $installed (Join-Path $app 'halo.previous.exe') -Force -ErrorAction SilentlyContinue
+}
 foreach ($pair in @(@($Halo, 'halo.exe'), @($Guardian, 'guardian.exe'), @($Settings, 'halo-settings.exe'))) {
     if ($pair[1] -eq 'halo-settings.exe' -and !(Test-Path $pair[0])) { continue }
     for ($i = 0; ; $i++) {

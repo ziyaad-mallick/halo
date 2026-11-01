@@ -6,3 +6,4 @@ build/
 .claude/
 toolchain/
 .gstack/
+dist/

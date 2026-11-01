@@ -69,6 +69,11 @@ build_swoop_lamp_test() {
   "$CXX" "${COMMON[@]}" tools/swoop_lamp_geometry_test.cpp -o build/swoop_lamp_geometry_test.exe
 }
 
+build_swoop_handoff_probe() {
+  echo "== swoop_handoff_probe.exe"
+  "$CXX" "${COMMON[@]}" -DHALO_SWOOP_TEST src/swoop.cpp src/swoop_compositor.cpp tools/swoop_handoff_probe.cpp -o build/swoop_handoff_probe.exe -ldwmapi -ldcomp -ld3d11 -ldxgi -lole32 -luuid -lversion -luser32 -lgdi32
+}
+
 build_start_test() {
   echo "== start_test.exe"
   "$CXX" "${COMMON[@]}" src/usage.cpp tools/start_test.cpp -o build/start_test.exe -lpdh -luser32
@@ -94,6 +99,7 @@ case "${1:-halo}" in
   dock_hit_test) build_dock_hit_test ;;
   swoop_test) build_swoop_test ;;
   swoop_lamp_test) build_swoop_lamp_test ;;
+  swoop_handoff_probe) build_swoop_handoff_probe ;;
   settings_launch_test) build_settings_launch_test ;;
   start_test) build_start_test ;;
   notification_preview) build_notification_preview ;;
