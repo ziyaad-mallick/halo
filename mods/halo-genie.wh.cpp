@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              halo-genie
 // @name            Halo Genie
-// @description     macOS Scale-effect minimize/restore into Halo's dock icons (GPU compositor), plus a zoom for maximize/un-maximize.
-// @version         2.1.0
+// @description     Lamp-style minimize/restore into Halo's dock icons (GPU compositor), plus a zoom for maximize/un-maximize.
+// @version         2.2.0
 // @author          Ziyaad Mallick (fork of MacOS Minimize Animation by Abdullah Masood)
 // @include         *
 // @exclude         halo.exe
@@ -16,15 +16,15 @@
 /*
 # Halo Genie
 
-The macOS "Scale" minimize effect for [Halo](https://github.com/ziyaad-mallick/halo),
-the dock that replaces the Windows taskbar. Minimizing shrinks the window
-toward the app's dock icon along an ease-in-out path (about 320 ms, fading out
-over the last 30%); restoring is the exact reverse with a tiny spring settle.
+The lamp minimize effect for [Halo](https://github.com/ziyaad-mallick/halo),
+the dock that replaces the Windows taskbar. Minimizing bends the window
+toward the app's dock icon (about 320 ms, fading out over the last 30%);
+restoring reverses the effect.
 Maximize and un-maximize get a matching zoom (the window scales between its two
 rects, ease-out, no flash).
 
 The animation runs on the GPU compositor: the window is captured once into a
-DirectComposition surface, and scale, translate and opacity are
+DirectComposition surface, and clipped strips follow lamp-curve
 IDCompositionAnimation timelines committed once, so the DWM plays them at the
 display refresh rate with no per-frame CPU work in the host process.
 
@@ -385,6 +385,36 @@ static IDCompositionAnimation* MakeAnim(IDCompositionDevice* dev, const Track& t
     return an;
 }
 
+// Lamp geometry adapted from the MIT-licensed MacOS Minimize Animation modern
+// engine by Potassiumuncher and Abdullah Masood. Coordinates are screen pixels.
+static void LampVertex(double tx, double ty, double p, Geometry w, Geometry icon, double& x, double& y) {
+    bool mirror = icon.y + icon.height / 2 < w.y + w.height / 2;
+    if (mirror) {
+        w.y = -w.y - w.height;
+        icon.y = -icon.y - icon.height;
+        ty = 1 - ty;
+    }
+    double k = std::min(p / 0.3, 1.0), j = std::max((p - 0.3) / 0.7, 0.0);
+    double extra = icon.y - w.y - w.height;
+    double full = icon.y - w.y - extra * (1 - k);
+    double height = full * (1 - j), yy = ty * height;
+    // full can be zero for an icon aligned with the window's top edge.
+    double denom = std::abs(full) < 0.001 ? (full < 0 ? -0.001 : 0.001) : full;
+    x = w.x + tx * icon.width + tx * (w.width - icon.width) * (1 - j) * (1 - ty)
+        + tx * (w.width - icon.width) * (1 - k) * ty
+        + (icon.x - w.x) * (yy / (full + (full < 0 ? -0.1 : 0.1))) * k + (icon.x - w.x) * j
+        + sin((height - yy) / denom * 2 * kPi + kPi) * (w.x + w.width * tx - icon.x - icon.width * tx) / 7 * k;
+    y = w.y + yy + icon.y - w.y - height - extra * (1 - k);
+    if (mirror) y = -y;
+}
+
+struct LampStrip {
+    IDCompositionVisual* visual{};
+    IDCompositionScaleTransform* scale{};
+    IDCompositionTranslateTransform* move{};
+    IDCompositionTransform* group{};
+};
+
 // One D3D device per process, made on first use (injected into every process,
 // so nothing is created until an animation actually runs).
 static IDXGIDevice* AcquireDxgiDevice() {
@@ -472,7 +502,7 @@ static DWORD WINAPI Worker(LPVOID param) {
     // union of the two rects with a margin is enough.
     RECT dest = zoom ? a->toEst : RECT{(LONG)a->icon.x, (LONG)a->icon.y, (LONG)(a->icon.x + a->icon.width), (LONG)(a->icon.y + a->icon.height)};
     RECT box = Union(a->from, dest);
-    int pad = zoom ? 48 : (int)(std::max(sw, sh) * 0.06) + 32;
+    int pad = zoom ? 48 : (int)(std::max(sw, sh) * 0.25) + 32;
     box = {box.left - pad, box.top - pad, box.right + pad, box.bottom + pad};
     const int vLeft = box.left, vTop = box.top, vW = box.right - box.left, vH = box.bottom - box.top;
 
@@ -492,6 +522,7 @@ static DWORD WINAPI Worker(LPVOID param) {
     IDCompositionScaleTransform* scale = nullptr;
     IDCompositionTranslateTransform* move = nullptr;
     IDCompositionTransform* group = nullptr;
+    std::vector<LampStrip> strips;
     bool built = false;
 
     if (dxgi && SUCCEEDED(DCompositionCreateDevice(dxgi, __uuidof(IDCompositionDevice), (void**)&dev)) &&
@@ -553,16 +584,61 @@ static DWORD WINAPI Worker(LPVOID param) {
             scale->SetCenterX((float)(sw / 2)); scale->SetCenterY((float)(sh / 2));
         }
 
+        // Horizontal strips share one GPU surface. Each strip follows the lamp
+        // curve independently; DWM evaluates the timelines at display refresh.
+        if (!zoom) {
+            constexpr int count = 32;
+            Geometry win{(float)a->from.left, (float)a->from.top, (float)sw, (float)sh};
+            auto value = [=](int row, int property, double u) {
+                double p = rising ? CurveX(1 - u) : CurveX(u);
+                double l, y0, r, ignored, x1, y1;
+                double t0 = (double)row / count, t1 = (double)(row + 1) / count;
+                LampVertex(0, t0, p, win, a->icon, l, y0);
+                LampVertex(1, t0, p, win, a->icon, r, ignored);
+                LampVertex(0, t1, p, win, a->icon, x1, y1);
+                double scaleY = (y1 - y0) / (sh / count);
+                if (property == 0) return (r - l) / sw;
+                if (property == 1) return scaleY;
+                if (property == 2) return l - win.x;
+                return y0 - win.y - scaleY * sh * t0;
+            };
+            for (int row = 0; row < count && built; ++row) {
+                strips.emplace_back();
+                auto& s = strips.back();
+                IDCompositionRectangleClip* clip = nullptr;
+                built = SUCCEEDED(dev->CreateVisual(&s.visual)) && SUCCEEDED(dev->CreateScaleTransform(&s.scale)) &&
+                        SUCCEEDED(dev->CreateTranslateTransform(&s.move)) && SUCCEEDED(dev->CreateRectangleClip(&clip));
+                if (built) {
+                    IDCompositionTransform* parts[] = {s.scale, s.move};
+                    built = SUCCEEDED(clip->SetLeft(0.0f)) && SUCCEEDED(clip->SetRight((float)sw)) &&
+                            SUCCEEDED(clip->SetTop((float)(sh * row / count))) &&
+                            SUCCEEDED(clip->SetBottom((float)(sh * (row + 1) / count))) &&
+                            SUCCEEDED(s.visual->SetClip(clip)) && SUCCEEDED(s.visual->SetContent(surface)) &&
+                            SUCCEEDED(s.scale->SetScaleX((float)value(row, 0, 0))) &&
+                            SUCCEEDED(s.scale->SetScaleY((float)value(row, 1, 0))) &&
+                            SUCCEEDED(s.move->SetOffsetX((float)value(row, 2, 0))) &&
+                            SUCCEEDED(s.move->SetOffsetY((float)value(row, 3, 0))) &&
+                            SUCCEEDED(dev->CreateTransformGroup(parts, 2, &s.group)) &&
+                            SUCCEEDED(s.visual->SetTransform(s.group)) &&
+                            SUCCEEDED(visual->AddVisual(s.visual, TRUE, nullptr));
+                }
+                Rel(clip);
+            }
+            // The root only carries opacity and positioning for the lamp.
+            sx.f = sy.f = [](double) { return 1.0; };
+            tx.f = ty.f = [](double) { return 0.0; };
+            scale->SetCenterX(0.0f); scale->SetCenterY(0.0f);
+        }
         // Static first pose (the window exactly where it was, or at the icon for a
         // restore) so the ghost is on screen before the caller touches the real window.
         scale->SetScaleX((float)sx.f(0)); scale->SetScaleY((float)sy.f(0));
         move->SetOffsetX((float)tx.f(0)); move->SetOffsetY((float)ty.f(0));
         effect->SetOpacity((float)op.f(0));
         IDCompositionTransform* parts[2] = {scale, move};
-        built = SUCCEEDED(dev->CreateTransformGroup(parts, 2, &group)) &&
+        built = built && SUCCEEDED(dev->CreateTransformGroup(parts, 2, &group)) &&
                 SUCCEEDED(visual->SetOffsetX((float)(a->from.left - vLeft))) &&
                 SUCCEEDED(visual->SetOffsetY((float)(a->from.top - vTop))) &&
-                SUCCEEDED(visual->SetContent(surface)) && SUCCEEDED(visual->SetTransform(group)) &&
+                (!zoom || SUCCEEDED(visual->SetContent(surface))) && SUCCEEDED(visual->SetTransform(group)) &&
                 SUCCEEDED(visual->SetEffect(effect)) && SUCCEEDED(target->SetRoot(visual)) && SUCCEEDED(dev->Commit());
     }
     if (built) {
@@ -584,7 +660,37 @@ static DWORD WINAPI Worker(LPVOID param) {
         bool ok = asx && asy && atx && aty && aop &&
                   SUCCEEDED(scale->SetScaleX(asx)) && SUCCEEDED(scale->SetScaleY(asy)) &&
                   SUCCEEDED(move->SetOffsetX(atx)) && SUCCEEDED(move->SetOffsetY(aty)) &&
-                  SUCCEEDED(effect->SetOpacity(aop)) && SUCCEEDED(dev->Commit());
+                  SUCCEEDED(effect->SetOpacity(aop));
+        if (ok && !zoom) {
+            const int count = (int)strips.size();
+            Geometry win{(float)a->from.left, (float)a->from.top, (float)sw, (float)sh};
+            for (int row = 0; row < count && ok; ++row) {
+                Track tracks[4];
+                for (int prop = 0; prop < 4; ++prop) {
+                    tracks[prop].knots = {0, .05, .1, .15, .2, .25, .3, .35, .4, .45, .5, .55, .6, .65, .7, .75, .8, .85, .9, .95, 1};
+                    tracks[prop].f = [=](double u) {
+                        double p = rising ? CurveX(1-u) : CurveX(u);
+                        double l, y0, r, ignored, x1, y1;
+                        double t0 = (double)row / count, t1 = (double)(row + 1) / count;
+                        LampVertex(0, t0, p, win, a->icon, l, y0);
+                        LampVertex(1, t0, p, win, a->icon, r, ignored);
+                        LampVertex(0, t1, p, win, a->icon, x1, y1);
+                        double sy = (y1-y0)/(sh/count);
+                        if (prop == 0) return (r-l)/sw;
+                        if (prop == 1) return sy;
+                        if (prop == 2) return l-win.x;
+                        return y0-win.y-sy*sh*t0;
+                    };
+                }
+                IDCompositionAnimation* anims[4] = {};
+                for (int i = 0; i < 4; ++i) { anims[i] = MakeAnim(dev, tracks[i], dur); if (!anims[i]) ok = false; }
+                auto& s = strips[row];
+                if (ok) ok = SUCCEEDED(s.scale->SetScaleX(anims[0])) && SUCCEEDED(s.scale->SetScaleY(anims[1])) &&
+                             SUCCEEDED(s.move->SetOffsetX(anims[2])) && SUCCEEDED(s.move->SetOffsetY(anims[3]));
+                for (auto& anim : anims) Rel(anim);
+            }
+        }
+        if (ok) ok = SUCCEEDED(dev->Commit());
         Rel(asx); Rel(asy); Rel(atx); Rel(aty); Rel(aop);
         LARGE_INTEGER freq, t0, now;
         QueryPerformanceFrequency(&freq);
@@ -603,6 +709,7 @@ static DWORD WINAPI Worker(LPVOID param) {
     if (a->cloaked) { Cloak(a->hwnd, FALSE); DwmFlush(); }
     SetTransitions(a->hwnd, TRUE);
     a->firstShown = true;
+    for (auto& s : strips) { Rel(s.group); Rel(s.scale); Rel(s.move); Rel(s.visual); }
     Rel(group); Rel(scale); Rel(move); Rel(effect); Rel(surface); Rel(visual); Rel(target); Rel(dev); Rel(dxgi);
     if (ghost) DestroyWindow(ghost);
     {
