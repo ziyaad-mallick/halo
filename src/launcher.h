@@ -86,7 +86,7 @@ public:
 
 private:
     enum class Kind { App, File, Result, Settings, Power, MenuItem, AllApps,
-                      PowerMode, CcWifi, CcWifiMore, CcBt, CcBtMore, CcBright, CcVol, CcMute, CcPrev, CcPlay, CcNext, CcBack, CcRefresh, CcRow, CcQuick, CcAction, CcOutMore };
+                      PowerMode, CcWifi, CcWifiMore, CcBt, CcBtMore, CcBright, CcVol, CcMute, CcPrev, CcPlay, CcNext, CcBack, CcRefresh, CcRadioSettings, CcRow, CcQuick, CcAction, CcOutMore };
     struct Hit {
         D2D1_RECT_F r;
         Kind kind;

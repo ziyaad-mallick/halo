@@ -77,7 +77,7 @@ constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloCont
 enum class Id {
     None, WifiPill, BtPill, WifiText, BtText, Wifi, Bluetooth, RowTile, Airplane, Hotspot, Night, Dark, Dnd,
     DisplayTile, Bright, SoundTile, Vol, OutRow, OutDev, ListTile, WifiNet, BtDev, MediaTile, Prev, PlayPause, Next,
-    Snip, Cast, Settings, Battery, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut, Clock, Label, Back, DeviceListTile, DiscoveryAction
+    Snip, Cast, Settings, Battery, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut, Clock, Label, Back, DeviceListTile, DiscoveryAction, RadioSettings
 };
 bool Passive(Id id) {
     return id == Id::WifiPill || id == Id::BtPill || id == Id::RowTile || id == Id::DisplayTile || id == Id::SoundTile ||
@@ -1085,6 +1085,9 @@ void ControlCenter::Impl::Click(Item const& it) {
         case Id::Snip: LaunchAfterClose(L"ms-screenclip:"); return;
         case Id::Cast: LaunchAfterClose(L"ms-settings-connectabledevices:devicediscovery"); return;
         case Id::Settings: LaunchAfterClose(L"ms-settings:"); return;
+        case Id::RadioSettings:
+            LaunchAfterClose(expand == Expand::Wifi ? L"ms-settings:network-wifi" : L"ms-settings:bluetooth");
+            return;
         case Id::Lock:
             if (svc::DryRun()) { svc::Log(L"DRYRUN lock workstation"); break; }
             Close();
@@ -1208,7 +1211,8 @@ void ControlCenter::Impl::Layout() {
     // Details get their own bounded page: expanding devices must never bury the shell actions.
     if (outsOpen || expand != Expand::None) {
         height = std::min(MaxH(), kHomeH);
-        add(Id::Back, {x0, y, x1, y + headerH});
+        add(Id::Back, {x0, y, outsOpen ? x1 : x1 - 112, y + headerH});
+        if (!outsOpen) add(Id::RadioSettings, {x1 - 108, y, x1, y + headerH});
         y += headerH + kS2;
         const float footerTop = height - insetY - actionD;
         const float bottom = footerTop - kS3;
@@ -1556,15 +1560,19 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         switch (it.id) {
             case Id::Back: {
                 glyph(0xE72B, fIcon.get(), {r.left + kS2, r.top, r.left + kS2 + kS6, r.bottom}, kText);
-                txt(L"Control Center", fTitle.get(), {r.left + kS2 + kS6 + kS2, r.top, r.right - 112, r.bottom}, kText);
+                txt(L"Control Center", fTitle.get(), {r.left + kS2 + kS6 + kS2, r.top, r.right - (outsOpen ? 112 : kS2), r.bottom}, kText);
                 const size_t total = outsOpen ? outs.size() : expand == Expand::Wifi ? wifiRows.size() : btRows.size();
                 const size_t offset = outsOpen ? outOffset : listOffset, visible = outsOpen ? outVisible : listVisible;
-                if (visible && total > visible) {
+                if (outsOpen && visible && total > visible) {
                     const auto range = std::to_wstring(offset + 1) + L"–" + std::to_wstring(offset + visible) + L" / " + std::to_wstring(total);
                     txt(range, fSubR.get(), {r.right - 112, r.top, r.right - kS2, r.bottom}, kDim);
                 }
                 break;
             }
+            case Id::RadioSettings:
+                box(r, kRadiusSmall, kOff);
+                txt(L"Settings", fCap.get(), r, kText);
+                break;
             case Id::DeviceListTile: {
                 tile(r);
                 const wchar_t* title = outsOpen ? L"Audio output" : expand == Expand::Wifi ? L"Wi-Fi networks" : L"Bluetooth devices";

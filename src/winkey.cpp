@@ -38,7 +38,14 @@ LRESULT CALLBACK LowLevel(int code, WPARAM w, LPARAM l) {
             // Win can be held without Feed() having seen it (an injected Win from a remapper, or a Win
             // press before the hook started), so also ask the async key state: that was the leak that let
             // the stock Quick Settings open behind the panel.
-            const bool winHeld = g_track.winDown || ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000);
+            const bool winKey = k->vkCode == VK_LWIN || k->vkCode == VK_RWIN;
+            const bool physicallyDown = ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
+            if (down && !winKey) {
+                g_track.Reconcile(physicallyDown);
+                // Keep swallowing repeats of a shortcut key until its release, even if Win came up first.
+                if (!physicallyDown && !(GetAsyncKeyState(k->vkCode) & 0x8000)) g_swallow = 0;
+            }
+            const bool winHeld = g_track.winDown || physicallyDown;
             if (down && (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN)) g_swallow = 0;  // never stay stuck swallowing
             const bool ours = k->vkCode == 'A' || k->vkCode == 'N';  // Win+N: Halo's Notification Center
             if (ours && (g_swallow == k->vkCode || (down && winHeld && !g_swallow))) {

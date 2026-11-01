@@ -18,6 +18,10 @@ UINT ControlCenterMessage();  // posted to `target` on Win+A (wParam 0) or Win+N
 // The decision logic, separate from the hook so it can be unit tested.
 struct Tracker {
     bool winDown = false, other = false;
+    // A session transition can hide a release from the hook. Resync on the next non-Win key.
+    void Reconcile(bool physicallyDown) {
+        if (!physicallyDown) { winDown = false; other = false; }
+    }
     // Feed one key event; returns true when this was the Win release of a lone tap.
     bool Feed(DWORD vk, bool down) {
         if (vk == VK_LWIN || vk == VK_RWIN) {

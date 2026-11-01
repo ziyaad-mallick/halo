@@ -1540,6 +1540,15 @@ void Launcher::Hide() {
 void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
     auto const& st = settings::Get().start;
     const bool reduce = settings::Get().reduceMotion;
+    // The compact Halo 2 transition handles rise and fade without scaling the
+    // glass. Other selected effects use the same compositor motion as panels.
+    if (!reduce && (st.effect == settings::Effect::Bounce || st.effect == settings::Effect::Swipe || st.effect == settings::Effect::Swoop)) {
+        const float2 travel{0, ui::kEnterTravel * m_s};
+        const float2 corner{CornerX(), 1.0f};
+        if (in) motion::In(m_comp, v, rest, travel, st, corner);
+        else motion::Out(m_comp, v, rest, travel, st, corner);
+        return;
+    }
     const float speed = settings::Speed(st);
     auto ms = [&](float x) { return std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(x / speed)))); };
     v.StopAnimation(L"Scale");
@@ -3074,9 +3083,14 @@ void Launcher::LayoutRight() {
     m_usageVisual.IsVisible(false);
     m_sliderShapes.IsVisible(false);
     const float top = ty1 + tk::kInGroup * s, bottom = m_barTop - pad;
-    const float header = 28 * s, rowH = 32 * s, rowsTop = top + header + tk::kInCard / 2 * s;
+    const float header = 28 * s, rowH = 32 * s;
+    const bool radio = m_detail != Detail::Output;
+    const float rowsTop = top + header + tk::kInCard / 2 * s + (radio ? rowH : 0);
     add(Kind::CcBack, 0, R(x0, top, x0 + 200 * s, top + header));
-    if (m_detail != Detail::Output) add(Kind::CcRefresh, 0, R(x1 - 88 * s, top, x1, top + header));
+    if (radio) {
+        add(Kind::CcRefresh, 0, R(x1 - 88 * s, top, x1, top + header));
+        add(Kind::CcRadioSettings, 0, R(x0, top + header, x1, top + header + rowH));
+    }
     const int total = static_cast<int>(m_detail == Detail::Wifi ? m_wifiRows.size() : m_detail == Detail::Bt ? m_btRows.size() : m_outs.size());
     m_ccRowsFit = std::max(1, static_cast<int>(std::floor((bottom - rowsTop) / rowH)));
     m_ccScroll = std::clamp(m_ccScroll, 0, std::max(0, total - m_ccRowsFit));
@@ -3275,6 +3289,10 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
                 c.ink->SetOpacity(1.0f);
                 break;
             }
+            case Kind::CcRadioSettings:
+                txt.Draw(dc, m_detail == Detail::Wifi ? L"Open Wi-Fi settings" : L"Open Bluetooth settings", fSub.get(),
+                         r, c.soft.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+                break;
             case Kind::CcRow: {
                 if (m_detail == Detail::Wifi) {
                     auto const& n = m_wifiRows[h.index];
@@ -3370,7 +3388,8 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
             const int back = CcIndexOf(Kind::CcBack, 0);
             if (back >= 0) {
                 auto b = at(m_ccBase[back].r);
-                txt.Draw(dc, message, fSub.get(), R(b.left, b.bottom + 12 * s, at(m_rightRect).right - start::kRightPad * s, b.bottom + 56 * s), c.muted.get(),
+                const float messageTop = b.bottom + (out ? 12 : 44) * s;
+                txt.Draw(dc, message, fSub.get(), R(b.left, messageTop, at(m_rightRect).right - start::kRightPad * s, messageTop + 44 * s), c.muted.get(),
                          DWRITE_TEXT_ALIGNMENT_LEADING);
             }
         }
@@ -3553,6 +3572,12 @@ void Launcher::CcClick(Hit const& hit) {
         case Kind::CcPlay: m_media.PlayPause(); return;
         case Kind::CcNext: m_media.Next(); return;
         case Kind::CcBack: ToggleDetail(Detail::None); return;
+        case Kind::CcRadioSettings: {
+            const bool wifi = m_detail == Detail::Wifi;
+            Hide();
+            OpenQuietly(wifi ? L"ms-settings:network-wifi" : L"ms-settings:bluetooth");
+            return;
+        }
         case Kind::CcRefresh: {
             const bool wifi = m_detail == Detail::Wifi;
             const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();

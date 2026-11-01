@@ -311,6 +311,7 @@ struct NotificationCenter::Impl {
     HWND hwnd{};
     float s = 1;
     RECT work{};
+    int monitorBottom = 0;
     float availH = 800;  // logical px a column of content may use
     // Geometry. Standalone these are the constants; attached to the Control Center the width is the CC's
     // and the calendar drops its big date (the CC header has it) and may use shorter rows.
@@ -355,7 +356,16 @@ struct NotificationCenter::Impl {
         if (settings::Get().reduceMotion) cfg.effect = settings::Effect::None;
         return cfg;
     }
-    float DockClearance() const { return settings::Get().halo2 ? settings::Get().taskbar.iconSize + 2 * ui::kS6 : 0; }
+    float DockClearance() const {
+        if (!settings::Get().halo2) return 0;
+        const auto& cfg = settings::Get();
+        const float icon = 28.0f * cfg.taskbar.iconSize / 48.0f;
+        const float magnification = cfg.reduceMotion ? 1.0f : 1.0f + (cfg.taskbar.magnification - 100) / 100.0f * 1.14f;
+        // Same resting pill and peak icon geometry as Halo::ComputeMetrics, plus the dock's 6 px bottom margin.
+        const float dockHeight = std::max(icon + 22.0f, 11.0f + icon * magnification) + 6.0f;
+        // rcWork may already exclude space at the bottom; count only the portion still inside it.
+        return std::max(0.0f, dockHeight + (work.bottom - monitorBottom) / s);
+    }
     void BuildFonts();
     std::vector<Row> BuildRows();
     void Update(bool firstShow);
@@ -892,8 +902,7 @@ wuc::CompositionBrush NotificationCenter::Impl::NoiseBrush(int w, int h) {
 // ---------------------------------------------------------------------------------------------
 // cards
 
-// Same glass recipe as the dock pill and the Control Center: blurred backdrop, #16161A tint at 50%,
-// 2.5% grain, 1 px gradient rim.
+// Halo 2 uses the Start panel's surface settings and palette; classic retains Control Center glass.
 void NotificationCenter::Impl::CreateCard(Card& c, bool backgroundOnly) {
     const float wPx = std::ceil(kW * s), hPx = std::ceil(c.row.h * s);
     c.outer = comp.CreateContainerVisual();
@@ -921,8 +930,10 @@ void NotificationCenter::Impl::CreateCard(Card& c, bool backgroundOnly) {
 
         auto tint = comp.CreateSpriteVisual();
         tint.RelativeSizeAdjustment({1, 1});
-        const auto& gcc = settings::Get().cc;  // the notification column follows the Control Center's glass
-        tint.Brush(comp.CreateColorBrush(theme::C(theme::Glass(gcc).tint)));
+        const auto& cfg = settings::Get();
+        const settings::Surface& surface = cfg.halo2 ? static_cast<const settings::Surface&>(cfg.start)
+                                                       : static_cast<const settings::Surface&>(cfg.cc);
+        tint.Brush(comp.CreateColorBrush(theme::C(theme::Glass(surface).tint)));
         c.vis.Children().InsertAtTop(tint);
 
         if (noise) {
@@ -931,18 +942,6 @@ void NotificationCenter::Impl::CreateCard(Card& c, bool backgroundOnly) {
             n.Opacity(theme::P().noise);
             n.Brush(noise);
             c.vis.Children().InsertAtTop(n);
-        }
-        if (backgroundOnly) {  // one static specular wash over the shared glass
-            auto sheen = comp.CreateLinearGradientBrush();
-            sheen.StartPoint({0, 0});
-            sheen.EndPoint({0, 1});
-            const auto white = theme::Dark() ? 0x18 : 0x48;
-            sheen.ColorStops().Append(comp.CreateColorGradientStop(0, winrt::Windows::UI::ColorHelper::FromArgb(white, 255, 255, 255)));
-            sheen.ColorStops().Append(comp.CreateColorGradientStop(ui::kNotificationGlossEnd, winrt::Windows::UI::ColorHelper::FromArgb(0, 255, 255, 255)));
-            auto gloss = comp.CreateSpriteVisual();
-            gloss.RelativeSizeAdjustment({1, 1});
-            gloss.Brush(sheen);
-            c.vis.Children().InsertAtTop(gloss);
         }
     }
 
@@ -966,7 +965,20 @@ void NotificationCenter::Impl::CreateCard(Card& c, bool backgroundOnly) {
         c.rim.CornerRadius({rad - t / 2, rad - t / 2});
         c.rim.Size({wPx - t, hPx - t});
         auto sprite = comp.CreateSpriteShape(c.rim);
-        sprite.StrokeBrush(comp.CreateColorBrush(theme::C(theme::P().edge.a ? theme::P().edge : theme::P().rimLow)));
+        if (backgroundOnly && settings::Get().halo2) {
+            auto rim = comp.CreateLinearGradientBrush();
+            rim.MappingMode(wuc::CompositionMappingMode::Relative);
+            rim.StartPoint({0, 0});
+            rim.EndPoint({0, 1});
+            auto const& p = theme::P();
+            rim.ColorStops().Append(comp.CreateColorGradientStop(0.0f, theme::C(p.rimTop)));
+            rim.ColorStops().Append(comp.CreateColorGradientStop(0.35f, theme::C(p.rimMid)));
+            rim.ColorStops().Append(comp.CreateColorGradientStop(0.7f, theme::C(p.rimLow)));
+            rim.ColorStops().Append(comp.CreateColorGradientStop(1.0f, theme::C(p.rimBottom)));
+            sprite.StrokeBrush(rim);
+        } else {
+            sprite.StrokeBrush(comp.CreateColorBrush(theme::C(theme::P().edge.a ? theme::P().edge : theme::P().rimLow)));
+        }
         sprite.StrokeThickness(t);
         auto rimVisual = comp.CreateShapeVisual();
         rimVisual.RelativeSizeAdjustment({1, 1});
@@ -998,9 +1010,9 @@ void NotificationCenter::Impl::Draw(Card& c, bool hover, int part) {
         if (box) {
             const float inset = ui::kNotificationInset;
             const auto shape = D2D1::RoundedRect(D2D1::RectF(inset, 0, kW - inset, r.h), ui::kRadiusSmall, ui::kRadiusSmall);
-            br->SetColor(theme::Dark() ? ColorF(1, 1, 1, hover ? 0.10f : 0.055f) : ColorF(1, 1, 1, hover ? 0.65f : 0.42f));
+            br->SetColor(hover ? theme::P().fillHover : theme::P().fill);
             dc->FillRoundedRectangle(shape, br.get());
-            br->SetColor(theme::Dark() ? ColorF(1, 1, 1, 0.07f) : ColorF(0, 0, 0, 0.05f));
+            br->SetColor(theme::P().line);
             dc->DrawRoundedRectangle(shape, br.get(), 0.5f);
         }
         const bool interactive = r.kind == K::Notif || r.kind == K::Group || r.kind == K::Collapse;
@@ -1408,6 +1420,7 @@ void NotificationCenter::Impl::ApplyGeometry() {
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(hm, &mi);
     work = mi.rcWork;
+    monitorBottom = mi.rcMonitor.bottom;
     UINT dx = 96, dy = 96;
     GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
     s = dx / 96.0f;

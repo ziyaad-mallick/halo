@@ -33,22 +33,21 @@ bool PtInRect(RECT* r, POINT p) { return p.x>=r->left && p.x<r->right && p.y>=r-
 void InflateRect(RECT* r,int x,int y) {r->left-=x;r->right+=x;r->top-=y;r->bottom+=y;}
 ULONGLONG GetTickCount64() { return tick; }
 void SetWindowPos(int,int,int x,int y,int w,int h,int) { window={x,y,x+w,y+h}; }
-namespace ui { constexpr float kS4=16; }
+namespace ui { constexpr float kS4=16, kS6=24; }
 namespace motion { constexpr float kPad=16; }
 namespace settings {
-struct Config { struct {bool closeOnLeave=true;} cc; struct {int hideDelay=500;} taskbar; bool halo2=true; } cfg;
+struct Config { struct {bool closeOnLeave=true;} cc; struct {int hideDelay=500, iconSize=48, magnification=150;} taskbar; bool halo2=true, reduceMotion=false; } cfg;
 Config& Get() {return cfg;}
 }
 constexpr float kEdge=16, kAttachGap=12;
 struct Fixture {
  enum class St { Open, Closed }; St st=St::Open;
  bool attached=false, byPointer=true, entered=false;
- ULONGLONG outSince=0; float s=1; RECT work{0,0,1000,768}, anchorRc{};
+ ULONGLONG outSince=0; float s=1; RECT work{0,0,1000,768}, anchorRc{}; int monitorBottom=768;
  int hwnd=1, closed=0, m_width=1000; float totalH=300, winH=0, availH=640,kW=360;
  std::vector<int> dying;
  void Dismissed() {++closed; st=St::Closed;}
- float DockClearance() {return 96;}
-''' + method('CheckPointer') + '\n' + method('Place') + r'''
+''' + src[src.index('    float DockClearance() const {'):src.index('\n    void BuildFonts();')].strip() + '\n' + method('CheckPointer') + '\n' + method('Place') + r'''
 };
 int main() {
  Fixture edge; edge.CheckPointer(); tick=599; edge.CheckPointer(); assert(!edge.closed);
@@ -61,11 +60,21 @@ int main() {
  tick+=300; cursor={700,500}; crossing.CheckPointer(); assert(crossing.outSince==0);
  Fixture drag; held=true; cursor={100,100}; drag.CheckPointer(); tick+=2000; drag.CheckPointer(); assert(!drag.closed); held=false;
  for(float scale : {1.f,1.25f,1.5f,2.f}) for(long height : {768,1080,1440}) {
-  Fixture f; f.s=scale; f.work.bottom=height; f.totalH=std::min(400.f,height/scale-128); f.availH=f.totalH; f.Place();
+  Fixture f; f.s=scale; f.work.bottom=height; f.monitorBottom=height; f.totalH=std::min(400.f,height/scale-128); f.availH=f.totalH; f.Place();
   const float bottom=window.top+motion::kPad*scale+f.totalH*scale;
   assert(std::abs(bottom-(height-(kEdge+f.DockClearance())*scale))<2);
+  assert(f.DockClearance() > 60 && f.DockClearance() < 62);
   assert(window.top+motion::kPad*scale>=0);
  }
+ Fixture reserved; reserved.monitorBottom=768; reserved.work.bottom=700;
+ assert(reserved.DockClearance()==0);
+ reserved.Place(); assert(std::abs((window.top+motion::kPad+reserved.totalH)-(700-kEdge))<2);
+ settings::cfg.taskbar.iconSize=64; settings::cfg.taskbar.magnification=200;
+ Fixture large; assert(large.DockClearance()>90);
+ settings::cfg.reduceMotion=true; assert(large.DockClearance()<70);
+ settings::cfg.halo2=false; Fixture classic; classic.Place(); assert(window.top+motion::kPad==kEdge);
+ Fixture attached; attached.attached=true; attached.anchorRc={400,600,760,750}; attached.Place();
+ assert(std::abs((window.top+motion::kPad+attached.totalH)-(attached.anchorRc.top-kAttachGap))<2);
  puts("notification leave/placement: all checks passed");
 }
 '''
