@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "icons.h"
+#include "notif_column.h"
 #include "services.h"
 #include "start_widgets.h"
 #include "usage.h"
@@ -43,8 +44,9 @@ namespace wuc = winrt::Windows::UI::Composition;
 
 // What the panel needs from the dock that owns it.
 struct LauncherHost {
-    // The dock's glass (blur, tint, grain, rim), sized by its parent. The arguments are the grain's height in px and the surface's settings (opacity, tint).
-    std::function<wuc::ContainerVisual(int, settings::Surface const&)> glass;
+    // The dock's glass (blur, tint, grain, rim), sized by its parent. The arguments are the grain's height in px, the surface's settings (opacity, tint), the grain's width and the corner radius.
+    // `w` is the grain's width in px and `radius` the rim's corner radius in px (0: the dock's).
+    std::function<wuc::ContainerVisual(int, settings::Surface const&, int, float)> glass;
     // The dock's icon brush for a launch target (a .lnk, shell:AppsFolder\<AUMID> or exe), null if it has none.
     std::function<wuc::CompositionBrush(std::wstring const&)> appIcon;
     // Brings the app to the front if it is running, else starts it.
@@ -86,7 +88,8 @@ public:
 
 private:
     enum class Kind { App, File, Result, Settings, Power, MenuItem, AllApps,
-                      PowerMode, CcWifi, CcWifiMore, CcBt, CcBtMore, CcBright, CcVol, CcMute, CcPrev, CcPlay, CcNext, CcBack, CcRefresh, CcRadioSettings, CcRow, CcQuick, CcAction, CcOutMore };
+                      PowerMode, CcWifi, CcWifiMore, CcBt, CcBtMore, CcBright, CcVol, CcMute, CcPrev, CcPlay, CcNext, CcBack, CcRefresh, CcRadioSettings, CcRow, CcQuick, CcAction, CcOutMore,
+                      CcToggle };  // CcToggle: a tile's logo zone (index 0 Wi-Fi, 1 Bluetooth, 10+i quick tile i); the rest of the tile opens its menu or page
     struct Hit {
         D2D1_RECT_F r;
         Kind kind;
@@ -177,6 +180,9 @@ private:
     void ShiftHits();                                            // HALO 2.0 home: the scrolled, clipped rects of the home hits
     void BlinkCaret();
     void OpenMotion(wuc::Visual const& v, winrt::Windows::Foundation::Numerics::float3 rest, bool in);
+    bool DockLikeMotion() const;
+    float OpenTravel() const;
+    void ParkBelow(wuc::Visual const& v, winrt::Windows::Foundation::Numerics::float3 rest);
     void DrawHeader(ID2D1DeviceContext* dc, float ox, float oy);
     void DrawWidgets(ID2D1DeviceContext* dc, float ox, float oy);  // greeting, quote, clock, month, battery, power mode
     void DrawRight(ID2D1DeviceContext* dc, float ox, float oy);    // tiles, sliders, now playing / the radio list
@@ -201,7 +207,23 @@ private:
     void OnServiceMessage(UINT m);
 
     bool m_h2 = false;
-    float m_lw = 0;                        // the left column's width (== m_w without halo2)
+    // HALO 2.0 panel = [notifications + calendar | middle | control centre]. Everything below the glass keeps its own
+    // coordinates from the middle column's left edge (x = 0); m_nw is how far that is from the panel's left edge, and
+    // m_w the width of middle + right. Pointer x from the window is converted with PX().
+    float m_nw = 0;                        // the notification card's width plus the gap after it (px); 0 without halo2
+    float m_notifW = 0, m_gap = 0;         // the notification card's own width, and the gap between cards
+    float PanelW() const { return m_nw + m_w; }
+    float PX(float windowX) const { return windowX - m_shadowM - m_nw; }
+    std::unique_ptr<NotifColumn> m_notifCol;
+    wuc::ContainerVisual m_notifRoot{nullptr};
+    // The dock's magnification wave for the app icons: one property set the UI thread writes the pointer into, and per-icon
+    // expression animations the compositor evaluates every frame (no animation is created per mouse move).
+    wuc::CompositionPropertySet m_wave{nullptr};
+    bool m_waveOn = false;
+    void AttachWave(IconV const& ic, float cx, float cy, float h);
+    void MoveWave(float x, float panelY);
+    bool m_pressedNotif = false;           // the button went down in the notification column
+    float m_lw = 0;                        // the middle column's width (== m_w without halo2)
     start::LeftPlan m_plan;
     start::RightPlan m_rplan;
     D2D1_RECT_F m_greetRect{}, m_cardRect{}, m_calRect{}, m_modeRect{}, m_rightRect{};

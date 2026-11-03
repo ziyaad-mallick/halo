@@ -154,4 +154,19 @@ bool Unpin(std::wstring const& path) {
     return ok;
 }
 
+bool Move(std::wstring const& path, std::wstring const& anchor, bool after) {
+    if (path.empty() || anchor.empty() || !_wcsicmp(path.c_str(), anchor.c_str())) return false;
+    std::vector<std::wstring> paths;
+    ReadPaths(paths);
+    auto same = [](std::wstring const& want) { return [&want](std::wstring const& p) { return !_wcsicmp(p.c_str(), want.c_str()); }; };
+    auto from = std::find_if(paths.begin(), paths.end(), same(path));
+    if (from == paths.end()) return false;
+    std::wstring moved = *from;
+    paths.erase(from);
+    auto at = std::find_if(paths.begin(), paths.end(), same(anchor));
+    if (at == paths.end()) return false;  // nothing written: the list is untouched
+    paths.insert(after ? at + 1 : at, std::move(moved));
+    return WritePaths(paths);
+}
+
 }  // namespace halo::pins

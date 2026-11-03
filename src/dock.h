@@ -83,6 +83,14 @@ public:
     // Darkens icon `index` while the button is down on it; -1 lets go.
     void SetPressed(int index);
 
+    // Drag to reorder (pinned icons only; `index` and the arguments below are into the last SetItems). BeginDrag
+    // lifts the icon and glues it to the pointer, Reorder moves it to slot `to` while the others slide aside, and
+    // EndDrag eases it from the pointer into its slot. False from BeginDrag = not draggable.
+    bool BeginDrag(int index);
+    void Reorder(int from, int to);
+    void EndDrag();
+    bool Dragging() const { return m_dragId != 0; }
+
     // Bounces icon `index` three times, or until it is running.
     void Bounce(int index);
 
@@ -130,6 +138,7 @@ private:
     };
     float DotSize() const;
     float IconY() const;  // Offset.Y of an icon at rest
+    size_t EntryIndex(int live) const;  // index into m_entries of the live (not leaving) icon `live`, or m_entries.size()
     Entry MakeEntry(Item const& item, bool instant);
     void AnimateTo(winrt::Windows::UI::Composition::CompositionObject const& target, wchar_t const* property,
                    float to, int ms);
@@ -159,6 +168,7 @@ private:
     bool m_h2 = false;           // HALO 2.0 at construction (the dock is rebuilt when it flips)
     float m_shift = 0.0f;        // (cluster - widgets) / 2: where the app icons' centre sits relative to the dock's
     unsigned m_magnetId = 0;     // the entry id pulled toward the pointer
+    unsigned m_dragId = 0;       // the entry id being dragged to a new slot, 0 = none
     winrt::Windows::UI::Composition::SpriteVisual m_clusterDivider{nullptr};
     float m_clusterWidth = 0.0f;
     float m_dividerWidth = 0.0f;

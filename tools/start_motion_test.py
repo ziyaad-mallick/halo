@@ -20,7 +20,7 @@ before_direction = re.sub(r'    if \(st.effect == settings::Effect::None\) \{.*?
 checks = {
     'close preserves active offset': 'v.StopAnimation(L"Offset")' not in before_direction,
     'close preserves active opacity': 'v.StopAnimation(L"Opacity")' not in before_direction,
-    'opening has a bounded offset transition': 'slide.Duration(ms(motion::kFadeInMs))' in body,
+    'opening has a bounded offset transition': 'const float fadeInMs = ' in body and 'slide.Duration(ms(fadeInMs))' in body,
     'close takes current presentation pose': 'slide.InsertKeyFrame(0.0f' not in body[body.index('    } else {\n        auto down'):],
     'device setup yields until after first layout': 'StartServices();' not in show and
         'SetTimer(m_hwnd, kServicesTimer' in show and show.index('Build();') < show.index('SetTimer(m_hwnd, kServicesTimer'),

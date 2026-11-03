@@ -239,6 +239,8 @@ private:
     void OpenMenuFor(int item);
     void ReloadPins();
     void PointerMove(float x, float y = 0.0f);
+    void DragMove(float x);             // with the button down on a pinned icon: start / continue a reorder
+    void MoveItem(int from, int to);    // drag step: dock order, item lists and pins.txt
     void PointerLeave();
     void Reveal();
     void OpenLauncher();
@@ -246,9 +248,6 @@ private:
     // closed together: Win+A, Win+N, the edge gestures and the test messages all come through here.
     void OpenPanel(bool byPointer = false, bool withNotifs = true);
     void ClosePanel();
-    // HALO 2.0: the right side opens the notification column on its own (with the calendar), not the Control Center.
-    void OpenNotifications(bool byPointer = false);
-    void ToggleNotifications();
     void TogglePanel() { if (m_cc && m_cc->IsOpen()) ClosePanel(); else OpenPanel(); }
     halo::LauncherAnchor LauncherAnchorNow() const;
     std::wstring LaunchTarget(RunningApp const& app) const;
@@ -295,6 +294,8 @@ private:
     std::unique_ptr<halo::ControlCenter> m_cc;
     bool m_trackingMouse = false;
     int m_pressed = -1;  // the icon the mouse button went down on
+    float m_pressX = 0;       // ... and where, for telling a click from a drag
+    bool m_dragging = false;  // a pinned icon is being dragged to a new place (m_pressed is its current index)
     bool m_pressedStart = false;  // the button went down on the Start logo
     Dock::Kind m_pressedWidget = Dock::Kind::None;  // HALO 2.0: ... or on the Wi-Fi / volume widget
     bool m_autoHide = true;  // off under HALO_TEST
@@ -399,7 +400,7 @@ bool Halo::Create(HINSTANCE inst) {
             });
             Step(L"launcher", [&] {
                 halo::LauncherHost host;
-                host.glass = [this](int noiseHeight, halo::settings::Surface const& g) { return BuildPill(noiseHeight, 0.0f, &g); };
+                host.glass = [this](int noiseHeight, halo::settings::Surface const& g, int noiseWidth, float radius) { return BuildPill(noiseHeight, radius, &g, noiseWidth); };
                 host.appIcon = [this](std::wstring const& target) { return IconBrushFor(target); };
                 host.launch = [this](std::wstring const& target) { LaunchRecent(target); };
                 host.closed = [this] { if (!m_trackingMouse) PointerLeave(); };  // the dock may auto-hide again
@@ -695,6 +696,7 @@ void Halo::RebuildDock(bool keepIcons) {
     KillTimer(m_hwnd, kPreviewGrace);
     m_hoverItem = -1;
     m_pressed = -1;
+    m_dragging = false;  // the dock it belonged to is going away
     m_label.reset();
     m_dock->Detach();
     m_dock.reset();
@@ -882,6 +884,7 @@ void Halo::RefreshDock() {
     // Indices refer to the old app list. Clear them before ReleaseCapture,
     // which synchronously reenters WM_CAPTURECHANGED.
     m_hoverItem = -1;
+    if (std::exchange(m_dragging, false) && m_dock) m_dock->EndDrag();  // the order is already saved, step by step
     m_pressed = -1;
     m_pressedStart = false;
     m_pressedWidget = Dock::Kind::None;
@@ -1178,9 +1181,66 @@ void Halo::ShowPreviewsFor(int item) {
     m_previews->Show(wins, m_full.left + static_cast<int>(cx), GetPillRectScreen().top, m_monitor, m_scale.v);
 }
 
+// A pinned icon pressed and pulled sideways more than a few px is a drag: it follows the pointer and, as it passes
+// the slot of another pinned icon, takes that slot (the others slide aside). Unpinned icons have no place to move to.
+void Halo::DragMove(float x) {
+    if (!m_dock || m_pressed < 0 || m_state != State::Shown) return;
+    if (!m_dragging) {
+        if (std::abs(x - m_pressX) < m_scale.f(6)) return;
+        if (m_pressed >= static_cast<int>(m_items.size()) || m_items[m_pressed].launch.empty()) return;
+        if (!m_dock->BeginDrag(m_pressed)) return;
+        m_dragging = true;
+        m_hoverItem = -1;
+        KillTimer(m_hwnd, kPreviewTimer);
+        HidePreviews(true);
+        if (m_label) m_label->Hide();
+    }
+    int pinned = 0;
+    while (pinned < static_cast<int>(m_items.size()) && !m_items[pinned].launch.empty()) pinned++;
+    int best = m_pressed;
+    float bestDist = std::abs(m_dock->RestIconCenter(m_pressed).first - x);
+    for (int i = 0; i < pinned; i++) {
+        float d = std::abs(m_dock->RestIconCenter(i).first - x);
+        if (d < bestDist) { bestDist = d; best = i; }
+    }
+    if (best != m_pressed) MoveItem(m_pressed, best);
+}
+
+void Halo::MoveItem(int from, int to) {
+    const int n = static_cast<int>(m_items.size());
+    if (from == to || from < 0 || to < 0 || from >= n || to >= n) return;
+    Item item = m_items[from];
+    std::wstring name = from < static_cast<int>(m_appNames.size()) ? m_appNames[from] : std::wstring();
+    m_items.erase(m_items.begin() + from);
+    m_items.insert(m_items.begin() + to, item);
+    if (from < static_cast<int>(m_appNames.size()) && to < static_cast<int>(m_appNames.size())) {
+        m_appNames.erase(m_appNames.begin() + from);
+        m_appNames.insert(m_appNames.begin() + to, name);
+    }
+    m_dock->Reorder(from, to);
+    m_pressed = to;
+    Log(L"drag: " + std::to_wstring(from) + L" -> " + std::to_wstring(to));
+    // Persist against a neighbour that is still pinned (the dock may show fewer icons than pins.txt lists).
+    const bool before = to + 1 < n && !m_items[to + 1].launch.empty();
+    const std::wstring& anchor = before ? m_items[to + 1].launch : m_items[to > 0 ? to - 1 : 0].launch;
+    if (anchor.empty() || !halo::pins::Move(item.launch, anchor, !before)) return;
+    auto same = [](std::wstring const& want) { return [&want](PinnedApp const& a) { return !_wcsicmp(a.linkPath.c_str(), want.c_str()); }; };
+    auto moved = std::find_if(m_apps.begin(), m_apps.end(), same(item.launch));
+    if (moved == m_apps.end()) return;
+    PinnedApp app = std::move(*moved);
+    m_apps.erase(moved);
+    auto at = std::find_if(m_apps.begin(), m_apps.end(), same(anchor));
+    if (at == m_apps.end()) { m_apps.push_back(std::move(app)); return; }
+    m_apps.insert(before ? at : at + 1, std::move(app));
+}
+
 void Halo::PointerMove(float x, float y) {
     if (m_autoHide) Reveal();
     Dock::Target target;
+    if (m_dragging && m_dock) {  // the dragged icon follows the pointer; no hover name or preview strip meanwhile
+        m_dock->OnPointerMove(x);
+        return;
+    }
     if (m_dock) {
         m_dock->OnPointerMove(x);
         target = m_dock->HitTarget(x, y);
@@ -1477,19 +1537,6 @@ void Halo::OpenPanel(bool byPointer, bool withNotifs) {
     }
 }
 
-void Halo::OpenNotifications(bool byPointer) {
-    if (!m_notif || m_notif->IsOpen()) return;
-    m_notif->SetAnchor(RECT{});  // standalone: the full column at the right edge, calendar included
-    m_notif->Open(byPointer);
-    Log(L"panel: notifications opened (HALO 2.0)");
-}
-
-void Halo::ToggleNotifications() {
-    if (m_notif && m_notif->IsOpen()) m_notif->Close();
-    else OpenNotifications();
-}
-
-
 void Halo::ClosePanel() {
     KillTimer(m_hwnd, kPanelStagger);
     if (m_cc) m_cc->Close();   // its onHidden closes the notification column too
@@ -1507,9 +1554,8 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     if (m == halo::winkey::ControlCenterMessage()) {  // Win+A (wParam 0) / Win+N (1): both toggle the one panel
-        if (m_cfg.halo2) {  // Win+A is Start (it hosts the control centre), Win+N the notifications and calendar
-            if (w == 1) ToggleNotifications();
-            else OpenLauncher();
+        if (m_cfg.halo2) {  // Start hosts both the notifications + calendar (left) and the control centre (right)
+            OpenLauncher();
         } else {
             TogglePanel();
         }
@@ -1522,6 +1568,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, m_hwnd, 0};
                 m_trackingMouse = TrackMouseEvent(&tme);
             }
+            if (m_pressed >= 0 && (w & MK_LBUTTON)) DragMove(mx);
             PointerMove(mx, my);
             return 0;
         case WM_MOUSELEAVE:
@@ -1549,7 +1596,6 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case kMsgTestControlCenter: case kMsgTestNotifCenter:
             if (_wgetenv(L"HALO_TEST")) {
                 if (!m_cfg.halo2) TogglePanel();
-                else if (m == kMsgTestNotifCenter) ToggleNotifications();
                 else OpenLauncher();
             }
             return 0;
@@ -1584,9 +1630,8 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                     (q == QUNS_BUSY || q == QUNS_RUNNING_D3D_FULL_SCREEN || q == QUNS_PRESENTATION_MODE))
                     return 0;
             }
-            if (m_cfg.halo2) {  // the right side is notifications + calendar; the top swipe goes to Start (it hosts the control centre)
-                if (w == halo::edge::kTop) OpenLauncher();
-                else OpenNotifications(true);
+            if (m_cfg.halo2) {  // every edge gesture opens Start: notifications + calendar are its left column, the control centre its right
+                OpenLauncher();
                 return 0;
             }
             OpenPanel(w == halo::edge::kBottom, w != halo::edge::kBottom);  // the corner: Quick Settings alone; touch: both, no auto-hide
@@ -1650,12 +1695,15 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 m_pressedWidget = target.kind == Dock::Kind::Media || target.kind == Dock::Kind::MediaPlay || target.kind == Dock::Kind::MediaNext ? target.kind : Dock::Kind::None;
                 if (m_widgets) m_widgets->SetPressed(MediaPart(m_pressedWidget));
                 m_pressed = m_dock->HitTest(mx, my);
+                m_pressX = mx;
                 m_dock->SetPressed(m_pressed);
                 if ((m_pressed >= 0 || m_pressedWidget != Dock::Kind::None) && (GetKeyState(VK_LBUTTON) & 0x8000)) SetCapture(m_hwnd);  // the release may land outside
             }
             return 0;
         case WM_LBUTTONUP:
-        case WM_CAPTURECHANGED:
+        case WM_CAPTURECHANGED: {
+            const bool wasDragging = std::exchange(m_dragging, false);  // a drag ends here, and is never also a click
+            if (wasDragging && m_dock) m_dock->EndDrag();
             if (std::exchange(m_pressedStart, false) && m == WM_LBUTTONUP && m_dock && m_dock->HitStart(mx, my))
                 OpenLauncher();
             {
@@ -1680,12 +1728,13 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 m_dock->SetPressed(-1);
                 if (m == WM_LBUTTONUP) {
                     ReleaseCapture();
-                    if (m_state == State::Shown && m_dock->HitTest(mx, my) == pressed &&
+                    if (m_state == State::Shown && !wasDragging && m_dock->HitTest(mx, my) == pressed &&
                         pressed < static_cast<int>(m_items.size()))
                         Activate(pressed);
                 }
             }
             return 0;
+        }
         case WM_RBUTTONUP:
             if (m_dock && m_state == State::Shown) {
                 int hit = m_dock->HitTest(mx, my);

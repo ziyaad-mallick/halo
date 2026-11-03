@@ -203,6 +203,7 @@ Dock::Entry Dock::MakeEntry(Item const& item, bool instant) {
     v.Properties().InsertScalar(L"P", instant ? 1.0f : 0.0f);  // presence
     v.Properties().InsertScalar(L"S", instant ? 1.0f : 0.0f);  // scale, set by an expression
     v.Properties().InsertScalar(L"Mag", 0.0f);                 // 0..1: how far the magnetic pull toward the pointer has eased in
+    v.Properties().InsertScalar(L"Shift", 0.0f);               // px: where a reorder left it relative to its slot, easing back to 0
     m_root.Children().InsertAtTop(v);
     e.icon = v;
 
@@ -396,11 +397,16 @@ void Dock::BuildExpressions() {
         // The magnetic pull: a fraction of the way to the pointer, capped, eased in by Mag (stays 0 under reduce motion).
         const std::wstring pull = L" + Clamp((p.PointerX - (" + slotCenter + L")) * 0.18, -" + std::to_wstring(kPullPx * m_m.restSize / 28) +
                                   L", " + std::to_wstring(kPullPx * m_m.restSize / 28) + L") * " + me + L".Mag";
-        auto x = m_compositor.CreateExpressionAnimation(slotCenter + pull + L" - p.Rest / 2");
+        // The icon being dragged is glued to the pointer; every other one sits in its slot, plus whatever a reorder
+        // left in Shift (eased back to 0, so a neighbour slides into its new place).
+        const bool dragged = m_entries[i].id == m_dragId;
+        const std::wstring iconCenter = dragged ? std::wstring(L"p.PointerX") : slotCenter + pull + L" + " + me + L".Shift";
+        auto x = m_compositor.CreateExpressionAnimation(iconCenter + L" - p.Rest / 2");
         bind(x);
         Start(m_entries[i].icon, L"Offset.X", x, L"icon x");
 
-        auto dx = m_compositor.CreateExpressionAnimation(slotCenter + L" - " + std::to_wstring(DotSize() / 2));
+        auto dx = m_compositor.CreateExpressionAnimation((dragged ? std::wstring(L"p.PointerX") : slotCenter + L" + " + me + L".Shift") +
+                                                         L" - " + std::to_wstring(DotSize() / 2));
         bind(dx);
         Start(m_entries[i].dot, L"Offset.X", dx, L"dot x");
     }
@@ -625,6 +631,70 @@ void Dock::SetPressed(int index) {
         AnimateTo(m_overlay, L"Opacity", kPressDarkness, kPressInMs);
         break;
     }
+}
+
+size_t Dock::EntryIndex(int live) const {
+    int k = 0;
+    for (size_t i = 0; i < m_entries.size(); i++) {
+        if (m_entries[i].leaving) continue;
+        if (k++ == live) return i;
+    }
+    return m_entries.size();
+}
+
+bool Dock::BeginDrag(int index) {
+    if (m_dragId) return false;
+    const size_t i = EntryIndex(index);
+    if (i >= m_entries.size() || m_entries[i].extra) return false;  // only pinned icons have a place to move
+    SetPressed(-1);
+    SetMagnet(-1);
+    m_dragId = m_entries[i].id;
+    Entry& e = m_entries[i];
+    // Above its neighbours, and a little lifted.
+    m_root.Children().Remove(e.icon);
+    m_root.Children().InsertAtTop(e.icon);
+    AnimateTo(e.icon, L"Offset.Y", IconY() - m_m.restSize * 0.12f, kPressInMs);
+    BuildExpressions();
+    return true;
+}
+
+void Dock::Reorder(int from, int to) {
+    if (from == to) return;
+    const size_t a = EntryIndex(from), b = EntryIndex(to);
+    if (a >= m_entries.size() || b >= m_entries.size() || m_entries[a].extra || m_entries[b].extra) return;
+    const float pitch = m_m.restSize + m_m.gap;
+    Entry moved = m_entries[a];
+    m_entries.erase(m_entries.begin() + a);
+    m_entries.insert(m_entries.begin() + b, std::move(moved));
+    // Everything between the two slots moves one place the other way: start it a pitch back and let it slide in.
+    const size_t lo = std::min(a, b), hi = std::max(a, b);
+    for (size_t k = lo; k <= hi; k++) {
+        if (k == b) continue;  // the moved icon
+        auto props = m_entries[k].icon.Properties();
+        props.InsertScalar(L"Shift", a < b ? pitch : -pitch);
+        AnimateTo(props, L"Shift", 0.0f, kPresenceMs);
+    }
+    BuildExpressions();
+}
+
+void Dock::EndDrag() {
+    if (!m_dragId) return;
+    const unsigned id = std::exchange(m_dragId, 0u);
+    int live = 0;
+    for (auto& e : m_entries) {
+        if (e.leaving) continue;
+        if (e.id == id) {
+            // From where the pointer holds it to its slot, on the same curve as everything else.
+            auto props = e.icon.Properties();
+            props.InsertScalar(L"Shift", m_pointerX - MagnifiedIconCenterAndTop(live).first);
+            BuildExpressions();
+            AnimateTo(props, L"Shift", 0.0f, kPresenceMs);
+            AnimateTo(e.icon, L"Offset.Y", IconY(), kPresenceMs);
+            return;
+        }
+        live++;
+    }
+    BuildExpressions();
 }
 
 bool Dock::Bouncing(Entry const& e) const {

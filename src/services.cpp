@@ -1374,14 +1374,23 @@ winrt::fire_and_forget Media::PullAsync() {
         if (sess) {
             next.has = true;
             next.source = sess.SourceAppUserModelId().c_str();
-            auto info = sess.GetPlaybackInfo();
-            next.playing = info.PlaybackStatus() ==
-                           winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
-            auto c = info.Controls();
-            next.canPrev = c.IsPreviousEnabled();
-            next.canNext = c.IsNextEnabled();
+            // Some sessions hand back a null playback info / controls / properties object (S_OK + nullptr); the
+            // projection does not check, so dereferencing one is an access violation that catch(...) cannot catch.
+            if (auto info = sess.GetPlaybackInfo()) {
+                next.playing = info.PlaybackStatus() ==
+                               winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+                if (auto c = info.Controls()) {
+                    next.canPrev = c.IsPreviousEnabled();
+                    next.canNext = c.IsNextEnabled();
+                }
+            }
             auto props = co_await sess.TryGetMediaPropertiesAsync();
             if (gen != *live || seq != *newest) co_return;
+            if (!props) {
+                m_state = std::move(next);
+                if (m_changed) m_changed();
+                co_return;
+            }
             next.title = props.Title().c_str();
             next.artist = props.Artist().c_str();
             if (next.source == m_state.source && next.title == m_state.title && next.artist == m_state.artist) {

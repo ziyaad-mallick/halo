@@ -17,5 +17,8 @@ std::vector<PinnedApp> Load();            // the list, seeding the file first if
 bool IsPinned(std::wstring const& path);  // case-insensitive match on the launch path
 bool Pin(std::wstring const& path);       // appends and rewrites the file; false if already pinned or on error
 bool Unpin(std::wstring const& path);     // removes and rewrites the file; false if not pinned or on error
+// Moves `path` to just before `anchor` (just after it when `after`) and rewrites the file; false if either is not
+// pinned, they are the same, or on error. This is the dock's drag-to-reorder.
+bool Move(std::wstring const& path, std::wstring const& anchor, bool after);
 
 }  // namespace halo::pins

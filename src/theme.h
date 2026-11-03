@@ -132,4 +132,20 @@ inline GlassStyle Glass(halo::settings::Surface const& g) {
 inline winrt::Windows::UI::Color C(Argb c) { return winrt::Windows::UI::ColorHelper::FromArgb(c.a, c.r, c.g, c.b); }
 inline D2D1_COLOR_F A(D2D1_COLOR_F c, float alpha) { c.a *= alpha; return c; }
 
+
+// A tonal palette from the accent: tinted surfaces instead of neutral grey. `tint1` / `tint2` are the accent at low
+// alpha (resting tile, resting badge); `pc` is the "primary container" an ON tile is filled with, and `onpc` the ink on it.
+struct Tonal { D2D1_COLOR_F tint1, tint2, pc, onpc; };
+inline Tonal TonalNow() {
+    const auto a = P().accent;
+    auto mix = [](D2D1_COLOR_F c, float k, float t) { return D2D1::ColorF(c.r + (k - c.r) * t, c.g + (k - c.g) * t, c.b + (k - c.b) * t, 1.0f); };
+    Tonal t;
+    const bool dark = Dark();
+    t.tint1 = D2D1::ColorF(a.r, a.g, a.b, dark ? 0.15f : 0.11f);
+    t.tint2 = D2D1::ColorF(a.r, a.g, a.b, dark ? 0.26f : 0.19f);
+    t.pc = dark ? mix(a, 1.0f, 0.55f) : mix(a, 0.0f, 0.12f);
+    t.onpc = dark ? mix(a, 0.0f, 0.82f) : D2D1::ColorF(1, 1, 1, 1);
+    return t;
+}
+
 }  // namespace halo::theme

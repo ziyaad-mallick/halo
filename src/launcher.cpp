@@ -148,9 +148,12 @@ constexpr float kMenuRowH = 32;
 constexpr float kMenuPad = 8;
 constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 24;
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
-constexpr int kMaxApps = 12, kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
-constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2, kCaretTimer = 3, kServicesTimer = 4;  // kClockTimer: halo2, re-armed to each minute boundary
-constexpr int kListBuffer = 4, kScrollMs = 180;  // rows drawn past each end of the list; the scroll slide
+constexpr int kH2Apps = 10, kH2Files = 10, kH2AppCols = 5;  // the 2.0 middle pane: 5 x 2 apps, 2 x 5 files
+constexpr int kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
+constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2, kCaretTimer = 3, kServicesTimer = 4, kOpenTimer = 5, kRehoverTimer = 6;  // kClockTimer: halo2, re-armed to each minute boundary
+constexpr int kQuickTiles = 10;  // Airplane, Hotspot, Do not disturb, Night light, Dark mode, Microphone, Battery saver, Screenshot, Cast, Project
+constexpr int kStartSpringPeriodMs = 92, kStartHideMs = 170;  // the dock's reveal spring is 55 ms and its hide 200 ms, for a surface a tenth the height
+constexpr int kListBuffer = 4, kScrollMs = 180, kScrollSpringMs = 85;  // rows drawn past each end of the list; the scroll slide
 constexpr UINT kMsgAppsFolder = WM_APP + 1;  // lParam: a Launcher::Found* from the Apps folder thread, owned by the panel
 constexpr UINT kMsgRecent = WM_APP + 2;  // result stays in shared state; no owned message payload
 // halo2: service notifications for the right column (the Control Center's own numbering is its own window's business).
@@ -158,7 +161,7 @@ constexpr UINT kMsgAudio = WM_APP + 10, kMsgRadios = WM_APP + 11, kMsgBright = W
                kMsgWifi = WM_APP + 14, kMsgBt = WM_APP + 15, kMsgUsage = WM_APP + 16, kMsgMic = WM_APP + 17, kMsgLate = WM_APP + 18;
 constexpr float kPanelRadius = 28;  // local: theme.h has no panel-radius token
 // Icon motion, matched to the dock: hover swells and lifts on a spring, a press squashes, a click bounces.
-constexpr float kHoverScale = 1.18f, kHoverLift = 3, kPressScale = 0.94f, kBounceRise = 8;
+constexpr float kHoverScale = 1.25f, kHoverLift = 6, kPressScale = 0.94f, kBounceRise = 8;
 constexpr float kHoverDamping = 0.6f;
 constexpr int kHoverPeriodMs = 45, kBounceMs = 420;
 
@@ -414,7 +417,6 @@ void OpenQuietly(std::wstring const& target) {
 }
 
 IReference<float3> Ref3(float3 v) { return v; }  // spring animations take IReference<float3>
-IReference<float2> Ref2(float2 v) { return v; }
 
 
 }  // namespace
@@ -746,25 +748,30 @@ void Launcher::Build() {
     m_h2 = settings::Get().halo2;
     float wl, rightW = 0;  // the left column's width, and the right column's (logical px)
     if (m_h2) {
-        auto const widths = start::PlanWidths((m_anchor.monitor.right - m_anchor.monitor.left) / s);
-        wl = widths.left;
+        auto const widths = start::PlanWidths3((m_anchor.monitor.right - m_anchor.monitor.left) / s);
+        wl = widths.mid;
         rightW = widths.right;
-        m_w = std::round(widths.total * s);
+        m_gap = std::round(start::kPanelGap * s);
+        m_notifW = std::round(widths.notif * s);
+        m_nw = m_notifW > 0 ? m_notifW + m_gap : 0;  // the middle card starts here
+        m_w = std::round(wl * s) + m_gap + std::round(rightW * s);
     } else {
         wl = std::min(kWidth, (m_anchor.monitor.right - m_anchor.monitor.left) / s - 2 * kScreenMargin);
         wl = std::clamp(wl, std::min(kMinWidth, wl), kMaxWidth);
+        m_nw = m_notifW = m_gap = 0;
         m_w = std::round(wl * s);
     }
-    m_lw = m_h2 ? std::round(wl * s) : m_w;
+    m_lw = m_h2 ? std::round(wl * s) + m_gap : m_w;  // where the right card starts
     m_rightW = rightW;
 
     // HALO 2.0 keeps twelve slots per section; classic Start follows its preferences.
     auto const& cfg = settings::Get().start;
-    const size_t maxApps = m_h2 ? kMaxApps : std::min(cfg.recentApps, 6);
-    size_t maxFiles = m_h2 ? kMaxFiles : std::min(cfg.recentFiles, kMaxFiles);
+    const size_t maxApps = m_h2 ? kH2Apps : std::min(cfg.recentApps, 6);
+    size_t maxFiles = m_h2 ? kH2Files : std::min(cfg.recentFiles, kMaxFiles);
     if (m_h2) {  // Keep every recent item; the home body scrolls on smaller displays.
-        m_plan = start::PlanLeft(start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s),
-                                 maxApps > 0, maxFiles > 0);
+        m_plan = start::PlanCenter(std::min(start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s),
+                                            (m_anchor.monitor.bottom - m_anchor.monitor.top) / s * 0.78f),
+                                   maxApps > 0, maxFiles > 0);
         m_homeScroll = 0;
         m_rightScroll = 0;
     }
@@ -782,12 +789,18 @@ void Launcher::Build() {
 
     // Top to bottom: search bar, recent apps (one row), recent files (2 x 6), the dock bar under a hairline.
     // Both recent sections share six columns; HALO 2.0 places the greeting and widgets above search.
-    const float innerW = wl - 2 * kPad, colW = innerW / kFileCols;
+    const int appCols = m_h2 ? kH2AppCols : kFileCols;
+    const float innerW = wl - 2 * kPad, colW = innerW / appCols;
     const float searchTop = m_h2 ? m_plan.searchY : kSearchTop;
-    const float searchBot = searchTop + kSearchH;
+    const float searchBot = searchTop + (m_h2 ? start::kSearchH : kSearchH);
     float appsLabelY, appsTop, filesLabelY, filesTop, dividerY;
     if (m_h2) {
-        const float height = std::max(m_plan.height, start::kRightMinH);
+        // Tall enough that the control centre never needs to scroll (the middle column has room to spare), if the screen allows.
+        const float availH = start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s);
+        // Never taller than 78 % of the screen, and at least tall enough for the control pane.
+        const float screenH = (m_anchor.monitor.bottom - m_anchor.monitor.top) / s;
+        const float capH = std::min(availH, screenH * 0.78f);
+        const float height = std::min(capH, std::max({m_plan.height, start::kRightMinH, start::PlanRight(0, 6, true).bottom}));
         appsLabelY = m_plan.appsLabelY;
         appsTop = m_plan.appsTop;
         filesLabelY = m_plan.filesLabelY;
@@ -804,7 +817,8 @@ void Launcher::Build() {
                             searchBot + 8 + 4 + kMaxResults * kResultRowH + 4);  // a page of results always fits
     }
     const float bottomY = dividerY + 1;
-    m_iconPx = kIconSize;
+    const float iconSz = m_h2 ? start::tk::kAppIcon : kIconSize;  // 2.0: 56 px app icons
+    m_iconPx = iconSz;
     m_h = std::round((bottomY + kBottomH) * s);
     m_bodyTop = (searchBot + 8) * s;
     m_bodyBottom = dividerY * s;
@@ -814,15 +828,15 @@ void Launcher::Build() {
     m_filesLabel = R(kPad * s, filesLabelY * s, (kPad + innerW) * s, (filesLabelY + kLabelH) * s);
     // "All apps" at the right end of the first label's line (its text, not its plate, on the margin).
     m_allAppsRect = R((kPad + innerW + 8 - 104) * s, (appsLabelY - 6) * s, (kPad + innerW + 8) * s, (appsLabelY + kLabelH + 6) * s);
-    const float barW = m_h2 ? m_w / s : wl;  // HALO 2.0: one footer under both columns
+    const float barW = wl;  // HALO 2.0: the footer is the middle card's; the control centre card has none
     m_divider = R(kPad * s, dividerY * s, (barW - kPad) * s, (dividerY + 1) * s);
     m_appCells.clear();
     m_fileCells.clear();
     for (size_t i = 0; i < m_apps.size(); i++) {
-        float x = kPad + (i % kFileCols + 0.5f) * colW - kIconSize / 2,
-              y = m_h2 ? appsTop + (i / kFileCols) * start::kAppRowH + start::tk::kInCard / 2
-                       : appsTop + (i / kFileCols) * kAppRowH + (kAppRowH - kIconSize) / 2;
-        m_appCells.push_back(R(x * s, y * s, (x + kIconSize) * s, (y + kIconSize) * s));
+        float x = kPad + (i % appCols + 0.5f) * colW - iconSz / 2,
+              y = m_h2 ? appsTop + (i / appCols) * start::kAppRowH + start::tk::kInCard / 2
+                       : appsTop + (i / appCols) * kAppRowH + (kAppRowH - kIconSize) / 2;
+        m_appCells.push_back(R(x * s, y * s, (x + iconSz) * s, (y + iconSz) * s));
     }
     const float fileColW = (innerW - start::tk::kInGroup) / 2;  // HALO 2.0: recent files are a two-column list of rows
     for (size_t i = 0; i < m_files.size(); i++) {
@@ -849,16 +863,9 @@ void Launcher::Build() {
     m_staticHits.push_back({m_settingsRect, Kind::Settings, 0});
     m_staticHits.push_back({m_powerRect, Kind::Power, 0});
 
-    if (m_h2) {  // greeting + quote, then two cards of one height (battery with power mode, the week)
-        namespace tk = start::tk;
-        const float cardGap = tk::kInGroup, cardA = (innerW - cardGap) / 2;
+    if (m_h2) {  // the hello, the time and the quote; the battery bar lives in the control pane now
         m_greetRect = R(kPad * s, m_plan.greetY * s, (kPad + innerW) * s, (m_plan.greetY + m_plan.greetH) * s);
-        m_cardRect = R(kPad * s, m_plan.widgetsY * s, (kPad + cardA) * s, (m_plan.widgetsY + m_plan.widgetsH) * s);
-        m_calRect = R((kPad + cardA + cardGap) * s, m_plan.widgetsY * s, (kPad + innerW) * s, (m_plan.widgetsY + m_plan.widgetsH) * s);
-        const float segW = (cardA - 2 * tk::kPad) / 3, segTop = m_plan.widgetsY + m_plan.widgetsH - tk::kPad - tk::kSeg;
-        for (int i = 0; i < 3; i++)
-            m_modeSeg[i] = R((kPad + tk::kPad + i * segW) * s, segTop * s, (kPad + tk::kPad + (i + 1) * segW) * s, (segTop + tk::kSeg) * s);
-        m_modeRect = R(m_modeSeg[0].left, m_modeSeg[0].top, m_modeSeg[2].right, m_modeSeg[2].bottom);
+        m_calRect = R(0, 0, 0, 0);
         m_battery = svc::ReadBattery();
         m_mode = svc::ReadPowerMode();
     }
@@ -885,61 +892,119 @@ void Launcher::Build() {
         m_shadowB = pal.shadow.a ? std::ceil((pal.shadowBlur + pal.shadowY) * s) : 0.0f;
     }
     m_shadowHold = nullptr;
-    const float panelR = (m_h2 ? start::tk::kRPanel : kPanelRadius) * s;
+    // HALO 2.0 is three cards (notifications, middle, control centre), each its own glass with its own edge, shadow and
+    // rounded corners; classic Start is one. `boxes` are the cards' x and width in panel px.
+    const float panelR = (m_h2 ? start::tk::kRCard + ui::kS2 : kPanelRadius) * s;
+    struct Box { float x, w; };
+    std::vector<Box> boxes;
+    if (m_h2) {
+        if (m_nw > 0) boxes.push_back({0, m_notifW});
+        boxes.push_back({m_nw, m_lw - m_gap});
+        boxes.push_back({m_nw + m_lw, m_w - m_lw});
+    } else {
+        boxes.push_back({0, PanelW()});
+    }
+    // The cards' glass is the dock's (same tint, same opacity): Start reads as part of the same surface family.
+    settings::Surface const& glassCfg = m_h2 ? static_cast<settings::Surface const&>(settings::Get().taskbar) : settings::Get().start;
     if (m_shadowM > 0) {
-        if (auto sh = m_h2 ? MakeBakedShadow(m_comp, m_gdev, std::ceil(m_w), std::ceil(m_h), panelR, theme::P().shadowBlur * s,
+        auto hold = m_comp.CreateContainerVisual();
+        hold.Size({PanelW(), m_h});
+        hold.Offset(PanelHome());
+        for (auto const& b : boxes) {
+            auto sh = m_h2 ? MakeBakedShadow(m_comp, m_gdev, std::ceil(b.w), std::ceil(m_h), panelR, theme::P().shadowBlur * s,
                                              theme::P().shadowY * s, theme::P().shadow)
-                           : MakeShadow(m_comp, m_gdev, std::ceil(m_w), std::ceil(m_h), panelR,
-                                        theme::P().shadowBlur * s, theme::P().shadowY * s, theme::P().shadow)) {
-            if (!m_h2) sh.Size({m_w, m_h});
-            m_shadowHold = m_comp.CreateContainerVisual();
-            m_shadowHold.Size({m_w, m_h});
-            m_shadowHold.Offset(PanelHome());
-            m_shadowHold.Children().InsertAtTop(sh);
+                           : MakeShadow(m_comp, m_gdev, std::ceil(b.w), std::ceil(m_h), panelR, theme::P().shadowBlur * s,
+                                        theme::P().shadowY * s, theme::P().shadow);
+            if (!sh) continue;
+            if (!m_h2) sh.Size({b.w, m_h});
+            auto at = m_comp.CreateContainerVisual();  // the shadow is drawn around (0, 0): put it under its card
+            at.Size({b.w, m_h});
+            at.Offset({b.x, 0, 0});
+            at.Children().InsertAtTop(sh);
+            hold.Children().InsertAtTop(at);
+        }
+        if (hold.Children().Count()) {
+            m_shadowHold = hold;
             m_root.Children().InsertAtTop(m_shadowHold);
         }
     }
     // The stage clips the panel to the old window rect, so the rise/exit still happens behind the window bottom edge.
     auto stage = m_comp.CreateContainerVisual();
     stage.Offset({m_shadowM, 0, 0});
-    stage.Size({m_w, kTop * s + m_h});
+    stage.Size({PanelW(), kTop * s + m_h});
     {
         auto sc = m_comp.CreateRectangleClip();
-        sc.Left(0); sc.Top(0); sc.Right(m_w); sc.Bottom(kTop * s + m_h);
+        sc.Left(0); sc.Top(0); sc.Right(PanelW()); sc.Bottom(kTop * s + m_h);
         stage.Clip(sc);
     }
     m_root.Children().InsertAtTop(stage);
     m_panel = m_comp.CreateContainerVisual();
-    m_panel.Size({m_w, m_h});
+    m_panel.Size({PanelW(), m_h});
     m_panel.Offset({0, kTop * s, 0});
-    auto clip = m_comp.CreateRoundedRectangleGeometry();
-    clip.CornerRadius({panelR, panelR});
-    clip.Size({m_w, m_h});
-    m_panel.Clip(m_comp.CreateGeometricClip(clip));
+    if (!m_h2) {
+        auto clip = m_comp.CreateRoundedRectangleGeometry();
+        clip.CornerRadius({panelR, panelR});
+        clip.Size({PanelW(), m_h});
+        m_panel.Clip(m_comp.CreateGeometricClip(clip));
+    }
     stage.Children().InsertAtTop(m_panel);
 
-    if (m_host.glass) {
-        auto glass = m_host.glass(static_cast<int>(std::ceil(m_h)), settings::Get().start);
-        glass.Size({m_w, m_h});
-        m_panel.Children().InsertAtTop(glass);
-    }
-    m_content = m_comp.CreateContainerVisual();
-    m_content.Size({m_w, m_h});
-    m_panel.Children().InsertAtTop(m_content);
-
-    {   // 1 px hairline around the panel (separates light glass from a light wallpaper); inset so the clip keeps all of it
-        const float t = std::max(1.0f, std::round(s));
+    const float edgeT = std::max(1.0f, std::round(s));
+    for (auto const& b : boxes) {  // glass, then the 1 px hairline that separates it from a light wallpaper
+        auto card = m_comp.CreateContainerVisual();
+        card.Size({b.w, m_h});
+        card.Offset({b.x, 0, 0});
+        if (m_h2) {
+            auto clip = m_comp.CreateRoundedRectangleGeometry();
+            clip.CornerRadius({panelR, panelR});
+            clip.Size({b.w, m_h});
+            card.Clip(m_comp.CreateGeometricClip(clip));
+        }
+        if (m_host.glass) {
+            auto glass = m_host.glass(static_cast<int>(std::ceil(m_h)), glassCfg, static_cast<int>(std::ceil(b.w)), m_h2 ? panelR : 0.0f);
+            glass.Size({b.w, m_h});
+            card.Children().InsertAtTop(glass);
+            if (m_h2) {  // tonal: the accent, faint at the top of the pane and gone by 45 %
+                const auto a = theme::P().accent;
+                const float al = theme::Dark() ? 0.13f : 0.09f;
+                auto grad = m_comp.CreateLinearGradientBrush();
+                grad.MappingMode(wuc::CompositionMappingMode::Relative);
+                grad.StartPoint({0, 0});
+                grad.EndPoint({0, 1});
+                grad.ColorStops().Append(m_comp.CreateColorGradientStop(0.0f, Col({a.r, a.g, a.b, al})));
+                grad.ColorStops().Append(m_comp.CreateColorGradientStop(0.45f, Col({a.r, a.g, a.b, 0.0f})));
+                auto tint = m_comp.CreateSpriteVisual();
+                tint.Size({b.w, m_h});
+                tint.Brush(grad);
+                card.Children().InsertAtTop(tint);
+            }
+        }
         auto edgeShape = m_comp.CreateRoundedRectangleGeometry();
-        edgeShape.Offset({t / 2, t / 2});
-        edgeShape.Size({m_w - t, m_h - t});
-        edgeShape.CornerRadius({panelR - t / 2, panelR - t / 2});
+        edgeShape.Offset({edgeT / 2, edgeT / 2});
+        edgeShape.Size({b.w - edgeT, m_h - edgeT});
+        edgeShape.CornerRadius({panelR - edgeT / 2, panelR - edgeT / 2});
         auto edgeSprite = m_comp.CreateSpriteShape(edgeShape);
         edgeSprite.StrokeBrush(m_comp.CreateColorBrush(theme::C(theme::P().edge)));
-        edgeSprite.StrokeThickness(t);
+        edgeSprite.StrokeThickness(edgeT);
         auto edge = m_comp.CreateShapeVisual();
-        edge.Size({m_w, m_h});
+        edge.Size({b.w, m_h});
         edge.Shapes().Append(edgeSprite);
-        m_panel.Children().InsertAtTop(edge);
+        card.Children().InsertAtTop(edge);
+        m_panel.Children().InsertAtTop(card);
+    }
+    m_content = m_comp.CreateContainerVisual();  // the middle and the control centre: x = 0 is the middle card's left edge
+    m_content.Size({m_w, m_h});
+    m_content.Offset({m_nw, 0, 0});
+    m_panel.Children().InsertAtTop(m_content);
+
+    m_notifRoot = nullptr;
+    if (m_h2 && m_nw > 0) {  // the notification + calendar card
+        if (!m_notifCol) {
+            m_notifCol = std::make_unique<NotifColumn>(GetModuleHandleW(nullptr), m_comp, m_gdev);
+            m_notifCol->onOpened = [this] { Hide(); };
+        }
+        m_notifRoot = m_notifCol->Build(m_notifW, m_h, s);
+        m_panel.Children().InsertAtTop(m_notifRoot);
     }
 
     auto plate = [&](wuc::CompositionRoundedRectangleGeometry& shape) {
@@ -954,12 +1019,17 @@ void Launcher::Build() {
     };
     m_hover = plate(m_hoverShape);
     m_content.Children().InsertAtTop(m_hover);
+    m_wave = m_comp.CreatePropertySet();
+    m_wave.InsertScalar(L"PointerX", -10000.0f);
+    m_wave.InsertScalar(L"PointerY", -10000.0f);
+    m_wave.InsertScalar(L"Intensity", 0.0f);
+    m_waveOn = false;
     m_hoverIndex = -1;
     m_hoverOn = m_menuHoverOn = false;
 
     {   // the dock bar: divider, user, Settings, Power
         float top = m_divider.top, h = m_h - top;
-        const float barPx = m_h2 ? m_w : m_lw;
+        const float barPx = m_lw;
         auto surface = MakeSurface(barPx, h);
         Redraw(surface, &Launcher::DrawStatic);
         auto v = MakeSurfaceVisual(surface, barPx, h);
@@ -1030,7 +1100,7 @@ void Launcher::Build() {
     if (m_h2) {  // HALO 2.0: the menu is the one raised surface: a shadow under it (baked, so it costs no GPU blur), animated with it
         m_menuOuter = m_comp.CreateContainerVisual();
         m_menuOuter.Size({m_menuW, m_menuH});
-        m_menuOuter.Offset({m_menuX, m_menuY, 0});
+        m_menuOuter.Offset({m_menuX + m_nw, m_menuY, 0});
         m_menuOuter.Opacity(0.0f);
         m_menuOuter.IsVisible(false);
         if (auto sh = MakeBakedShadow(m_comp, m_gdev, m_menuW, m_menuH, start::tk::kRCard * s, start::tk::kMenuShadowBlur * s,
@@ -1038,7 +1108,7 @@ void Launcher::Build() {
             m_menuOuter.Children().InsertAtTop(sh);
         m_menuOuter.Children().InsertAtTop(m_menu);
     } else {
-        m_menu.Offset({m_menuX, m_menuY, 0});
+        m_menu.Offset({m_menuX + m_nw, m_menuY, 0});
         m_menu.Opacity(0.0f);
         m_menu.IsVisible(false);
     }
@@ -1048,7 +1118,7 @@ void Launcher::Build() {
     menuClip.Size({m_menuW, m_menuH});
     m_menu.Clip(m_comp.CreateGeometricClip(menuClip));
     if (m_host.glass) {
-        auto glass = m_host.glass(static_cast<int>(std::ceil(m_menuH)), settings::Get().start);
+        auto glass = m_host.glass(static_cast<int>(std::ceil(m_menuH)), glassCfg, static_cast<int>(std::ceil(m_menuW)), 0.0f);
         glass.Size({m_menuW, m_menuH});
         m_menu.Children().InsertAtTop(glass);
         // Over the panel's own text the dock's 50% tint is not enough; the backdrop is the desktop, not the panel.
@@ -1080,6 +1150,45 @@ void Launcher::Build() {
 
 // The part between the search bar and the dock bar: the home sections, or the results while there is a query.
 // Rebuilt on every keystroke; the glass, shadow and bars are not.
+// The dock's wave for one icon: scale = 1 + 0.28 * (cosine falloff of the distance to the pointer, radius ~90 px), times
+// Intensity (0 until the pointer is near the apps). `k` lives on the sprite so Scale and the small lift share one value.
+// The icon's centre is baked; the home holder's offset is referenced live, so the wave stays right while the list scrolls.
+void Launcher::AttachWave(IconV const& ic, float cx, float cy, float h) {
+    if (!m_wave || !m_homeHold) return;
+    const float R = 92.0f * m_s;
+    auto n = [](float v) { return std::to_wstring(v); };
+    auto k = m_comp.CreateExpressionAnimation(
+        L"1 + 0.28 * w.Intensity * (Cos(Clamp(Sqrt(Pow(w.PointerX - " + n(cx) + L", 2) + Pow(w.PointerY - (" + n(cy) + L" + hold.Offset.Y - " + n(m_bodyTop) +
+        L"), 2)) / " + n(R) + L", 0, 1) * 3.14159265) + 1) / 2");
+    k.SetReferenceParameter(L"w", m_wave);
+    k.SetReferenceParameter(L"hold", m_homeHold);
+    ic.v.Properties().InsertScalar(L"k", 1.0f);
+    ic.v.Properties().StartAnimation(L"k", k);
+    auto scale = m_comp.CreateExpressionAnimation(L"Vector3(Max(me.k, 0.001), Max(me.k, 0.001), 1)");
+    scale.SetReferenceParameter(L"me", ic.v.Properties());
+    ic.v.StartAnimation(L"Scale", scale);
+    auto lift = m_comp.CreateExpressionAnimation(n(ic.restY) + L" - (me.k - 1) * " + n(h * 0.45f));
+    lift.SetReferenceParameter(L"me", ic.v.Properties());
+    ic.v.StartAnimation(L"Offset.Y", lift);
+}
+
+// Pointer in content coordinates. The wave is on while the pointer is within a radius of the apps.
+void Launcher::MoveWave(float x, float panelY) {
+    if (!m_wave) return;
+    m_wave.InsertScalar(L"PointerX", x);
+    m_wave.InsertScalar(L"PointerY", panelY);
+    bool closeEnough = false;
+    if (!m_appCells.empty() && !Listing()) {
+        const float R = 92.0f * m_s;
+        const float top = m_appCells.front().top - m_homeScroll - R, bottom = m_appCells.back().bottom - m_homeScroll + R;
+        closeEnough = x >= 0 && x < m_lw && panelY >= top && panelY <= bottom;
+    }
+    if (closeEnough != m_waveOn) {
+        m_waveOn = closeEnough;
+        Animate(m_wave, L"Intensity", closeEnough ? 1.0f : 0.0f, closeEnough ? 140 : 360);  // eases in fast, relaxes slowly: the dock's feel
+    }
+}
+
 void Launcher::BuildBody() {
     const float s = m_s;
     const bool results = Listing();
@@ -1144,12 +1253,13 @@ void Launcher::BuildBody() {
     } else {
         for (size_t i = 0; i < m_apps.size(); i++) {
             auto const& c = m_appCells[i];
-            const float cw = (m_lw - 2 * kPad * s) / kFileCols;  // HALO 2.0: the whole cell, icon and name, is one target
+            const float cw = (m_lw - m_gap - 2 * kPad * s) / kH2AppCols;  // HALO 2.0: the whole cell, icon and name, is one target
             m_hits.push_back({m_h2 ? R((c.left + c.right) / 2 - cw / 2 + 2 * s, c.top - start::tk::kInCard / 2 * s, (c.left + c.right) / 2 + cw / 2 - 2 * s,
                                        c.top - start::tk::kInCard / 2 * s + start::kAppRowH * s)
                                    : R(c.left - kIconPad * s, c.top - kIconPad * s, c.right + kIconPad * s, c.bottom + kIconPad * s),
                               Kind::App, static_cast<int>(i)});
             m_appSprites.push_back(sprite(m_host.appIcon(m_apps[i]), c));
+            if (m_h2 && m_appSprites.back().v) AttachWave(m_appSprites.back(), (c.left + c.right) / 2, (c.top + c.bottom) / 2, c.bottom - c.top);
         }
         for (size_t i = 0; i < m_files.size(); i++) {
             auto const& c = m_fileCells[i];
@@ -1166,8 +1276,6 @@ void Launcher::BuildBody() {
 
     }
     if (m_query.empty()) m_hits.push_back({m_allAppsRect, Kind::AllApps, 0});
-    if (m_h2 && m_mode != svc::PowerMode::Unknown)
-        for (int i = 0; i < 3; i++) m_hits.push_back({m_modeSeg[i], Kind::PowerMode, i});
     for (auto const& h : m_staticHits) m_hits.push_back(h);
     m_hitBase.clear();
     for (auto const& h : m_hits) m_hitBase.push_back(h.r);
@@ -1377,24 +1485,19 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
         // App names under their icons, in the six-column grid (empty slots stay empty; the grid keeps its height).
         auto fApp = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_NORMAL);
         auto fFile = txt.Format(ui::kFontText, tk::kText * s, DWRITE_FONT_WEIGHT_NORMAL);
-        const float colW = (m_lw - 2 * kPad * s) / kFileCols;
+        const float colW = (m_lw - m_gap - 2 * kPad * s) / kH2AppCols;
         for (size_t i = 0; i < m_apps.size(); i++) {
             auto const& c = m_appCells[i];
             const float cx = (c.left + c.right) / 2;
             txt.Draw(dc, AppName(m_apps[i]), fApp.get(), at(R(cx - colW / 2 + 4 * s, c.bottom + 4 * s, cx + colW / 2 - 4 * s, c.bottom + 22 * s)),
                      soft.get(), DWRITE_TEXT_ALIGNMENT_CENTER, true);
         }
-        // Recent files: a row each, the icon (a sprite) at the left, the name, and the folder it lives in, muted.
+        // Recent files: a row each, the icon (a sprite) at the left and the name.
         for (size_t i = 0; i < m_files.size(); i++) {
             auto r = at(m_fileCells[i]);
-            std::wstring folder;
-            if (auto last = m_files[i].path.find_last_of(L'\\'); last != std::wstring::npos && last > 0) {
-                auto prev = m_files[i].path.find_last_of(L'\\', last - 1);
-                folder = m_files[i].path.substr(prev == std::wstring::npos ? 0 : prev + 1, last - (prev == std::wstring::npos ? 0 : prev + 1));
-            }
-            const float folderW = 88 * s, nameL = r.left + (8 + tk::kFileIcon + 8) * s;
-            txt.Draw(dc, m_files[i].name, fFile.get(), R(nameL, r.top, r.right - folderW - 16 * s, r.bottom), white.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
-            txt.Draw(dc, folder, fApp.get(), R(r.right - folderW - 8 * s, r.top, r.right - 8 * s, r.bottom), dim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING, true);
+            // The compact card has no room for the folder next to the name (it cut names to one letter): the name gets the row.
+            const float nameL = r.left + (8 + tk::kFileIcon + 8) * s;
+            txt.Draw(dc, m_files[i].name, fFile.get(), R(nameL, r.top, r.right - 8 * s, r.bottom), white.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
         }
         return;
     }
@@ -1474,7 +1577,13 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     const float2 rise{0, ui::kEnterTravel * m_s};  // a short rise as it fades in, just above the dock
     auto const& st = settings::Get().start;
     const float2 corner{CornerX(), 1.0f};  // the swoop grows from just above the dock (the bottom centre; in 2.0 the dock is under the panel's middle-left)
-    if (m_h2) {
+    if (m_h2 && DockLikeMotion()) {
+        // Parked below the window edge (invisible) while the freshly drawn surfaces reach the GPU: starting the spring
+        // in the same frame put that one-off hitch into the first, fastest part of the motion.
+        ParkBelow(m_panel, {0, home, 0});
+        if (m_shadowHold) ParkBelow(m_shadowHold, PanelHome());
+        SetTimer(m_hwnd, kOpenTimer, 34, nullptr);
+    } else if (m_h2) {
         OpenMotion(m_panel, {0, home, 0}, true);
         if (m_shadowHold) OpenMotion(m_shadowHold, PanelHome(), true);
     } else {
@@ -1483,13 +1592,16 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     }
     ShowDim(st.dimDesktop);
     Place();  // shows the window: after the slide is set up, so no frame shows the panel at rest first
-    SetTimer(m_hwnd, kRefreshTimer, 420, nullptr);  // once, after the rise has settled
+    SetTimer(m_hwnd, kRefreshTimer, 900, nullptr);  // once, after the spring has settled (a rebuild mid-motion is a visible hitch)
     ArmClock();
 
     m_open = true;
     // Build establishes m_h2 on the first opening. Yield before binding devices,
     // so synchronous audio setup cannot hold back Show and its compositor commit.
-    const auto bindDelay = std::max<UINT>(USER_TIMER_MINIMUM, static_cast<UINT>(std::lround(motion::kFadeInMs / settings::Speed(st))));
+    // Nothing heavy while the panel moves: every service answer and every notification snapshot redraws a surface and uploads it
+    // to the GPU, and those frames land in the middle of the spring. 2.0 waits until the motion has settled (the notification
+    // column and the control centre show what they had last time until then).
+    const auto bindDelay = m_h2 ? 600u : std::max<UINT>(USER_TIMER_MINIMUM, static_cast<UINT>(std::lround(motion::kFadeInMs / settings::Speed(st))));
     SetTimer(m_hwnd, kServicesTimer, bindDelay, nullptr);
     Focus();
     QueryPerformanceCounter(&t1);
@@ -1502,6 +1614,7 @@ void Launcher::Show(LauncherAnchor const& anchor) {
 // The Win key arrives from a hook thread, so Windows may refuse the foreground change; borrowing the
 // foreground thread's input queue is the standard way around that.
 void Launcher::Focus() {
+    if (EnvIs(L"HALO_TEST_NOFOCUS")) return;  // test runs must never take the keyboard from whoever is typing
     DWORD me = GetCurrentThreadId(), fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
     bool attached = fg && fg != me && AttachThreadInput(me, fg, TRUE);
     SetForegroundWindow(m_hwnd);
@@ -1514,6 +1627,9 @@ void Launcher::Focus() {
 void Launcher::Hide() {
     if (!m_open) return;
     m_open = false;
+    KillTimer(m_hwnd, kOpenTimer);
+    KillTimer(m_hwnd, kRehoverTimer);
+    if (m_notifCol) m_notifCol->SetActive(false);
     unsigned gen = ++m_gen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     const float2 rise{0, ui::kEnterTravel * m_s};
@@ -1533,6 +1649,30 @@ void Launcher::Hide() {
     Log(L"hiding");
 }
 
+// The dock's reveal for Start (see OpenMotion): the Bounce and Rise effects slide the panel in, they do not fade it.
+bool Launcher::DockLikeMotion() const {  // every motion but None: they all start a beat after the window is up
+    return !settings::Get().reduceMotion && settings::Get().start.effect != settings::Effect::None;
+}
+
+void Launcher::ParkBelow(wuc::Visual const& v, float3 rest) {
+    v.StopAnimation(L"Offset");
+    v.StopAnimation(L"Offset.Y");
+    v.StopAnimation(L"Opacity");
+    v.Opacity(0.0f);
+    const bool rises = settings::Get().start.effect == settings::Effect::Bounce || settings::Get().start.effect == settings::Effect::Rise;
+    v.Offset({rest.x, rest.y + (rises ? OpenTravel() : 0.0f), rest.z});
+    v.StopAnimation(L"Scale");
+    v.CenterPoint({PanelW() / 2, m_h, 0});  // grows from the bottom centre, where the dock is
+    const float s0 = settings::Get().start.effect == settings::Effect::Bounce ? 0.94f : 1.0f;
+    v.Scale({s0, s0, 1});
+}
+
+// How far Bounce / Rise start below their resting place: a short rise, not the panel's whole height (a spring's
+// response time ignores distance, so a long travel is violent and shows few frames).
+float Launcher::OpenTravel() const {
+    return 84.0f * m_s * std::clamp(settings::Amount(settings::Get().start), 0.8f, 1.5f);
+}
+
 // HALO 2.0 open and close: a bounded ease-out rise and fade; closing, it sinks and fades
 // from the current compositor pose, including when the entrance is interrupted. Only offset and opacity
 // animate, on the compositor: the glass behind is never resized or scaled. speed scales the times, motion the travel;
@@ -1540,6 +1680,67 @@ void Launcher::Hide() {
 void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
     auto const& st = settings::Get().start;
     const bool reduce = settings::Get().reduceMotion;
+    if (m_h2 && !reduce && (st.effect == settings::Effect::Bounce || st.effect == settings::Effect::Rise || st.effect == settings::Effect::Fade)) {
+        // Two clean motions. Fade: opacity only, nothing moves. Bounce / Rise: a short rise on a spring that overshoots a
+        // little, with a quick fade so it never pops in. Both start a beat after the window is up (see Show) so the
+        // window's first-frame hitch happens while the panel is still invisible.
+        const float speed = settings::Speed(st);
+        const bool rises = st.effect != settings::Effect::Fade;
+        const float travel = OpenTravel();
+        auto ms = [&](float x) { return std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(x / speed)))); };
+        auto outCurve = m_comp.CreateCubicBezierEasingFunction({0.0f, 0.0f}, {0.2f, 1.0f});
+        const bool bounce = st.effect == settings::Effect::Bounce;
+        v.CenterPoint({PanelW() / 2, m_h, 0});
+        if (in) {
+            v.StopAnimation(L"Offset");
+            v.StopAnimation(L"Offset.Y");
+            v.StopAnimation(L"Opacity");
+            v.StopAnimation(L"Scale");
+            v.Scale({bounce ? 0.94f : 1.0f, bounce ? 0.94f : 1.0f, 1});
+            v.Opacity(0.0f);
+            v.Offset({rest.x, rest.y + (rises ? travel : 0.0f), rest.z});
+            auto fade = m_comp.CreateScalarKeyFrameAnimation();
+            fade.InsertKeyFrame(0.0f, 0.0f);
+            fade.InsertKeyFrame(1.0f, 1.0f, outCurve);
+            fade.Duration(ms(rises ? 150.0f : 220.0f));
+            v.StartAnimation(L"Opacity", fade);
+            if (rises) {
+                // Loose spring (damping 0.5, like the dock's bounce): it rises past its place by ~a sixth of the travel and settles.
+                const float zeta = bounce ? 0.5f : 1.0f;
+                auto spring = m_comp.CreateSpringScalarAnimation();
+                spring.FinalValue(rest.y);
+                spring.DampingRatio(zeta);
+                spring.Period(ms(kStartSpringPeriodMs));
+                v.StartAnimation(L"Offset.Y", spring);
+                if (bounce) {  // and it swells into size on the same spring
+                    auto grow = m_comp.CreateSpringVector3Animation();
+                    grow.FinalValue(Ref3({1.0f, 1.0f, 1.0f}));
+                    grow.DampingRatio(zeta);
+                    grow.Period(ms(kStartSpringPeriodMs));
+                    v.StartAnimation(L"Scale", grow);
+                }
+            }
+        } else {
+            auto down = m_comp.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.9f, 0.5f});
+            auto fade = m_comp.CreateScalarKeyFrameAnimation();
+            fade.InsertKeyFrame(1.0f, 0.0f, down);
+            fade.Duration(ms(kStartHideMs));
+            v.StartAnimation(L"Opacity", fade);
+            if (rises) {
+                auto slide = m_comp.CreateScalarKeyFrameAnimation();
+                slide.InsertKeyFrame(1.0f, rest.y + travel * 0.5f, down);
+                slide.Duration(ms(kStartHideMs));
+                v.StartAnimation(L"Offset.Y", slide);
+                if (bounce) {
+                    auto shrink = m_comp.CreateVector3KeyFrameAnimation();
+                    shrink.InsertKeyFrame(1.0f, {0.96f, 0.96f, 1.0f}, down);
+                    shrink.Duration(ms(kStartHideMs));
+                    v.StartAnimation(L"Scale", shrink);
+                }
+            }
+        }
+        return;
+    }
     // The compact Halo 2 transition handles rise and fade without scaling the
     // glass. Other selected effects use the same compositor motion as panels.
     if (!reduce && (st.effect == settings::Effect::Bounce || st.effect == settings::Effect::Swipe || st.effect == settings::Effect::Swoop)) {
@@ -1551,6 +1752,7 @@ void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
     }
     const float speed = settings::Speed(st);
     auto ms = [&](float x) { return std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(x / speed)))); };
+    const float fadeInMs = m_h2 ? 220.0f : static_cast<float>(motion::kFadeInMs), outMs = m_h2 ? 150.0f : static_cast<float>(motion::kOutMs);  // 2.0: an unhurried fade
     v.StopAnimation(L"Scale");
     v.Scale({1, 1, 1});
     if (st.effect == settings::Effect::None) {
@@ -1570,7 +1772,7 @@ void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
             auto slide = m_comp.CreateVector3KeyFrameAnimation();
             slide.InsertKeyFrame(0.0f, {rest.x, rest.y + travel, rest.z});
             slide.InsertKeyFrame(1.0f, rest, m_easeOut);
-            slide.Duration(ms(motion::kFadeInMs));
+            slide.Duration(ms(fadeInMs));
             v.StartAnimation(L"Offset", slide);
         } else {
             v.Offset(rest);
@@ -1578,19 +1780,19 @@ void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
         auto fade = m_comp.CreateScalarKeyFrameAnimation();
         fade.InsertKeyFrame(0.0f, 0.0f);
         fade.InsertKeyFrame(1.0f, 1.0f, m_easeOut);
-        fade.Duration(ms(motion::kFadeInMs));
+        fade.Duration(ms(fadeInMs));
         v.StartAnimation(L"Opacity", fade);
     } else {
         auto down = m_comp.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.9f, 0.5f});
         if (travel != 0) {
             auto slide = m_comp.CreateVector3KeyFrameAnimation();
             slide.InsertKeyFrame(1.0f, {rest.x, rest.y + travel, rest.z}, down);
-            slide.Duration(ms(motion::kOutMs));
+            slide.Duration(ms(outMs));
             v.StartAnimation(L"Offset", slide);
         }
         auto fade = m_comp.CreateScalarKeyFrameAnimation();
         fade.InsertKeyFrame(1.0f, 0.0f, down);
-        fade.Duration(ms(motion::kOutMs));
+        fade.Duration(ms(outMs));
         v.StartAnimation(L"Opacity", fade);
     }
 }
@@ -1599,6 +1801,8 @@ void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
 // again in ~20 ms), so a closed Start costs the memory it had before it was ever opened.
 void Launcher::ReleaseVisuals() {
     if (!m_h2 || !m_root) return;
+    if (m_notifCol) m_notifCol->Release();
+    m_notifRoot = nullptr;
     m_root.Children().RemoveAll();
     m_appSprites.clear();
     m_fileSprites.clear();
@@ -1607,6 +1811,7 @@ void Launcher::ReleaseVisuals() {
     m_panel = m_content = m_shadowHold = m_menu = m_menuOuter = m_bodyIcons = m_listClip = m_listHold = m_listIcons = m_homeHold = m_ccClip = m_ccHold = m_usageVisual = nullptr;
     m_searchSurface = m_bodySurface = m_headerSurface = m_listSurface = m_ccSurface = m_usageSurface = nullptr;
     m_caret = nullptr;
+    m_wave = nullptr;
     m_hover = m_menuHover = m_ccPlate = m_sliderShapes = nullptr;
     m_hoverShape = m_menuHoverShape = m_ccPlateShape = m_brTrack = m_brFill = m_vlTrack = m_vlFill = nullptr;
     m_ccPlateSprite = nullptr;
@@ -1634,7 +1839,7 @@ void Launcher::Place() {
     int margin = static_cast<int>(kTop * m_s);
     int mx = static_cast<int>(m_shadowM), mb = static_cast<int>(m_shadowB);
     int top = m_anchor.bottom - static_cast<int>(m_h) - margin;
-    int winW = static_cast<int>(m_w) + 2 * mx, winH = static_cast<int>(m_h) + margin + mb;
+    int winW = static_cast<int>(PanelW()) + 2 * mx, winH = static_cast<int>(m_h) + margin + mb;
     SetWindowPos(m_hwnd, HWND_TOPMOST, x - mx, top, winW, winH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     if (EnvIs(L"HALO_TEST")) {
         auto mid0 = [&](D2D1_RECT_F const& r) {
@@ -1773,7 +1978,7 @@ void Launcher::ApplyRecent(bool redraw) {
         m_allFiles = std::move(m_recentRefresh->files);
         m_fileIcons = std::move(m_recentRefresh->icons);
     }
-    m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min<size_t>(m_allFiles.size(), kMaxFiles));
+    m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min<size_t>(m_allFiles.size(), m_h2 ? kH2Files : kMaxFiles));
     if (iconsChanged) m_fileBrushes.clear();
     std::wstring after;
     for (auto const& f : m_allFiles) after += f.path + L"|";
@@ -2000,6 +2205,7 @@ Launcher::Hit const* Launcher::HitAt(float x, float y) const {
 }
 
 Launcher::IconV const* Launcher::IconOf(Hit const& hit) const {
+    if (m_h2) return nullptr;  // 2.0: the wave drives the app icons (a spring on Scale would replace its expression)
     if (hit.kind == Kind::App && hit.index < static_cast<int>(m_appSprites.size()) && m_appSprites[hit.index].v)
         return &m_appSprites[hit.index];
     if (!m_h2 && hit.kind == Kind::File && hit.index < static_cast<int>(m_fileSprites.size()) && m_fileSprites[hit.index].v)
@@ -2056,27 +2262,16 @@ void Launcher::Highlight(D2D1_RECT_F const* r, float radius, bool inMenu) {
     float2 off{r->left, r->top}, size{r->right - r->left, r->bottom - r->top};
     if (!inMenu) m_plateTo = *r;
     shape.CornerRadius({radius * m_s, radius * m_s});
-    if (!on) {
-        shape.StopAnimation(L"Offset");
-        shape.StopAnimation(L"Size");
-        shape.Offset(off);
-        shape.Size(size);
-    } else {
-        auto glide = [&](wchar_t const* prop, float2 to) {
-            auto sp = m_comp.CreateSpringVector2Animation();
-            sp.FinalValue(Ref2(to));
-            sp.DampingRatio(0.72f);
-            sp.Period(std::chrono::milliseconds(50));
-            shape.StartAnimation(prop, sp);
-        };
-        glide(L"Offset", off);
-        glide(L"Size", size);
-    }
+    shape.StopAnimation(L"Offset");  // no glide between items: the plate is simply there (a gliding plate dragged on every scroll step)
+    shape.StopAnimation(L"Size");
+    shape.Offset(off);
+    shape.Size(size);
     on = true;
     Animate(visual, L"Opacity", 1.0f, 100);
 }
 
 void Launcher::OnHover(float x, float y) {
+    if (m_h2) MoveWave(x, y - kTop * m_s);
     auto const* hit = HitAt(x, y - kTop * m_s);
     {   // the right column has its own plate (it sits in the scrolling holder, so a scroll carries it along)
         int cc = -1;
@@ -2094,7 +2289,13 @@ void Launcher::OnHover(float x, float y) {
                     case Kind::CcVol: CcPlate(nullptr, 0); break;  // a slider has no plate: it answers the drag
                     case Kind::CcQuick:
                     case Kind::CcWifi:
-                    case Kind::CcBt: CcPlate(&b.r, start::tk::kRCard * m_s); break;
+                    case Kind::CcBt: CcPlate(&b.r, hh / 2); break;  // a pill, like the tile
+                    case Kind::CcToggle: {  // a round halo around the logo: this is the toggle
+                        const float bd = 30 * m_s, cx = b.r.left + 8 * m_s + bd / 2, cy = (b.r.top + b.r.bottom) / 2, hr = bd / 2 + 4 * m_s;
+                        D2D1_RECT_F halo = R(cx - hr, cy - hr, cx + hr, cy + hr);
+                        CcPlate(&halo, hr);
+                        break;
+                    }
                     case Kind::CcBack:
                     case Kind::CcRow: CcPlate(&b.r, start::tk::kRRow * m_s); break;
                     default: CcPlate(&b.r, hh / 2); break;  // round and pill controls
@@ -2137,12 +2338,14 @@ void Launcher::ToggleMenu(bool open) {
     auto mv = m_h2 ? m_menuOuter : m_menu;
     if (open) {
         mv.IsVisible(true);
-        mv.Offset({m_menuX, m_menuY + 6 * m_s, 0});
+        mv.Offset({m_menuX + m_nw, m_menuY + 6 * m_s, 0});
         Animate(mv, L"Offset.Y", m_menuY, 140);
         Animate(mv, L"Opacity", 1.0f, 120);
         Animate(m_content, L"Opacity", m_h2 ? 0.45f : 0.3f, 120);
+        if (m_notifRoot) Animate(m_notifRoot, L"Opacity", 0.45f, 120);
     } else {
         Animate(m_content, L"Opacity", 1.0f, 120);
+        if (m_notifRoot) Animate(m_notifRoot, L"Opacity", 1.0f, 120);
         auto menu = mv;
         auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
         Animate(mv, L"Opacity", 0.0f, 100);
@@ -2353,11 +2556,23 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == kServicesTimer) {
                 KillTimer(m_hwnd, kServicesTimer);
+                if (m_open && m_h2 && m_notifCol) m_notifCol->SetActive(true);  // reads the notifications and keeps them current while Start is up
                 if (m_open && !m_servicesOn) StartServices();
             }
             else if (w == kRefreshTimer) {
                 KillTimer(m_hwnd, kRefreshTimer);
                 if (m_open) Refresh();
+            }
+            else if (w == kRehoverTimer) {
+                KillTimer(m_hwnd, kRehoverTimer);
+                if (m_open) RehoverAtCursor();
+            }
+            else if (w == kOpenTimer) {  // the first frame with the new surfaces has landed: now the spring
+                KillTimer(m_hwnd, kOpenTimer);
+                if (m_open) {
+                    OpenMotion(m_panel, {0, kTop * m_s, 0}, true);
+                    if (m_shadowHold) OpenMotion(m_shadowHold, PanelHome(), true);
+                }
             }
             else if (w == kCaretTimer) {
                 if (m_open && m_caret) {  // the caret blinks from here, not from a forever-animation (that keeps the GPU compositing at 60 fps)
@@ -2375,7 +2590,7 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_MOUSEMOVE:
             if (m_drag) {
-                CcDrag(mx - m_shadowM);
+                CcDrag(PX(mx));
                 return 0;
             }
             static const bool test = EnvIs(L"HALO_TEST");  // posted test moves would be followed by an instant WM_MOUSELEAVE
@@ -2383,7 +2598,13 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, m_hwnd, 0};
                 m_tracking = TrackMouseEvent(&tme);
             }
-            if (m_open) OnHover(mx - m_shadowM, my);
+            if (m_open && m_h2 && m_notifCol && mx - m_shadowM < m_nw) {  // over the notification column
+                OnHover(-1, -1);                                              // nothing of the middle or right is hovered
+                m_notifCol->Move(mx - m_shadowM, my - kTop * m_s);
+                return 0;
+            }
+            if (m_notifCol) m_notifCol->Leave();
+            if (m_open) OnHover(PX(mx), my);
             return 0;
         case kMsgAppsFolder: {
             std::unique_ptr<Found> more(reinterpret_cast<Found*>(l));
@@ -2409,10 +2630,15 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_MOUSEWHEEL:  // three rows a notch; a touchpad's smaller steps add up
+            if (m_open && m_h2 && m_notifCol && !m_menuOpen) {  // the notification list scrolls under the pointer
+                POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
+                ScreenToClient(m_hwnd, &p);
+                if (p.x - m_shadowM < m_nw && m_notifCol->Wheel(static_cast<float>(p.x) - m_shadowM, p.y - kTop * m_s, GET_WHEEL_DELTA_WPARAM(w))) return 0;
+            }
             if (m_open && m_h2 && !m_menuOpen && !Listing()) {
                 POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
                 ScreenToClient(m_hwnd, &p);
-                if (p.x - m_shadowM < m_lw && p.y - kTop * m_s >= m_bodyTop && p.y - kTop * m_s < m_bodyBottom) {
+                if (PX(static_cast<float>(p.x)) >= 0 && PX(static_cast<float>(p.x)) < m_lw && p.y - kTop * m_s >= m_bodyTop && p.y - kTop * m_s < m_bodyBottom) {
                     ScrollHome(-GET_WHEEL_DELTA_WPARAM(w) * ui::kS6 * m_s / WHEEL_DELTA);
                     return 0;
                 }
@@ -2420,14 +2646,14 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (m_open && m_h2 && !m_menuOpen && m_detail == Detail::None) {
                 POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
                 ScreenToClient(m_hwnd, &p);
-                if (p.x - m_shadowM >= m_lw) {
+                if (PX(static_cast<float>(p.x)) >= m_lw) {
                     ScrollRight(-GET_WHEEL_DELTA_WPARAM(w) * ui::kS6 * m_s / WHEEL_DELTA);
                     return 0;
                 }
             }
             if (m_open && m_h2 && !m_menuOpen && m_detail != Detail::None) {  // over the right column the radio list scrolls
                 POINT p;
-                if (GetCursorPos(&p) && ScreenToClient(m_hwnd, &p) && p.x - m_shadowM >= m_lw) {
+                if (GetCursorPos(&p) && ScreenToClient(m_hwnd, &p) && PX(static_cast<float>(p.x)) >= m_lw) {
                     m_wheel -= GET_WHEEL_DELTA_WPARAM(w) * 3;
                     const int rows = m_wheel / WHEEL_DELTA;
                     m_wheel -= rows * WHEEL_DELTA;
@@ -2448,30 +2674,33 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                     POINT p;  // the list moved under a still pointer: hover what is there now
                     if (GetCursorPos(&p) && ScreenToClient(m_hwnd, &p)) {
                         m_hoverIndex = -2;
-                        OnHover(p.x - m_shadowM, static_cast<float>(p.y));
+                        OnHover(PX(static_cast<float>(p.x)), static_cast<float>(p.y));
                     }
                 }
             }
             return 0;
         case WM_MOUSELEAVE:
             m_tracking = false;
+            if (m_notifCol) m_notifCol->Leave();
             if (m_open) OnHover(-1, -1);
             return 0;
         case WM_LBUTTONDOWN:
             // The shadow margins (sides, bottom) are outside the panel: treat a click there as a click
             // outside and dismiss, like macOS.
-            if (m_open && (mx < m_shadowM || mx >= m_shadowM + m_w || my >= kTop * m_s + m_h)) {
+            if (m_open && (mx < m_shadowM || mx >= m_shadowM + PanelW() || my >= kTop * m_s + m_h)) {
                 Hide();
                 return 0;
             }
+            m_pressedNotif = m_open && m_h2 && m_notifCol && mx - m_shadowM < m_nw;
+            if (m_pressedNotif) return 0;  // the notification column acts on release
             if (m_open) {
-                auto const* hit = HitAt(mx - m_shadowM, my - kTop * m_s);
+                auto const* hit = HitAt(PX(mx), my - kTop * m_s);
                 m_pressedIndex = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
                 if (hit && (hit->kind == Kind::CcBright || hit->kind == Kind::CcVol)) {  // a slider takes the pointer until the button comes up
                     m_drag = static_cast<int>(hit->kind);
                     m_pressedIndex = -1;
                     SetCapture(m_hwnd);
-                    CcDrag(mx - m_shadowM);
+                    CcDrag(PX(mx));
                     return 0;
                 }
                 if (m_h2 && hit && !m_ccHits.empty() && hit >= m_ccHits.data() && hit < m_ccHits.data() + m_ccHits.size() &&
@@ -2494,9 +2723,13 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 m_pressedIndex = -1;
                 return 0;
             }
+            if (std::exchange(m_pressedNotif, false)) {
+                if (m_open && m_notifCol && mx - m_shadowM < m_nw) m_notifCol->Click(mx - m_shadowM, my - kTop * m_s);
+                return 0;
+            }
             if (m_open) {
                 if (m_h2) CcPress(false);
-                auto const* hit = HitAt(mx - m_shadowM, my - kTop * m_s);
+                auto const* hit = HitAt(PX(mx), my - kTop * m_s);
                 int key = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
                 if (hit && key == m_pressedIndex) {
                     Hit copy = *hit;
@@ -2561,26 +2794,6 @@ wchar_t const* ModeLabel(svc::PowerMode m) {
     }
 }
 
-std::wstring DateText(SYSTEMTIME const& st, wchar_t const* format) {
-    wchar_t b[64] = {};
-    return GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, format, b, 64, nullptr) ? std::wstring(b) : std::wstring();
-}
-
-// 0 = Sunday .. 6 = Saturday: the column-0 weekday of the user's calendar.
-int FirstWeekday() {
-    DWORD v = 0;  // LOCALE_IFIRSTDAYOFWEEK: 0 = Monday .. 6 = Sunday
-    if (!GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_IFIRSTDAYOFWEEK | LOCALE_RETURN_NUMBER, reinterpret_cast<LPWSTR>(&v),
-                         sizeof(v) / sizeof(wchar_t)))
-        return 0;
-    return static_cast<int>((v + 1) % 7);
-}
-
-std::wstring WeekdayLetter(int dow) {  // dow 0 = Sunday
-    wchar_t b[32] = {};
-    if (!GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SABBREVDAYNAME1 + (dow + 6) % 7, b, 32) || !b[0]) return L"?";
-    return std::wstring(1, static_cast<wchar_t>(std::towupper(b[0])));
-}
-
 // "(2) Some page | Site" -> "Some page | Site": browsers put the unread count in front of the title.
 std::wstring CleanTitle(std::wstring t) {
     if (t.size() > 3 && t[0] == L'(') {
@@ -2599,12 +2812,12 @@ int ModeIndex(svc::PowerMode m) {
 
 float Launcher::PanelX() const {
     const RECT& mon = m_anchor.monitor;
-    if (m_h2) return mon.left + (mon.right - mon.left - m_w) / 2;
+    if (m_h2) return mon.left + (mon.right - mon.left - PanelW()) / 2;
     return static_cast<float>(std::clamp(m_anchor.centerX - static_cast<int>(m_w) / 2, static_cast<int>(mon.left), static_cast<int>(mon.right - m_w)));
 }
 
 float Launcher::CornerX() const {
-    return m_h2 ? std::clamp((m_anchor.centerX - PanelX()) / std::max(m_w, 1.0f), 0.0f, 1.0f) : 0.5f;
+    return m_h2 ? std::clamp((m_anchor.centerX - PanelX()) / std::max(PanelW(), 1.0f), 0.0f, 1.0f) : 0.5f;
 }
 
 std::wstring Launcher::AppName(std::wstring const& target) const {
@@ -2632,19 +2845,19 @@ std::wstring Launcher::AppName(std::wstring const& target) const {
 
 void Launcher::SetScroll(wuc::ContainerVisual const& hold, float y) {
     if (!hold) return;
-    const auto dur = settings::Get().reduceMotion
-                         ? std::chrono::milliseconds(1)
-                         : std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(160 / settings::Speed(settings::Get().start)))));
-    auto a = m_comp.CreateScalarKeyFrameAnimation();
-    a.InsertKeyFrame(1.0f, y, m_easeOut);
-    a.Duration(dur);
-    const unsigned gen = m_gen;
-    auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    hold.StartAnimation(L"Offset.Y", a);
-    batch.End();
-    batch.Completed([this, gen](auto&&, auto&&) {
-        if (gen == m_gen && m_open) RehoverAtCursor();  // what is under a still pointer now
-    });
+    if (settings::Get().reduceMotion) {
+        hold.StopAnimation(L"Offset.Y");
+        hold.Offset({hold.Offset().x, y, hold.Offset().z});
+    } else {
+        // Critically damped spring: each frame closes a fixed fraction of what is left (an exponential ease-out), and a
+        // new wheel notch only moves the target, so velocity carries over instead of restarting like a keyframe would.
+        auto a = m_comp.CreateSpringScalarAnimation();
+        a.FinalValue(y);
+        a.DampingRatio(1.0f);
+        a.Period(std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(kScrollSpringMs / settings::Speed(settings::Get().start))))));
+        hold.StartAnimation(L"Offset.Y", a);
+    }
+    SetTimer(m_hwnd, kRehoverTimer, 140, nullptr);  // what is under a still pointer once the wheel has paused
 }
 
 void Launcher::RehoverAtCursor() {
@@ -2652,7 +2865,7 @@ void Launcher::RehoverAtCursor() {
     if (!m_open || m_menuOpen || !GetCursorPos(&p) || !ScreenToClient(m_hwnd, &p)) return;
     m_hoverIndex = -2;
     m_ccHover = -2;
-    OnHover(p.x - m_shadowM, static_cast<float>(p.y));
+    OnHover(PX(static_cast<float>(p.x)), static_cast<float>(p.y));
 }
 
 void Launcher::ShiftHits() {
@@ -2700,116 +2913,31 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
     auto at = [&](D2D1_RECT_F r) { return R(r.left + ox, r.top + dy, r.right + ox, r.bottom + dy); };
     SYSTEMTIME st;
     GetLocalTime(&st);
-
-    {   // the hero: "Hello Name", and the quote of the day under it
+    {   // the hero: "Hello Name" with the time and date on the right, and a quote of the day under it (upright, not italic)
         auto g = at(m_greetRect);
         const float clockLeft = g.right - start::kGreetingClockW * s;
-        auto fHello = txt.Format(ui::kFontDisplay, tk::kHero * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        auto fHello = txt.Format(ui::kFontDisplay, 26 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         txt.Draw(dc, L"Hello " + start::FirstName(m_user, m_user), fHello.get(), R(g.left, g.top, clockLeft - tk::kGroup * s, g.top + start::kGreetH * s),
                  c.ink.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
-        wchar_t clock[64] = {};
+        wchar_t clock[64] = {}, date[64] = {};
         GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &st, nullptr, clock, 64);
+        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, L"ddd, d MMM", date, 64, nullptr);
         auto fTime = txt.Format(ui::kFontText, tk::kTitle * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         auto fDate = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_NORMAL);
         txt.Draw(dc, clock, fTime.get(), R(clockLeft, g.top, g.right, g.top + 24 * s), c.ink.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
-        txt.Draw(dc, DateText(st, L"ddd, d MMM"), fDate.get(), R(clockLeft, g.top + 24 * s, g.right, g.top + start::kGreetH * s),
-                 c.muted.get(), DWRITE_TEXT_ALIGNMENT_TRAILING, true);
+        txt.Draw(dc, date, fDate.get(), R(clockLeft, g.top + 24 * s, g.right, g.top + start::kGreetH * s), c.muted.get(), DWRITE_TEXT_ALIGNMENT_TRAILING, true);
         auto const q = start::QuoteForDate(st.wYear, st.wMonth, st.wDay);
-        const bool compactQuote = m_plan.greetH < start::kGreetQuoteH;
-        auto fQuote = txt.Format(ui::kFontText, (compactQuote ? tk::kCap : tk::kTitle) * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        const float quoteTop = g.top + (start::kGreetH + 4) * s, quoteH = g.bottom - quoteTop;
+        auto fQuote = txt.Format(ui::kFontText, 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
         fQuote->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-        const std::wstring words = q.text, credit = L" - " + std::wstring(q.author);
-        auto layout = txt.Layout(words + credit, fQuote.get(), g.right - g.left, (m_plan.greetH - start::kGreetH) * s);
-        if (layout) {
-            const DWRITE_TEXT_RANGE quoteRange{0, static_cast<UINT32>(words.size())};
-            const DWRITE_TEXT_RANGE creditRange{quoteRange.length, static_cast<UINT32>(credit.size())};
-            layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, quoteRange);
-            layout->SetFontSize((compactQuote ? tk::kCap - 2 : tk::kCap) * s, creditRange);
-            layout->SetFontWeight(DWRITE_FONT_WEIGHT_NORMAL, creditRange);
+        fQuote->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        const std::wstring words = q.text, credit = L"  —  " + std::wstring(q.author);
+        if (auto layout = txt.Layout(words + credit, fQuote.get(), g.right - g.left, quoteH)) {
+            const DWRITE_TEXT_RANGE creditRange{static_cast<UINT32>(words.size()), static_cast<UINT32>(credit.size())};
+            layout->SetFontSize(tk::kCap * s, creditRange);
             layout->SetDrawingEffect(c.muted.get(), creditRange);
-            if (compactQuote) layout->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, tk::kCap * s, (tk::kCap - 2) * s);
-            for (float size = compactQuote ? tk::kCap : tk::kTitle; size > tk::kCap; ) {
-                DWRITE_TEXT_METRICS metrics{};
-                layout->GetMetrics(&metrics);
-                if (metrics.height <= (m_plan.greetH - start::kGreetH) * s) break;
-                size -= 2;
-                layout->SetFontSize(size * s, quoteRange);
-            }
-            dc->DrawTextLayout({g.left, g.top + start::kGreetH * s}, layout.get(), c.soft.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        }
-    }
-
-    const float radius = tk::kRCard * s, pad = tk::kPad * s;
-    auto card = [&](D2D1_RECT_F r) {
-        auto rr = D2D1::RoundedRect(R(r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f), radius, radius);
-        dc->FillRoundedRectangle(rr, c.fill.get());
-        dc->DrawRoundedRectangle(rr, c.line.get(), 1.0f);
-    };
-
-    {   // Battery: the percentage, the estimate (muted), a battery glyph, and the Windows power mode as a segmented control.
-        auto r = at(m_cardRect);
-        card(r);
-        auto fBig = txt.Format(ui::kFontText, tk::kTitle * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        auto fCap = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_NORMAL);
-        auto fCapB = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        const std::wstring battery = m_battery.hasBattery ? std::to_wstring(m_battery.percent) + L"%" : L"AC power";
-        std::wstring remaining = m_battery.charging ? L"Charging" : m_battery.ac ? L"Plugged in" : L"Estimating…";
-        if (!m_battery.ac && m_battery.remainingSeconds >= 0) {
-            const int minutes = m_battery.remainingSeconds / 60;
-            remaining = std::to_wstring(minutes / 60) + L"h " + std::to_wstring(minutes % 60) + L"m left";
-        }
-        txt.Draw(dc, battery, fBig.get(), R(r.left + pad, r.top + pad, r.right - pad - 40 * s, r.top + pad + 24 * s), c.ink.get());
-        txt.Draw(dc, remaining, fCap.get(), R(r.left + pad, r.top + pad + 24 * s, r.right - pad, r.top + pad + 40 * s), c.muted.get(),
-                 DWRITE_TEXT_ALIGNMENT_LEADING, true);
-        if (m_battery.hasBattery) {  // the glyph: an outline, a fill to the charge, the nub
-            const float bw = 26 * s, bh = 13 * s, bx = r.right - pad - bw - 3 * s, by = r.top + pad + 5.5f * s;
-            dc->DrawRoundedRectangle(D2D1::RoundedRect(R(bx, by, bx + bw, by + bh), 4 * s, 4 * s), c.muted.get(), 1.5f);
-            const float fillW = (bw - 5 * s) * std::clamp(m_battery.percent, 0, 100) / 100.0f;
-            if (fillW > 0.5f) dc->FillRoundedRectangle(D2D1::RoundedRect(R(bx + 2.5f * s, by + 2.5f * s, bx + 2.5f * s + fillW, by + bh - 2.5f * s), 1.5f * s, 1.5f * s), c.ink.get());
-            dc->FillRoundedRectangle(D2D1::RoundedRect(R(bx + bw + 1 * s, by + 4 * s, bx + bw + 3 * s, by + bh - 4 * s), 1 * s, 1 * s), c.muted.get());
-        }
-        auto track = at(m_modeRect);
-        const bool known = m_mode != svc::PowerMode::Unknown;
-        const float modeCorner = (tk::kRRow - ui::kS1) * s;
-        dc->FillRoundedRectangle(D2D1::RoundedRect(track, modeCorner, modeCorner), c.hover.get());
-        static const wchar_t* labels[] = {L"Efficiency", L"Balanced", L"Performance"};
-        const int sel = ModeIndex(m_mode);
-        for (int i = 0; i < 3; i++) {
-            auto seg = at(m_modeSeg[i]);
-            if (known && i == sel) {
-                auto in = Inflate(seg, -2 * s);
-                const float corner = modeCorner - 2 * s;
-                dc->FillRoundedRectangle(D2D1::RoundedRect(in, corner, corner), c.sel.get());
-            }
-            txt.Draw(dc, labels[i], (known && i == sel ? fCapB : fCap).get(), seg, known && i == sel ? c.ink.get() : c.muted.get(),
-                     DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
-    }
-
-    {   // the week: month on one line, the weekday letters, the dates with today in the accent circle
-        auto r = at(m_calRect);
-        card(r);
-        auto fTitle = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        auto fLetter = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_NORMAL);
-        auto fDay = txt.Format(ui::kFontText, tk::kText * s, DWRITE_FONT_WEIGHT_NORMAL);
-        auto fToday = txt.Format(ui::kFontText, tk::kText * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        const int first = FirstWeekday();
-        auto const grid = start::MakeMonthGrid(st.wYear, st.wMonth, st.wDay, first);
-        const float colW = (r.right - r.left - 2 * pad) / 7, x0 = r.left + pad;
-        txt.Draw(dc, DateText(st, L"MMMM yyyy"), fTitle.get(), R(x0, r.top + pad, r.right - pad, r.top + pad + 16 * s), c.ink.get(),
-                 DWRITE_TEXT_ALIGNMENT_LEADING, true);
-        const float lettersTop = r.top + pad + 20 * s, daysTop = r.bottom - pad - 28 * s;
-        for (int col = 0; col < 7; col++)
-            txt.Draw(dc, WeekdayLetter((first + col) % 7), fLetter.get(), R(x0 + col * colW, lettersTop, x0 + (col + 1) * colW, lettersTop + 16 * s),
-                     c.muted.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        const int row = std::max(grid.todayCell, 0) / 7;
-        for (int col = 0; col < 7; col++) {
-            const int idx = row * 7 + col, d = grid.day[idx];
-            if (!d) continue;
-            D2D1_RECT_F cell = R(x0 + col * colW, daysTop, x0 + (col + 1) * colW, daysTop + 28 * s);
-            const bool today = idx == grid.todayCell;
-            if (today) dc->FillEllipse(D2D1::Ellipse({Mid(cell.left, cell.right), Mid(cell.top, cell.bottom)}, 14 * s, 14 * s), c.accent.get());
-            txt.Draw(dc, std::to_wstring(d), (today ? fToday : fDay).get(), cell, today ? c.onAccent.get() : c.soft.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            layout->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, 20 * s, 15 * s);
+            dc->DrawTextLayout({g.left, quoteTop}, layout.get(), c.soft.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     }
 }
@@ -2838,6 +2966,8 @@ void Launcher::RefreshWidgets() {
     m_mode = svc::ReadPowerMode();
     if (m_headerSurface) Redraw(m_headerSurface, &Launcher::DrawHeader);
     RedrawBody();
+    LayoutRight();  // the power-mode targets exist only while the mode is known
+    RedrawRight();
 }
 
 // A segment of the power-mode control: Efficiency, Balanced or Performance, through the Windows power overlay API.
@@ -2853,8 +2983,7 @@ void Launcher::SetMode(int index) {
         m_mode = now == svc::PowerMode::Unknown ? next : now;
         Log(std::wstring(L"power mode: ") + ModeLabel(m_mode));
     }
-    if (m_headerSurface) Redraw(m_headerSurface, &Launcher::DrawHeader);
-    RedrawBody();
+    RedrawRight();
 }
 
 // ---- Right: services -----------------------------------------------------------------------------------------
@@ -2958,10 +3087,10 @@ void Launcher::OnServiceMessage(UINT m) {
 
 void Launcher::BuildRight(float rightW) {
     const float s = m_s;
-    m_rplan = start::PlanRight(m_h / s);
+    m_rplan = start::PlanRight(m_h / s, 6, true);  // six tile rows, compact; this card has no footer under it
     const float wpx = m_w - m_lw;
     m_rightRect = R(m_lw, 0, m_w, m_h);
-    m_barTop = m_divider.top;
+    m_barTop = m_h;  // the control centre card runs the full height: no footer under it
     const float contentH = std::max(m_barTop, std::ceil(m_rplan.bottom * s));
     auto const& pal = theme::P();
 
@@ -2982,10 +3111,11 @@ void Launcher::BuildRight(float rightW) {
             sp.FillBrush(m_comp.CreateColorBrush(Col(col)));
             sv.Shapes().Append(sp);
         };
-        add(m_brTrack, pal.off);
-        add(m_brFill, pal.text);
-        add(m_vlTrack, pal.off);
-        add(m_vlFill, pal.text);
+        const auto tn = theme::TonalNow();
+        add(m_brTrack, tn.tint2);
+        add(m_brFill, tn.pc);
+        add(m_vlTrack, tn.tint2);
+        add(m_vlFill, tn.pc);
         m_sliderShapes = sv;
         m_ccHold.Children().InsertAtTop(sv);
     }
@@ -3008,14 +3138,6 @@ void Launcher::BuildRight(float rightW) {
         m_ccPlate.Opacity(0.0f);
         m_ccPlateOn = false;
         m_ccHold.Children().InsertAtTop(m_ccPlate);
-    }
-    {   // the hairline between the columns
-        auto line = m_comp.CreateSpriteVisual();
-        const float t = std::max(1.0f, std::round(s));
-        line.Size({t, m_barTop - 2 * start::kRightPad * s});
-        line.Offset({m_lw, start::kRightPad * s, 0});
-        line.Brush(m_comp.CreateColorBrush(Col(pal.line)));
-        m_content.Children().InsertAtTop(line);
     }
     m_content.Children().InsertAtTop(m_ccClip);
     m_ccHover = -1;
@@ -3055,23 +3177,33 @@ void Launcher::LayoutRight() {
 
     const float gap = tk::kInCard * s, tw = (x1 - x0 - gap) / 2, ty0 = p.rowY[0] * s, ty1 = ty0 + p.rowH * s;
     const D2D1_RECT_F wifi = R(x0, ty0, x0 + tw, ty1), bt = R(x1 - tw, ty0, x1, ty1);
-    auto more = [&](D2D1_RECT_F t) { return R(t.right - 8 * s - 32 * s, Mid(ty0, ty1) - 16 * s, t.right - 8 * s, Mid(ty0, ty1) + 16 * s); };
+    // The logo zone of a tile toggles; anywhere else on it opens the list (Wi-Fi, Bluetooth) or its Settings page.
+    auto zone = [&](D2D1_RECT_F t) { return R(t.left, t.top, t.left + 46 * s, t.bottom); };
     add(Kind::CcWifi, 0, wifi);
-    add(Kind::CcWifiMore, 0, more(wifi));
+    add(Kind::CcToggle, 0, zone(wifi));
     add(Kind::CcBt, 0, bt);
-    add(Kind::CcBtMore, 0, more(bt));
+    add(Kind::CcToggle, 1, zone(bt));
 
     if (m_detail == Detail::None) {
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < kQuickTiles; ++i) {
             const float x = i % 2 ? x1 - tw : x0, y = p.rowY[1 + i / 2] * s;
             add(Kind::CcQuick, i, R(x, y, x + tw, y + p.rowH * s));
+            add(Kind::CcToggle, 10 + i, zone(R(x, y, x + tw, y + p.rowH * s)));
+        }
+        {   // the battery bar: battery on the left, the power mode (Efficiency / Balanced / Performance) on the right
+            m_cardRect = R(x0, p.battY * s, x1, (p.battY + p.battH) * s);
+            const float segW = 70 * s, segH = 30 * s, right = x1 - 7 * s, cy = Mid(m_cardRect.top, m_cardRect.bottom);
+            for (int i = 0; i < 3; i++) m_modeSeg[i] = R(right - (3 - i) * segW, cy - segH / 2, right - (2 - i) * segW, cy + segH / 2);
+            m_modeRect = R(m_modeSeg[0].left, m_modeSeg[0].top, m_modeSeg[2].right, m_modeSeg[2].bottom);
+            if (m_mode != svc::PowerMode::Unknown)
+                for (int i = 0; i < 3; i++) add(Kind::PowerMode, i, m_modeSeg[i]);
         }
         const float bh = p.sliderH * s, chev = tk::kChevBtn * s;
         add(Kind::CcBright, 0, R(x0, p.brightY * s, x1, p.brightY * s + bh));
         add(Kind::CcVol, 0, R(x0, p.volY * s, x1 - chev - gap, p.volY * s + bh));
         add(Kind::CcMute, 0, R(x0, p.volY * s, x0 + bh, p.volY * s + bh));
         add(Kind::CcOutMore, 0, R(x1 - chev, p.volY * s, x1, p.volY * s + bh));
-        const float my = p.mediaY * s, mh = p.mediaH * s, b = tk::kMediaBtn * s;
+        const float my = p.mediaY * s, mh = p.mediaH * s, b = (p.rows >= 6 ? 28.0f : tk::kMediaBtn) * s;
         const float bx = x1 - tk::kPad * s - 3 * b, by = my + (mh - b) / 2;
         add(Kind::CcPrev, 0, R(bx, by, bx + b, by + b));
         add(Kind::CcPlay, 0, R(bx + b, by, bx + 2 * b, by + b));
@@ -3080,6 +3212,7 @@ void Launcher::LayoutRight() {
         m_sliderShapes.IsVisible(true);
         return;
     }
+    m_cardRect = R(0, 0, 0, 0);
     m_usageVisual.IsVisible(false);
     m_sliderShapes.IsVisible(false);
     const float top = ty1 + tk::kInGroup * s, bottom = m_barTop - pad;
@@ -3149,22 +3282,10 @@ void Launcher::CcPlate(D2D1_RECT_F const* r, float radius) {
     const float2 off{r->left - m_lw, r->top}, size{r->right - r->left, r->bottom - r->top};
     m_ccPlateShape.CornerRadius({radius, radius});
     m_ccPlateSprite.CenterPoint({off.x + size.x / 2, off.y + size.y / 2});
-    if (!m_ccPlateOn) {
-        m_ccPlateShape.StopAnimation(L"Offset");
-        m_ccPlateShape.StopAnimation(L"Size");
-        m_ccPlateShape.Offset(off);
-        m_ccPlateShape.Size(size);
-    } else {
-        auto glide = [&](wchar_t const* prop, float2 to) {  // critically damped: it arrives without overshoot
-            auto sp = m_comp.CreateSpringVector2Animation();
-            sp.FinalValue(Ref2(to));
-            sp.DampingRatio(1.0f);
-            sp.Period(std::chrono::milliseconds(50));
-            m_ccPlateShape.StartAnimation(prop, sp);
-        };
-        glide(L"Offset", off);
-        glide(L"Size", size);
-    }
+    m_ccPlateShape.StopAnimation(L"Offset");  // no glide: see Highlight
+    m_ccPlateShape.StopAnimation(L"Size");
+    m_ccPlateShape.Offset(off);
+    m_ccPlateShape.Size(size);
     m_ccPlateOn = true;
     Animate(m_ccPlate, L"Opacity", 1.0f, ui::kHoverMs);
 }
@@ -3199,24 +3320,44 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
     auto pill = [&](D2D1_RECT_F r, float rad, ID2D1Brush* b) { dc->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), b); };
     const float tileR = tk::kRCard * s;
     const bool demo = m_demo;
+    const auto tn = theme::TonalNow();
+    winrt::com_ptr<ID2D1SolidColorBrush> bT1, bT2, bPc, bOn;
+    dc->CreateSolidColorBrush(tn.tint1, bT1.put());
+    dc->CreateSolidColorBrush(tn.tint2, bT2.put());
+    dc->CreateSolidColorBrush(tn.pc, bPc.put());
+    dc->CreateSolidColorBrush(tn.onpc, bOn.put());
+    auto fNameC = txt.Format(ui::kFontText, 12 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    auto fSubC = txt.Format(ui::kFontText, 11 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    auto fIconC = txt.Format(ui::kFontIcons, 15 * s, DWRITE_FONT_WEIGHT_NORMAL);
 
     // A tile: a neutral surface with the icon in a round badge (accent when on), a name and a state under it.
     auto tile = [&](D2D1_RECT_F r, wchar_t g, bool on, bool avail, std::wstring const& name, std::wstring const& state, float rightInset) {
-        auto rr = D2D1::RoundedRect(R(r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f), tileR, tileR);
-        dc->FillRoundedRectangle(rr, c.fill.get());
-        dc->DrawRoundedRectangle(rr, c.line.get(), 1.0f);
-        const float a = avail ? 1.0f : 0.45f, bd = tk::kBadge * s, cx = r.left + tk::kPad * s + bd / 2, cy = Mid(r.top, r.bottom);
+        (void)rightInset;
+        // A pill. Off: the accent's faint tint. On: filled with the tonal "primary container", and the logo turns from a
+        // circle into a rounded square (the shape says "on" before the colour does).
+        const float pr = (r.bottom - r.top) / 2;
+        dc->FillRoundedRectangle(D2D1::RoundedRect(r, pr, pr), on ? bPc.get() : bT1.get());
+        const float a = avail ? 1.0f : 0.45f, bd = 30 * s, cx = r.left + 8 * s + bd / 2, cy = Mid(r.top, r.bottom);
         c.ink->SetOpacity(a);
         c.muted->SetOpacity(a);
-        c.onAccent->SetOpacity(a);
-        dc->FillEllipse(D2D1::Ellipse({cx, cy}, bd / 2, bd / 2), on ? c.accent.get() : c.hover.get());
-        glyph(g, R(cx - bd / 2, cy - bd / 2, cx + bd / 2, cy + bd / 2), on ? c.onAccent.get() : c.ink.get(), fIcon.get());
-        const float tx = cx + bd / 2 + tk::kPad * s;
-        txt.Draw(dc, name, fName.get(), R(tx, cy - 20 * s, r.right - rightInset, cy), c.ink.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
-        txt.Draw(dc, state, fSub.get(), R(tx, cy, r.right - rightInset, cy + 18 * s), c.muted.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        bOn->SetOpacity(a);
+        bPc->SetOpacity(a);
+        if (on) dc->FillRoundedRectangle(D2D1::RoundedRect(R(cx - bd / 2, cy - bd / 2, cx + bd / 2, cy + bd / 2), bd * 0.34f, bd * 0.34f), bOn.get());
+        else dc->FillEllipse(D2D1::Ellipse({cx, cy}, bd / 2, bd / 2), bT2.get());
+        glyph(g, R(cx - bd / 2, cy - bd / 2, cx + bd / 2, cy + bd / 2), on ? bPc.get() : c.ink.get(), fIconC.get());
+        const float tx = cx + bd / 2 + 8 * s, tr = r.right - 6 * s;
+        auto* ink = on ? bOn.get() : c.ink.get();
+        if (state.empty()) {
+            txt.Draw(dc, name, fNameC.get(), R(tx, r.top, tr, r.bottom), ink, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        } else {
+            txt.Draw(dc, name, fNameC.get(), R(tx, cy - 15 * s, tr, cy + 1 * s), ink, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+            on ? bOn->SetOpacity(0.7f * a) : c.muted->SetOpacity(a);
+            txt.Draw(dc, state, fSubC.get(), R(tx, cy + 1 * s, tr, cy + 15 * s), on ? bOn.get() : c.muted.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        }
         c.ink->SetOpacity(1.0f);
         c.muted->SetOpacity(1.0f);
-        c.onAccent->SetOpacity(1.0f);
+        bOn->SetOpacity(1.0f);
+        bPc->SetOpacity(1.0f);
     };
     const bool hasWifi = demo || m_radios.HasWifi(), hasBt = demo || m_radios.HasBluetooth();
 
@@ -3226,13 +3367,15 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
         const float h2 = (r.bottom - r.top) / 2;
         switch (h.kind) {
             case Kind::CcQuick: {
-                static const wchar_t* names[] = {L"Airplane", L"Hotspot", L"Do not disturb", L"Night light", L"Dark mode", L"Microphone"};
-                static const wchar_t icons[] = {0xE709, 0xE704, 0xE708, 0xF08C, 0xE790, 0xE720};
+                static const wchar_t* names[] = {L"Airplane", L"Hotspot", L"Focus", L"Night light", L"Dark mode", L"Microphone", L"Battery saver", L"Screenshot", L"Cast", L"Project"};
+                static const wchar_t icons[] = {0xE709, 0xE704, 0xE708, 0xF08C, 0xE790, 0xE720, 0xE83F, 0xF7ED, 0xEC15, 0xE7F4};
+                SYSTEM_POWER_STATUS sps{};
+                GetSystemPowerStatus(&sps);
                 const bool airAvail = hasWifi || hasBt;
                 const bool avail = h.index == 0 ? airAvail : h.index == 1 ? m_hotspotAvail : h.index == 5 ? (m_mic.Available() || demo) : true;
                 const bool on = h.index == 0 ? (airAvail && !m_wifiOn && !m_btOn) : h.index == 1 ? m_hotspotOn : h.index == 2 ? m_dnd
-                                : h.index == 3 ? m_night : h.index == 4 ? m_dark : m_micMuted;
-                std::wstring state = !avail ? (h.index == 0 && (!m_servicesOn || m_radios.Loading()) ? L"Checking…" : h.index == 0 && m_radios.Failed() ? L"Check Settings" : L"Unavailable") : h.index == 5 ? (m_micMuted ? L"Muted" : L"On") : on ? L"On" : L"Off";
+                                : h.index == 3 ? m_night : h.index == 4 ? m_dark : h.index == 5 ? m_micMuted : h.index == 6 ? (sps.SystemStatusFlag & 1) != 0 : false;
+                std::wstring state = h.index >= 7 ? L"" : !avail ? (h.index == 0 && (!m_servicesOn || m_radios.Loading()) ? L"Checking…" : h.index == 0 && m_radios.Failed() ? L"Check Settings" : L"Unavailable") : h.index == 5 ? (m_micMuted ? L"Muted" : L"On") : on ? L"On" : L"Off";
                 tile(r, h.index == 5 && m_micMuted ? 0xEC54 : icons[h.index], on, avail, names[h.index], state, tk::kPad * s);
                 break;
             }
@@ -3241,7 +3384,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
                 const bool wifi = h.kind == Kind::CcWifi;
                 const bool has = wifi ? hasWifi : hasBt, on = has && (wifi ? m_wifiOn : m_btOn);
                 std::wstring sub = !has ? (!m_servicesOn || m_radios.Loading() ? L"Checking…" : m_radios.Failed() ? L"Check Settings" : L"Unavailable") : on ? (wifi && !m_ssid.empty() ? m_ssid : L"On") : L"Off";
-                tile(r, wifi ? 0xE701 : 0xE702, on, has, wifi ? L"Wi-Fi" : L"Bluetooth", sub, (tk::kPad + 32 + 4) * s);
+                tile(r, wifi ? 0xE701 : 0xE702, on, has, wifi ? L"Wi-Fi" : L"Bluetooth", sub, (tk::kPad + 16) * s);
                 break;
             }
             case Kind::CcWifiMore:
@@ -3325,15 +3468,46 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
         }
     }
 
+    if (m_detail == Detail::None && m_cardRect.right > m_cardRect.left) {  // the battery bar
+        auto r = at(m_cardRect);
+        const float pr = (r.bottom - r.top) / 2;
+        dc->FillRoundedRectangle(D2D1::RoundedRect(r, pr, pr), bT1.get());
+        const std::wstring battery = m_battery.hasBattery ? std::to_wstring(m_battery.percent) + L"%" : L"AC";
+        float tx = r.left + 14 * s;
+        if (m_battery.hasBattery) {  // the glyph: an outline, a fill to the charge, the nub
+            const float bw = 24 * s, bh2 = 12 * s, bx = tx, by = Mid(r.top, r.bottom) - bh2 / 2;
+            dc->DrawRoundedRectangle(D2D1::RoundedRect(R(bx, by, bx + bw, by + bh2), 4 * s, 4 * s), c.muted.get(), 1.5f);
+            const float fillW = (bw - 5 * s) * std::clamp(m_battery.percent, 0, 100) / 100.0f;
+            if (fillW > 0.5f) dc->FillRoundedRectangle(D2D1::RoundedRect(R(bx + 2.5f * s, by + 2.5f * s, bx + 2.5f * s + fillW, by + bh2 - 2.5f * s), 1.5f * s, 1.5f * s), bPc.get());
+            dc->FillRoundedRectangle(D2D1::RoundedRect(R(bx + bw + 1 * s, by + 4 * s, bx + bw + 3 * s, by + bh2 - 4 * s), 1 * s, 1 * s), c.muted.get());
+            tx += bw + 10 * s;
+        }
+        txt.Draw(dc, battery, fName.get(), R(tx, r.top, at(m_modeRect).left - 6 * s, r.bottom), c.ink.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+        auto track = at(m_modeRect);
+        const bool known = m_mode != svc::PowerMode::Unknown;
+        dc->FillRoundedRectangle(D2D1::RoundedRect(track, (track.bottom - track.top) / 2, (track.bottom - track.top) / 2), bT2.get());
+        auto fSeg = txt.Format(ui::kFontText, 11 * s, DWRITE_FONT_WEIGHT_NORMAL);
+        auto fSegB = txt.Format(ui::kFontText, 11 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        static const wchar_t* labels[] = {L"Efficiency", L"Balanced", L"Performance"};
+        const int sel = ModeIndex(m_mode);
+        for (int i = 0; i < 3; i++) {
+            auto seg = at(m_modeSeg[i]);
+            if (known && i == sel) {
+                const float rad = (seg.bottom - seg.top) / 2;
+                dc->FillRoundedRectangle(D2D1::RoundedRect(Inflate(seg, -2 * s), rad, rad), bPc.get());
+            }
+            txt.Draw(dc, labels[i], (known && i == sel ? fSegB : fSeg).get(), seg, known && i == sel ? bOn.get() : c.muted.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+    }
+
     if (m_detail == Detail::None) {  // Now Playing under the sliders
         const float x0 = m_lw + start::kRightPad * s, x1 = m_w - start::kRightPad * s;
         auto r = at(R(x0, m_rplan.mediaY * s, x1, (m_rplan.mediaY + m_rplan.mediaH) * s));
-        auto rr = D2D1::RoundedRect(R(r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f), tileR, tileR);
-        dc->FillRoundedRectangle(rr, c.fill.get());
-        dc->DrawRoundedRectangle(rr, c.line.get(), 1.0f);
+        const float mr = (r.bottom - r.top) / 2;
+        dc->FillRoundedRectangle(D2D1::RoundedRect(r, mr, mr), bT1.get());
         auto const& ms = m_media.State();
-        const float artSz = tk::kMediaArt * s;
-        D2D1_RECT_F ar = R(r.left + tk::kPad * s, Mid(r.top, r.bottom) - artSz / 2, r.left + tk::kPad * s + artSz, Mid(r.top, r.bottom) + artSz / 2);
+        const float artSz = (m_rplan.mediaH - 14) * s;
+        D2D1_RECT_F ar = R(r.left + 8 * s, Mid(r.top, r.bottom) - artSz / 2, r.left + 8 * s + artSz, Mid(r.top, r.bottom) + artSz / 2);
         bool drew = false;
         if (ms.artSize > 0 && ms.art.size() == static_cast<size_t>(ms.artSize) * ms.artSize) {  // the real thumbnail
             winrt::com_ptr<ID2D1Bitmap> bmp;
@@ -3353,7 +3527,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
             glyph(0xE8D6, ar, c.muted.get(), fIcon.get());
         }
         const int iPrev = CcIndexOf(Kind::CcPrev, 0);
-        const float tl = ar.right + tk::kPad * s, tr = (iPrev >= 0 ? at(m_ccBase[iPrev].r).left : r.right - tk::kPad * s) - tk::kInCard * s;
+        const float tl = ar.right + 8 * s, tr = (iPrev >= 0 ? at(m_ccBase[iPrev].r).left : r.right - tk::kPad * s) - tk::kInCard * s;
         const std::wstring title = ms.has ? (CleanTitle(ms.title).empty() ? L"Now Playing" : CleanTitle(ms.title)) : L"Not playing";
         const std::wstring artist = ms.has ? (ms.artist.empty() ? L"Media" : ms.artist) : L"Media you play shows up here";
         const float mid = Mid(r.top, r.bottom);
@@ -3491,9 +3665,57 @@ void Launcher::CcClick(Hit const& hit) {
     const bool dry = m_dryRun || svc::DryRun();
     auto note = [&](wchar_t const* what) { if (dry) Log(std::wstring(L"control: DRY RUN ") + what); };
     const bool hasWifi = m_demo || m_radios.HasWifi(), hasBt = m_demo || m_radios.HasBluetooth();
-    switch (hit.kind) {
+    // A tile has two targets. Its logo zone (CcToggle) switches it; the rest of it (the tile's own hit) opens
+    // the Wi-Fi / Bluetooth list or the Settings page for that setting.
+    // Quick tiles 6..9 are actions, not switches: Battery saver opens its Settings page, Screenshot starts the snip,
+    // Cast and Project press Win+K / Win+P for the shell's own flyouts. The logo and the bar do the same thing.
+    auto runExtra = [&](int i) {
+        if (dry) { note(L"extra tile"); return; }
+        Hide();
+        auto combo = [](WORD vk) {
+            INPUT in[4] = {};
+            in[0].type = in[1].type = in[2].type = in[3].type = INPUT_KEYBOARD;
+            in[0].ki.wVk = VK_LWIN;
+            in[1].ki.wVk = vk;
+            in[2].ki.wVk = vk;
+            in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+            in[3].ki.wVk = VK_LWIN;
+            in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(4, in, sizeof(INPUT));
+        };
+        switch (i) {
+            case 6: OpenQuietly(L"ms-settings:batterysaver"); break;
+            case 7: OpenQuietly(L"ms-screenclip:"); break;
+            case 8: combo('K'); break;
+            case 9: combo('P'); break;
+        }
+    };
+    Hit h = hit;
+    if (h.kind == Kind::CcToggle) {
+        if (h.index == 0) h = {h.r, Kind::CcWifi, 0};
+        else if (h.index == 1) h = {h.r, Kind::CcBt, 0};
+        else if (h.index - 10 >= 6) { runExtra(h.index - 10); return; }
+        else h = {h.r, Kind::CcQuick, h.index - 10};
+    } else if (h.kind == Kind::CcWifi) {
+        if (hasWifi) ToggleDetail(Detail::Wifi);
+        return;
+    } else if (h.kind == Kind::CcBt) {
+        if (hasBt) ToggleDetail(Detail::Bt);
+        return;
+    } else if (h.kind == Kind::CcQuick) {
+        static const wchar_t* pages[] = {L"ms-settings:network-airplanemode", L"ms-settings:network-mobilehotspot", L"ms-settings:notifications",
+                                         L"ms-settings:nightlight", L"ms-settings:colors", L"ms-settings:sound"};
+        if (h.index >= 6) { runExtra(h.index); return; }
+        if (h.index >= 0 && h.index < 6) {
+            if (dry) { note(pages[h.index]); return; }
+            Hide();
+            OpenQuietly(pages[h.index]);
+        }
+        return;
+    }
+    switch (h.kind) {
         case Kind::CcQuick:
-            switch (hit.index) {
+            switch (h.index) {
                 case 0:  // Airplane mode: both radios off (remembering what was on), or back to what was on
                     if (!hasWifi && !hasBt) return;
                     if (m_wifiOn || m_btOn) {

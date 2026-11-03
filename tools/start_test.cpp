@@ -184,11 +184,41 @@ static void UsageLive() {
     DestroyWindow(w);
 }
 
+// Start 2.0's three columns (notifications + calendar | middle | control centre) on the same screens as Layout().
+static void Layout3() {
+    struct Case {
+        float w, h, scale;
+    } cases[] = {{1366, 768, 1.25f}, {1366, 768, 1.5f}, {1366, 768, 1.0f}, {1920, 1080, 1.0f}, {1920, 1080, 1.5f}, {1280, 720, 1.5f}, {2560, 1440, 1.0f}};
+    for (auto c : cases) {
+        const float avail = start::AvailHeight(0, c.h - 90 * c.scale, c.scale);
+        const auto w = start::PlanWidths3(c.w / c.scale);
+        const auto plan = start::PlanCenter(avail, true, true);
+        std::printf("3col %gx%g @%g%%: width %.0f+%.0f+%.0f=%.0f of %.0f, center height %.0f of %.0f\n", c.w, c.h, c.scale * 100, w.notif, w.mid,
+                    w.right, w.total, c.w / c.scale, plan.height, avail);
+        CHECK(std::abs(w.notif + w.mid + w.right - w.total) < 0.01f);
+        CHECK((w.notif == 0 || w.notif >= start::kNotifMinW) && w.mid >= start::kMidMinW && w.right >= start::kRightMinW);
+        // fits the screen, unless even the middle and the control centre at their minimums do not
+        CHECK(w.total + 2 * start::kScreenMargin <= c.w / c.scale + 0.01f || w.total <= start::kMidMinW + start::kRightMinW + 0.01f);
+        CHECK(plan.height <= avail);
+        // the strip, then search, then the sections, top to bottom, none overlapping
+        CHECK(plan.widgetsY + plan.widgetsH <= plan.searchY);
+        CHECK(plan.searchY + start::kSearchH < plan.appsLabelY);
+        CHECK(plan.appsTop + 2 * start::kAppRowH <= plan.filesLabelY);
+        CHECK(plan.contentBottom >= plan.filesTop + start::tk::kFileRows * start::tk::kFileRowH);  // all 12 files are reachable
+        CHECK(plan.greetY + plan.greetH <= plan.widgetsY);  // the hello and the quote sit above the strip
+        CHECK(plan.appsTop + 2 * start::kAppRowH <= plan.filesLabelY);  // two rows of apps, none under the files heading
+    }
+    // the middle column is the last to shrink
+    CHECK(start::PlanWidths3(1920).mid == start::kMidW);
+    CHECK(start::PlanWidths3(1366 / 1.25f).mid >= start::kMidMinW);
+}
+
 int wmain() {
     Quotes();
     Calendar();
     Names();
     Layout();
+    Layout3();
     UsageParsing();
     UsageLive();
     std::printf(g_fail ? "start_test: %d FAILED\n" : "start_test: all passed\n", g_fail);

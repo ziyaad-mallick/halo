@@ -161,21 +161,21 @@ namespace tk {
 constexpr float kHero = ui::kDisplay, kTitle = ui::kHeading, kText = ui::kBody, kCap = ui::kCaption;
 constexpr float kInCard = ui::kS2, kPad = ui::kS3, kInGroup = ui::kS4, kGroup = ui::kS6, kMargin = ui::kS6;
 constexpr float kRCard = ui::kRadiusLarge, kRRow = ui::kRadiusSmall, kRPanel = ui::kPanelRadius;
-constexpr float kTile = 56, kBadge = 32, kTrack = 28, kCardH = 88, kAppCellH = 72, kAppIcon = 44, kFileRowH = 32, kFileIcon = 20,
-                kFileRows = 6, kSeg = 24, kMedia = 72, kMediaArt = 48, kMediaBtn = 32, kUsageRow = 22, kChevBtn = 28;
+constexpr float kTile = 56, kBadge = 32, kTrack = 28, kCardH = 88, kAppCellH = 92, kAppIcon = 48, kFileRowH = 34, kFileIcon = 20,
+                kFileRows = 5, kSeg = 24, kMedia = 72, kMediaArt = 48, kMediaBtn = 32, kUsageRow = 22, kChevBtn = 28;
 constexpr float kMenuShadowBlur = 24, kMenuShadowDy = 8;  // the one raised surface besides the panel: the Power menu
 constexpr int kFastMs = ui::kFastMs, kSlowMs = ui::kSlowMs;
 }  // namespace tk
 
 // ---- Layout -------------------------------------------------------------------------------------------
 inline constexpr float kScreenMargin = 24, kPanelTop = 8;
-inline constexpr float kLeftMax = 664, kLeftMin = 480, kRightW = 384, kRightMinW = 280;
-inline constexpr float kSearchTop = 252, kSearchH = 40, kGap = 24, kLabelH = 16;
+inline constexpr float kLeftMax = 664, kLeftMin = 480, kRightW = 330, kRightMinW = 290;
+inline constexpr float kSearchTop = 252, kSearchH = 44, kGap = 26, kLabelH = 16;
 inline constexpr float kAppRowH = tk::kAppCellH, kFileCellH = tk::kFileRowH, kBottomH = 56;
-inline constexpr float kGreetQuoteH = 88, kGreetH = 40;
-inline constexpr float kGreetingClockW = 192;
+inline constexpr float kGreetQuoteH = 84, kGreetH = 36;
+inline constexpr float kGreetingClockW = 96;
 inline constexpr float kWidgetsH = tk::kCardH;
-inline constexpr float kRightPad = 24, kRightMinH = 336;
+inline constexpr float kRightPad = 14, kRightMinH = 336;
 
 struct Widths {
     float left, right, total;
@@ -228,20 +228,86 @@ inline LeftPlan PlanLeft(float avail, bool wantApps, bool wantFiles) {
     return p;
 }
 
+// ---- Three columns: notifications + calendar | search + apps | control centre ------------------------------------
+// The panel is `notif + mid + right` wide. Narrow screens shrink the control centre first, then the notification
+// column, never the middle (search and apps are what Start is for). On a screen too small for all three the
+// notification column is dropped (notif = 0).
+inline constexpr float kNotifW = 256, kNotifMinW = 230, kMidW = 440, kMidMinW = 380, kPanelGap = 12;  // 1050 wide in all: the notification pane stays, the middle and control panes are fat
+struct Widths3 {
+    float notif, mid, right, total;
+};
+inline Widths3 PlanWidths3(float monitorW) {
+    const float avail = monitorW - 2 * kScreenMargin - 2 * kPanelGap;  // the card widths, without the gaps between them
+    float notif = kNotifW, right = kRightW, mid = std::min(kMidW, avail - notif - right);
+    if (mid < kMidMinW) {
+        mid = kMidMinW;
+        right = std::max(kRightMinW, avail - notif - mid);
+        if (notif + mid + right > avail) notif = std::max(kNotifMinW, avail - mid - right);
+        if (notif + mid + right > avail) notif = 0;  // a screen this small keeps Start and the control centre, and drops the column
+    }
+    return {notif, mid, right, notif + mid + right};
+}
+
+// The middle column's plan, top to bottom: the greeting and a quote, a slim strip (battery and power mode), search,
+// two rows of apps, files. Same fields as the two-column plan, so the Launcher keeps one shape of plan.
+inline constexpr float kHeroTop = 24;
+inline LeftPlan PlanCenter(float avail, bool wantApps, bool wantFiles) {
+    LeftPlan p;
+    p.files = wantFiles;
+    p.greetY = kHeroTop;
+    p.greetH = kGreetQuoteH;
+    if (avail < 560) {  // short, high-DPI screens: a tighter hero (the quote drops to a compact line)
+        p.greetY = 20;
+        p.greetH = kGreetQuoteH - tk::kGroup + 8;
+    }
+    p.widgetsY = p.greetY + p.greetH;  // no strip any more (the battery bar is in the control pane)
+    p.widgetsH = 0;
+    p.searchY = p.greetY + p.greetH + 14;
+    float y = p.searchY + kSearchH + kGap;
+    p.appsLabelY = y;
+    p.appsTop = y + kLabelH + tk::kInCard;
+    if (wantApps) y = p.appsTop + 2 * kAppRowH + kGap;  // 5 x 2 apps
+    p.filesLabelY = y;
+    p.filesTop = y + kLabelH + tk::kInCard;
+    if (wantFiles) y = p.filesTop + tk::kFileRows * tk::kFileRowH + tk::kInGroup;
+    p.contentBottom = y;
+    p.height = std::min(avail, y + 4 + kBottomH);
+    p.dividerY = p.height - kBottomH - 4;
+    return p;
+}
+
 // The right column (a compact control centre) for a panel `height` tall. Everything is a y from the top of the panel.
 // Four rows of tiles (Wi-Fi/Bluetooth, Airplane/Hotspot, Do not disturb/Night light, Dark mode/Microphone), the
 // Display and Sound sliders, Now Playing, the usage grid. Spare height widens the gaps between groups a little.
 struct RightPlan {
     bool roomy = true;
-    float rowY[4] = {24, 88, 152, 216}, rowH = tk::kTile, rowGap = tk::kInCard;
+    int rows = 4;
+    float rowY[6] = {24, 88, 152, 216, 280, 344}, rowH = tk::kTile, rowGap = tk::kInCard;
     float tilesY = 24, tilesH = tk::kTile;  // the first row
     float brightY = 0, volY = 0, sliderH = tk::kTrack;
     float mediaY = 0, mediaH = tk::kMedia;
+    float battY = 0, battH = 0;  // the compact plan's battery bar: battery and power mode, between the tiles and the sliders
     float usageY = 0, usageH = kLabelH + 6 + 2 * tk::kUsageRow;
     float gap = tk::kGroup, bottom = 0;
 };
-inline RightPlan PlanRight(float height) {
+// `rows` tile rows (the 2.0 panel has 6: Wi-Fi/Bluetooth, then ten quick tiles in pairs); `compact` is the small 2.0 panel's sizes.
+inline RightPlan PlanRight(float height, int rows = 4, bool compact = false) {
     RightPlan r;
+    r.rows = rows;
+    float top = 24;
+    if (compact) {
+        r.rowH = 48; r.rowGap = 8; r.sliderH = 38; r.mediaH = 60; r.gap = 14; top = 18; r.battH = 44;
+        for (int i = 0; i < rows; i++) r.rowY[i] = top + i * (r.rowH + r.rowGap);
+        r.tilesY = top; r.tilesH = r.rowH;
+        const float rowsEnd = r.rowY[rows - 1] + r.rowH;
+        r.battY = rowsEnd + r.gap;
+        r.brightY = r.battY + r.battH + r.gap;
+        r.volY = r.brightY + r.sliderH + r.rowGap;
+        r.mediaY = r.volY + r.sliderH + r.gap;
+        r.usageY = r.mediaY + r.mediaH + r.gap;
+        r.bottom = r.usageY + r.usageH + kRightPad;
+        return r;
+    }
     auto total = [&](float rowH, float gap) {
         return 24 + 4 * rowH + 3 * r.rowGap + 3 * gap + 2 * r.sliderH + r.rowGap + r.mediaH + r.usageH + kRightPad;
     };
