@@ -52,9 +52,6 @@ void Start(CompositionObject const& target, wchar_t const* property, Composition
 CubicBezierEasingFunction BounceUp(Compositor const& c) { return c.CreateCubicBezierEasingFunction({0.3f, 0.5f}, {0.5f, 1.0f}); }
 CubicBezierEasingFunction BounceDown(Compositor const& c) { return c.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.7f, 0.5f}); }
 
-// Expression parameter name of icon j's property set.
-std::wstring Param(size_t j) { return L"s" + std::to_wstring(j); }
-
 // Width of the pill for `count` icons at rest.
 float WidthAtRest(DockMetrics const& m, size_t count, bool divider) {
     return static_cast<float>(count) * (m.restSize + m.gap) - m.gap + 2 * m.padding + (divider ? m.gap : 0.0f);
@@ -71,6 +68,33 @@ float WaveGrowth(DockMetrics const& m) {
 }
 
 }  // namespace
+
+DockMetrics FitMetrics(DockMetrics const& full, float fit, float scale) {
+    DockMetrics m = full;
+    if (fit >= 1.0f) return m;
+    m.restSize = full.restSize * fit;
+    m.gap = std::max(4.0f * scale, full.gap * fit);
+    m.padding = std::max(6.0f * scale, full.padding * fit);
+    m.radius = full.radius * std::max(fit, 0.5f);
+    // The pill keeps its margin around the icon in proportion, but no thinner than 40 logical px: the cluster
+    // beside the icons (Start, time, Wi-Fi, battery) needs that height.
+    m.pillHeight = std::min(full.pillHeight, std::max(m.restSize + (full.pillHeight - full.restSize) * fit, 40.0f * scale));
+    m.cornerRadius = std::min(full.cornerRadius, m.pillHeight * 0.4f);
+    return m;
+}
+
+float FitScale(DockMetrics const& full, float scale, size_t n, float clusterWidth, float avail) {
+    constexpr int kSteps = 20, kMinStep = 8;
+    if (n == 0) return 1.0f;
+    for (int step = kSteps; step > kMinStep; step--) {
+        const float fit = static_cast<float>(step) / kSteps;
+        DockMetrics m = FitMetrics(full, fit, scale);
+        // What Dock::MaxWidth reports for these metrics.
+        const float need = clusterWidth + m.gap + WidthAtRest(m, n, true) + WaveGrowth(m) * (m.restSize + m.gap);
+        if (need <= avail) return fit;
+    }
+    return static_cast<float>(kMinStep) / kSteps;
+}
 
 Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
            ContainerVisual const& pill, DockMetrics const& metrics,
@@ -202,6 +226,8 @@ Dock::Entry Dock::MakeEntry(Item const& item, bool instant) {
     v.Offset({0, IconY(), 0});
     v.Properties().InsertScalar(L"P", instant ? 1.0f : 0.0f);  // presence
     v.Properties().InsertScalar(L"S", instant ? 1.0f : 0.0f);  // scale, set by an expression
+    v.Properties().InsertScalar(L"X", 0.0f);                    // where its slot starts (at scale S), set by an expression
+    v.Properties().InsertScalar(L"XP", 0.0f);                   // ...and at rest (at presence P)
     v.Properties().InsertScalar(L"Mag", 0.0f);                 // 0..1: how far the magnetic pull toward the pointer has eased in
     v.Properties().InsertScalar(L"Shift", 0.0f);               // px: where a reorder left it relative to its slot, easing back to 0
     m_root.Children().InsertAtTop(v);
@@ -348,74 +374,85 @@ void Dock::Prune(std::vector<unsigned> const& ids) {
 void Dock::BuildExpressions() {
     const size_t n = m_entries.size();
     const int d = m_dividerAt;
-    // Sum of property `prop` of the icons [0, count).
-    auto sum = [&](size_t count, wchar_t const* prop) {
-        if (count == 0) return std::wstring(L"0");
-        std::wstring s = L"(";
-        for (size_t j = 0; j < count; j++) s += (j ? L" + " : L"") + Param(j) + L"." + prop;
-        return s + L")";
-    };
-    // Where icon i's slot starts, relative to the first slot, in terms of `prop`
-    // (S: as magnified now; P: at rest). Each slot is Pitch wide times its
-    // scale, so neighbours make room for the full magnified size, like macOS.
-    auto start = [&](size_t i, wchar_t const* prop) {
-        std::wstring s = L"p.Pitch * " + sum(i, prop);
-        if (d >= 0 && static_cast<int>(i) >= d) s += L" + dv.Slot";
-        return s;
-    };
-    auto total = [&](wchar_t const* prop) {
-        return L"(p.Pitch * " + sum(n, prop) + (d >= 0 ? L" + dv.Slot)" : L")");
-    };
-    auto bind = [&](ExpressionAnimation const& a) {
+
+    // Where an icon's slot starts is chained, not summed: icon i's start is icon i-1's start plus icon i-1's width,
+    // and the divider's slot once past it. Every expression then stays the same length however many icons the dock
+    // holds (summing them all into each expression hit the compositor's string limit at 24 icons, and the dock
+    // failed to start). X: at the scale drawn now (S); XP: at rest (presence P only). Each slot is Pitch wide times
+    // its scale, so neighbours make room for the full magnified size, like macOS.
+    auto chain = [&](size_t i, wchar_t const* start, wchar_t const* prop) {
+        auto props = m_entries[i].icon.Properties();
+        if (i == 0) {
+            props.StopAnimation(start);
+            props.InsertScalar(start, 0.0f);
+            return;
+        }
+        auto a = m_compositor.CreateExpressionAnimation(std::wstring(L"a.") + start + L" + p.Pitch * a." + prop +
+                                                        (static_cast<int>(i) == d ? L" + dv.Slot" : L""));
         a.SetReferenceParameter(L"p", m_props);
         a.SetReferenceParameter(L"dv", m_divider.Properties());
-        for (size_t j = 0; j < n; j++) a.SetReferenceParameter(Param(j), m_entries[j].icon.Properties());
+        a.SetReferenceParameter(L"a", m_entries[i - 1].icon.Properties());
+        Start(props, start, a, std::wstring(L"slot start ") + start);
+    };
+    for (size_t i = 0; i < n; i++) {
+        chain(i, L"X", L"S");
+        chain(i, L"XP", L"P");
+    }
+
+    // Width of all the slots: the last icon's start plus its own width.
+    auto total = [&](wchar_t const* start, wchar_t const* prop) {
+        return L"(z." + std::wstring(start) + L" + p.Pitch * z." + prop + L")";
+    };
+    // m: the icon, z: the last icon, e: the first unpinned icon (the divider's).
+    auto bind = [&](ExpressionAnimation const& a, size_t i) {
+        a.SetReferenceParameter(L"p", m_props);
+        a.SetReferenceParameter(L"dv", m_divider.Properties());
+        if (n == 0) return;  // the pill's width with no icons uses neither
+        a.SetReferenceParameter(L"m", m_entries[i].icon.Properties());
+        a.SetReferenceParameter(L"z", m_entries[n - 1].icon.Properties());
     };
 
     std::wstring clusterShift = m_shift != 0.0f ? (L" + " + std::to_wstring(m_shift)) : L"";
 
     for (size_t i = 0; i < n; i++) {
-        const std::wstring me = Param(i);
         // Icon i's center at rest, where the wave measures its distance from.
-        std::wstring rest = L"(p.ContentCenter" + clusterShift + L" - " + total(L"P") + L" / 2 + " + start(i, L"P") + L" + p.Pitch * " + me +
-                            L".P / 2)";
+        std::wstring rest = L"(p.ContentCenter" + clusterShift + L" - " + total(L"XP", L"P") + L" / 2 + m.XP + p.Pitch * m.P / 2)";
         auto s = m_compositor.CreateExpressionAnimation(
-            me + L".P * (1 + (p.MaxScale - 1) * p.Intensity * (Cos(Clamp(Abs(p.PointerX - " + rest +
+            L"m.P * (1 + (p.MaxScale - 1) * p.Intensity * (Cos(Clamp(Abs(p.PointerX - " + rest +
             L") / p.Radius, 0, 1) * 3.14159265) + 1) / 2)");
-        bind(s);
+        bind(s, i);
         Start(m_entries[i].icon.Properties(), L"S", s, L"icon magnification");
 
-        auto scale = m_compositor.CreateExpressionAnimation(
-            L"Vector3(Max(" + me + L".S, 0.001), Max(" + me + L".S, 0.001), 1)");
-        scale.SetReferenceParameter(me, m_entries[i].icon.Properties());
+        auto scale = m_compositor.CreateExpressionAnimation(L"Vector3(Max(m.S, 0.001), Max(m.S, 0.001), 1)");
+        scale.SetReferenceParameter(L"m", m_entries[i].icon.Properties());
         Start(m_entries[i].icon, L"Scale", scale, L"icon scale");
 
         // Slots packed around the dock's center; the icon sits centered in
         // its slot (Offset is its top-left before scaling).
-        const std::wstring slotCenter = L"p.ContentCenter" + clusterShift + L" - " + total(L"S") + L" / 2 + " + start(i, L"S") + L" + p.Pitch * " +
-                                        me + L".S / 2";
+        const std::wstring slotCenter = L"p.ContentCenter" + clusterShift + L" - " + total(L"X", L"S") + L" / 2 + m.X + p.Pitch * m.S / 2";
         // The magnetic pull: a fraction of the way to the pointer, capped, eased in by Mag (stays 0 under reduce motion).
         const std::wstring pull = L" + Clamp((p.PointerX - (" + slotCenter + L")) * 0.18, -" + std::to_wstring(kPullPx * m_m.restSize / 28) +
-                                  L", " + std::to_wstring(kPullPx * m_m.restSize / 28) + L") * " + me + L".Mag";
+                                  L", " + std::to_wstring(kPullPx * m_m.restSize / 28) + L") * m.Mag";
         // The icon being dragged is glued to the pointer; every other one sits in its slot, plus whatever a reorder
         // left in Shift (eased back to 0, so a neighbour slides into its new place).
         const bool dragged = m_entries[i].id == m_dragId;
-        const std::wstring iconCenter = dragged ? std::wstring(L"p.PointerX") : slotCenter + pull + L" + " + me + L".Shift";
+        const std::wstring iconCenter = dragged ? std::wstring(L"p.PointerX") : slotCenter + pull + L" + m.Shift";
         auto x = m_compositor.CreateExpressionAnimation(iconCenter + L" - p.Rest / 2");
-        bind(x);
+        bind(x, i);
         Start(m_entries[i].icon, L"Offset.X", x, L"icon x");
 
-        auto dx = m_compositor.CreateExpressionAnimation((dragged ? std::wstring(L"p.PointerX") : slotCenter + L" + " + me + L".Shift") +
+        auto dx = m_compositor.CreateExpressionAnimation((dragged ? std::wstring(L"p.PointerX") : slotCenter + L" + m.Shift") +
                                                          L" - " + std::to_wstring(DotSize() / 2));
-        bind(dx);
+        bind(dx, i);
         Start(m_entries[i].dot, L"Offset.X", dx, L"dot x");
     }
 
     if (d >= 0) {
-        auto dx = m_compositor.CreateExpressionAnimation(L"p.ContentCenter" + clusterShift + L" - " + total(L"S") + L" / 2 + p.Pitch * " +
-                                                         sum(d, L"S") + L" + dv.Slot / 2 - " +
+        // The first unpinned icon's start already includes the divider's whole slot; the line sits in its middle.
+        auto dx = m_compositor.CreateExpressionAnimation(L"p.ContentCenter" + clusterShift + L" - " + total(L"X", L"S") + L" / 2 + e.X - dv.Slot / 2 - " +
                                                          std::to_wstring(m_divider.Size().x / 2));
-        bind(dx);
+        bind(dx, 0);
+        dx.SetReferenceParameter(L"e", m_entries[d].icon.Properties());
         Start(m_divider, L"Offset.X", dx, L"divider x");
     }
 
@@ -443,9 +480,9 @@ void Dock::BuildExpressions() {
     // the outer ones slide off.
     if (n > 0 || m_cluster || m_widgets) {
         std::wstring widthExpr = (m_clusterOffset > 0.0f ? (std::to_wstring(m_clusterOffset) + L" + ") : L"") +
-                                 total(L"S") + L" - p.Gap + 2 * p.Padding";
+                                 (n > 0 ? total(L"X", L"S") : std::wstring(L"0")) + L" - p.Gap + 2 * p.Padding";
         auto width = m_compositor.CreateExpressionAnimation(widthExpr);
-        bind(width);
+        bind(width, 0);
         Start(m_pill, L"Size.X", width, L"pill width");
 
         auto left = m_compositor.CreateExpressionAnimation(L"p.ContentCenter - pill.Size.X / 2");

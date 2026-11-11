@@ -30,6 +30,14 @@ struct DockMetrics {
     float centerX = 0.0f;      // x of the dock's center in the parent
 };
 
+// The dock's metrics at `fit` (1 = full size): icons, gaps, padding, the wave and the pill shrink together so more
+// icons fit. `scale` is the DPI scale; the gap, padding and pill height keep a floor in logical px.
+DockMetrics FitMetrics(DockMetrics const& full, float fit, float scale);
+
+// The largest fit (in steps of 1/20, down to 0.4) at which `n` icons, the cluster and the full magnification wave
+// fit in `avail` px; 0.4 when even that is too wide. 1 when everything fits at full size.
+float FitScale(DockMetrics const& full, float scale, size_t n, float clusterWidth, float avail);
+
 class DockCluster;
 class DockWidgets;
 

@@ -263,7 +263,11 @@ private:
     HWND m_hwnd{};
     Scale m_scale{1.0f};
     int m_width{}, m_height{};
-    DockMetrics m_metrics;
+    DockMetrics m_metrics;      // as drawn: m_metricsFull at m_fit
+    DockMetrics m_metricsFull;  // at full size, which also sizes the window
+    float m_fit = 1.0f;         // 1 = full size; the dock shrinks as icons are added so they all fit (FitScale)
+    float m_iconPx = 0.0f;      // icon surfaces are rendered for a fully magnified icon at full size, whatever the fit
+    bool m_refitting = false;
     std::vector<PinnedApp> m_apps;
     struct Item {
         std::wstring launch;  // .lnk to open when the app isn't running (empty for unpinned apps)
@@ -845,7 +849,7 @@ wuc::CompositionBrush Halo::IconBrushFor(std::wstring const& path) {
     try {
         IconImage icon;
         if (LoadJumboIcon(path, icon) && icon.width != 0)
-            brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
+            brush = MakeIconBrush(icon, m_iconPx);
         else
             Log(L"no icon for " + path);
     } catch (winrt::hresult_error const& e) {  // a lost device must not take the whole dock refresh with it
@@ -868,7 +872,7 @@ wuc::CompositionBrush Halo::FallbackIconBrush() {
     wuc::CompositionBrush brush{nullptr};
     try {
         IconImage icon;
-        if (LoadGenericIcon(icon) && icon.width != 0) brush = MakeIconBrush(icon, m_metrics.restSize * m_metrics.maxScale);
+        if (LoadGenericIcon(icon) && icon.width != 0) brush = MakeIconBrush(icon, m_iconPx);
     } catch (winrt::hresult_error const& e) {
         Log(L"generic icon failed " + Hex(e.code()));
     } catch (std::exception const&) {
@@ -905,11 +909,7 @@ void Halo::RefreshDock() {
     std::vector<Dock::Item> items;
     m_items.clear();
     m_appNames.clear();
-    // The pill can't grow past the screen: pinned apps take the room first, then running ones in the order they
-    // appeared; the rest stay reachable from Alt+Tab and the Start panel's recents.
-    const size_t cap = m_dock->MaxItems(static_cast<float>(m_width - m_scale.px(16)));
     for (auto const& pin : m_apps) {
-        if (items.size() >= cap) break;
         auto brush = IconBrushFor(pin.linkPath);
         if (!brush) brush = FallbackIconBrush();  // uninstalled or unreadable: shown plain, removable from its menu
         if (!brush) continue;
@@ -931,10 +931,6 @@ void Halo::RefreshDock() {
     }
     for (size_t i = 0; i < running.size(); i++) {
         if (pinned[i] || running[i].exe.empty()) continue;
-        if (items.size() >= cap) {
-            Log(L"dock full (" + std::to_wstring(cap) + L" icons fit): " + running[i].key + L" and later apps not shown");
-            break;
-        }
         // Packaged apps' exes often carry no icon; their Start entry has the logo.
         wuc::CompositionBrush brush{nullptr};
         if (!running[i].aumid.empty()) brush = IconBrushFor(L"shell:AppsFolder\\" + running[i].aumid);
@@ -954,6 +950,29 @@ void Halo::RefreshDock() {
             name = halo::AppNameResolver::Instance().Resolve(running[i].key, running[i].exe);
         }
         m_appNames.push_back(name);
+    }
+    // More icons make the whole dock smaller (icons, gaps, pill) so that they all fit; a change of size rebuilds the
+    // dock, which lands back here through BuildDock with the new fit.
+    // (The Now Playing capsule is not subtracted: its width follows the fitted pill height, so counting it made the
+    // fit flip back and forth near a step; MaxItems never counted it either.)
+    const float availW = static_cast<float>(m_width - m_scale.px(16));
+    const float fit = FitScale(m_metricsFull, m_scale.v, items.size(), m_cluster ? m_cluster->Width() : 0.0f, availW);
+    if (fit != m_fit && !m_refitting) {
+        Log(L"dock fit " + std::to_wstring(fit) + L" for " + std::to_wstring(items.size()) + L" icons");
+        m_fit = fit;
+        m_refitting = true;
+        RebuildDock(true);
+        m_refitting = false;
+        return;
+    }
+    // Past the smallest size the pill still can't grow off the screen: pinned apps keep their place, then running
+    // ones in the order they appeared; the rest stay reachable from Alt+Tab and the Start panel's recents.
+    const size_t cap = m_dock->MaxItems(static_cast<float>(m_width - m_scale.px(16)));
+    if (items.size() > cap) {
+        Log(L"dock full (" + std::to_wstring(cap) + L" icons fit at the smallest size): the rest are not shown");
+        items.erase(items.begin() + cap, items.end());
+        m_items.erase(m_items.begin() + cap, m_items.end());
+        m_appNames.erase(m_appNames.begin() + cap, m_appNames.end());
     }
     Log(std::to_wstring(running.size()) + L" running apps, " + std::to_wstring(items.size()) + L" icons");
     m_dock->SetItems(items);
@@ -995,6 +1014,10 @@ void Halo::ComputeMetrics() {
     m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_scale.f(kLabelRoom))) + margin;
     m_metrics.bottom = static_cast<float>(m_height - margin);
     m_metrics.centerX = m_width / 2.0f;
+    // The window and the icon surfaces stay sized for full size; only what is drawn shrinks (m_fit).
+    m_iconPx = m_metrics.restSize * m_metrics.maxScale;
+    m_metricsFull = m_metrics;
+    m_metrics = FitMetrics(m_metricsFull, m_fit, m_scale.v);
 }
 
 // Seats the dock on `mon`: the cursor reached its bottom edge, or (WM_DISPLAYCHANGE) the monitor it was on changed
@@ -1011,7 +1034,7 @@ void Halo::MigrateToMonitor(HMONITOR mon, bool reveal) {
     bool dpiChanged = std::abs(m_scale.v - newScale) > 0.001f;
     if (mon == m_currentMon && !dpiChanged && EqualRect(&mi.rcMonitor, &m_monitor)) return;  // nothing moved
 
-    const float iconPx = std::ceil(m_metrics.restSize * m_metrics.maxScale);
+    const float iconPx = std::ceil(m_iconPx);
     m_currentMon = mon;
     m_monitor = mi.rcMonitor;
     m_width = m_monitor.right - m_monitor.left;
@@ -1027,7 +1050,7 @@ void Halo::MigrateToMonitor(HMONITOR mon, bool reveal) {
     if (m_multimon) m_multimon->SetCurrentMonitor(mon);
     if (m_intellihide) m_intellihide->SetMonitor(mon, m_monitor);
 
-    if (m_dock) RebuildDock(std::ceil(m_metrics.restSize * m_metrics.maxScale) == iconPx);  // also sets the label's scale, the input region and the intellihide rect
+    if (m_dock) RebuildDock(std::ceil(m_iconPx) == iconPx);  // also sets the label's scale, the input region and the intellihide rect
     else UpdateRegion();
     if (reveal) Reveal();
 }

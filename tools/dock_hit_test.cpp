@@ -167,6 +167,54 @@ int wmain(int argc, wchar_t** argv) {
     dock.SetMagnet(2);  // must not throw
     dock.SetMagnet(-1);
 
+    // Regression: every icon's expression used to list every other icon, and with 24 icons the compositor refused
+    // the string ("The expression string is too long"), so Halo failed to start. Slots are chained now.
+    for (int count : {24, 25, 60, 120}) {
+        try {
+            auto root2 = comp.CreateContainerVisual();
+            auto pill2 = comp.CreateContainerVisual();
+            Dock big(comp, root2, pill2, m);
+            std::vector<Dock::Item> many;
+            for (int i = 0; i < count; i++)
+                many.push_back({L"big" + std::to_wstring(i), comp.CreateColorBrush(), false, i >= count - 3});  // the last 3 are unpinned
+            big.SetItems(many);
+            big.OnPointerMove(big.RestIconCenter(count / 2).first);
+            big.OnPointerLeave();
+            bool ordered = true;
+            for (int i = 0; i + 1 < count; i++) ordered &= big.RestIconCenter(i + 1).first > big.RestIconCenter(i).first;
+            CHECK(ordered);
+            CHECK(big.HitTest(big.RestIconCenter(count - 1).first, m.bottom - m.pillHeight / 2) == count - 1);
+        } catch (winrt::hresult_error const& e) {
+            printf("FAIL %d icons: %ls\n", count, e.message().c_str());
+            g_fail++;
+        }
+    }
+
+    // The fit: more icons never make the dock bigger, it is full size when everything fits, and it bottoms out.
+    {
+        DockMetrics full;
+        const float scale = 1.0f, cluster = 192.0f, avail = 1000.0f;
+        CHECK(FitScale(full, scale, 0, cluster, avail) == 1.0f);
+        CHECK(FitScale(full, scale, 8, cluster, avail) == 1.0f);
+        float prev = 1.0f;
+        bool shrinks = false;
+        for (size_t n = 1; n <= 200; n++) {
+            float f = FitScale(full, scale, n, cluster, avail);
+            CHECK(f <= prev && f >= 0.4f);
+            shrinks |= f < 1.0f;
+            prev = f;
+        }
+        CHECK(shrinks);
+        CHECK(FitScale(full, scale, 500, cluster, avail) == 0.4f);
+        CHECK(FitMetrics(full, 1.0f, scale).restSize == 28.0f);
+        DockMetrics half = FitMetrics(full, 0.5f, scale);
+        CHECK(half.restSize == 14.0f);
+        CHECK(half.gap >= 4.0f && half.gap < full.gap);
+        CHECK(half.pillHeight >= 40.0f && half.pillHeight <= full.pillHeight);
+        CHECK(half.cornerRadius <= half.pillHeight * 0.4f + 0.001f);
+        CHECK(half.bottom == full.bottom && half.centerX == full.centerX && half.maxScale == full.maxScale);
+    }
+
     printf(g_fail ? "FAILED: %d\n" : "All dock hit-test checks PASSED\n", g_fail);
     return g_fail ? 1 : 0;
 }
