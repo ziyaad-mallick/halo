@@ -181,7 +181,7 @@ public:
                     OnHaloExit();
                 }
             }
-            if (!proc_ && relaunchPending_ && !quit_ && Remaining(relaunchAt_, now) == 0) {
+            if (!proc_ && relaunchPending_ && !quit_ && !SessionEnding() && Remaining(relaunchAt_, now) == 0) {
                 relaunchPending_ = false;
                 Launch();
             }
@@ -205,6 +205,7 @@ private:
     UINT taskbarCreated_ = 0, cmdMsg_ = 0;
     Handle proc_;
     bool on_ = false, hidden_ = false, pendingHide_ = false, relaunchPending_ = false, quit_ = false, down_ = false;
+    bool sessionEnding_ = false;  // WM_QUERYENDSESSION seen: sign-out, restart or shutdown is under way
     DWORD hideAt_ = 0, relaunchAt_ = 0;
     std::vector<DWORD> crashes_;
     int exitCode_ = 0;
@@ -262,7 +263,17 @@ private:
         return (s == std::wstring::npos ? std::wstring() : p.substr(0, s + 1)) + L"halo.exe";
     }
 
+    // The session is being torn down: Windows kills halo.exe (exit 0x40010004) before it delivers WM_ENDSESSION to
+    // us, and a halo started now cannot initialise (0xC000026B). SM_SHUTTINGDOWN covers the window in which our
+    // own WM_QUERYENDSESSION has not arrived yet.
+    static constexpr DWORD kExitDllInitFailedLogoff = 0xC000026B;
+    bool SessionEnding() const { return sessionEnding_ || GetSystemMetrics(SM_SHUTTINGDOWN) != 0; }
+
     void Launch() {
+        if (SessionEnding()) {
+            Log(L"session ending; not launching halo");
+            return;
+        }
         std::wstring path = HaloPath();
         // halo watches this pid and, if we die while it runs, starts a guardian that adopts it.
         std::wstring cmd = L"\"" + path + L"\" --guardian " + std::to_wstring(GetCurrentProcessId());
@@ -296,6 +307,18 @@ private:
         if (code == 0) {
             Log(L"halo exited normally; going OFF (guardian stays alive)");
             GoOff();
+            return;
+        }
+        // 0xC000026B (STATUS_DLL_INIT_FAILED_LOGOFF) only happens when a process starts during logoff, so it
+        // is a session-end signal by itself. A bare 0x40010004 (DBG_TERMINATE_PROCESS) is not: a debugger or
+        // taskkill gives the same code, so without SessionEnding() it is counted like any other death.
+        if (SessionEnding() || code == kExitDllInitFailedLogoff) {
+            // Not a crash and not worth a relaunch: no crash count, no "stopped after repeated crashes" box.
+            Log(L"halo ended with the session (exit code 0x%08lX); restoring taskbar, not relaunching", code);
+            sessionEnding_ = true;
+            relaunchPending_ = false;
+            hidden_ = false;
+            SafeRestore();
             return;
         }
         Log(L"halo died (exit code 0x%08lX); restoring taskbar", code);
@@ -564,8 +587,17 @@ private:
                 if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) ReinstallHook(true);
                 return TRUE;
             case WM_QUERYENDSESSION:
+                sessionEnding_ = true;  // from here on halo's death is the session ending, not a crash
                 return TRUE;
             case WM_ENDSESSION:
+                if (!w) {  // another app vetoed it: the session goes on, so does Halo
+                    sessionEnding_ = false;
+                    if (on_ && !proc_ && !relaunchPending_) {
+                        relaunchPending_ = true;
+                        relaunchAt_ = GetTickCount() + kRelaunchDelayMs;
+                    }
+                    return 0;
+                }
                 if (w) {
                     Shutdown(L"logoff/shutdown");
                     quit_ = true;
