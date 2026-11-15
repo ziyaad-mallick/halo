@@ -55,7 +55,7 @@ namespace {
 // side, so the spring's overshoot never clips; everything below is in panel ("pill") coordinates.
 // Geometry, all from tokens.h: a 344 px panel, the inset and gaps on the 4 px scale, concentric corners.
 constexpr float kW = 380, kInset = ui::kPanelInset, kGap = ui::kS3, kRadius = ui::kPanelRadius;
-constexpr float kHeaderH = 56, kTitleLine = 20, kCaptionLine = 16, kListRowH = 36, kPowH = 52;
+constexpr float kHeaderH = 56, kTitleLine = 20, kCaptionLine = 16, kPowH = 52;
 constexpr float kMaxH = 900, kMargin = ui::kS2;
 // The home view at its full (non-dense) height: the details page and the "does it fit" test measure against it.
 constexpr float kHomeH = 620;
