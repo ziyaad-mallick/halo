@@ -85,12 +85,23 @@ void FreeRgn(HRGN r) {
     if (r && Gdi().del) Gdi().del(r);
 }
 
-// GetWindowRgn: ERROR (0) = no region, NULLREGION (1) = an empty one, SIMPLEREGION/COMPLEXREGION = real.
-// GetWindowRgnBox gives the same answer without needing a region object.
-bool HasEmptyRegion(HWND h) {
-    RECT box{};
-    return GetWindowRgnBox(h, &box) == NULLREGION;
+// GetWindowRgnBox: ERROR (0) = no region, NULLREGION (1) = an empty one, SIMPLEREGION/COMPLEXREGION = real.
+// It also fails outright now and then while another thread shows or hides the window (ERROR with a last-error
+// code, ERROR_INVALID_HANDLE; seen in tools/taskbar_test.cpp, also on a window no Halo code touches). That is
+// "unknown", not "no region": acting on it would replace a good empty region, and SetWindowRgn on a visible
+// window passes through a moment with none. So read up to 3 times and keep "unreadable" apart.
+enum class Rgn { None, Empty, Real, Unreadable };
+Rgn RegionState(HWND h) {
+    for (int i = 0; i < 3; ++i) {
+        RECT box{};
+        SetLastError(0);
+        const int t = GetWindowRgnBox(h, &box);
+        if (t == ERROR && GetLastError() != 0) continue;
+        return t == ERROR ? Rgn::None : t == NULLREGION ? Rgn::Empty : Rgn::Real;
+    }
+    return Rgn::Unreadable;
 }
+bool HasEmptyRegion(HWND h) { return RegionState(h) == Rgn::Empty; }
 
 // Drop remembered regions of windows that no longer exist (Explorer restarted).
 void ForgetDeadWindows() {
@@ -127,19 +138,21 @@ bool ConcealWindow(HWND h) {
     if (!IsWindow(h)) return false;
     bool ok = true;
     const bool visible = IsWindowVisible(h) != FALSE;
-    if (!HasEmptyRegion(h)) {
+    // Hide first: replacing a region on a window that is on screen passes through a moment with none.
+    if (visible) ShowWindow(h, SW_HIDE);
+    const Rgn st = RegionState(h);
+    if (st == Rgn::None || st == Rgn::Real) {  // Empty: already ours; Unreadable: leave a region we cannot see alone
         HRGN orig = NewRgn();
         const int t = orig ? GetWindowRgn(h, orig) : ERROR;
         if ((t == SIMPLEREGION || t == COMPLEXREGION) && !g_savedRgn.count(h)) g_savedRgn[h] = orig;
         else FreeRgn(orig);
         HRGN empty = NewRgn();
         // On success the window owns `empty`; redraw only matters while something is on screen.
-        if (!empty || !SetWindowRgn(h, empty, visible)) {
+        if (!empty || !SetWindowRgn(h, empty, FALSE)) {
             FreeRgn(empty);
             ok = false;
         }
     }
-    if (visible) ShowWindow(h, SW_HIDE);
     return ok;
 }
 
@@ -153,7 +166,9 @@ void ReleaseWindow(HWND h) {
         return;
     }
     // Only undo our own empty region: if Explorer has put a region of its own there since, that one is right.
-    if (HasEmptyRegion(h)) {
+    // An unreadable region is cleared too: a taskbar stuck with no pixels is the worse mistake.
+    const Rgn st = RegionState(h);
+    if (st == Rgn::Empty || st == Rgn::Unreadable) {
         const bool visible = IsWindowVisible(h) != FALSE;
         HRGN back = it != g_savedRgn.end() ? it->second : nullptr;
         if (it != g_savedRgn.end()) g_savedRgn.erase(it);
@@ -167,7 +182,10 @@ void ReleaseWindow(HWND h) {
 
 bool ReconcealIfShown(HWND h) {
     if (!IsWindow(h)) return false;
-    if (!IsWindowVisible(h) && HasEmptyRegion(h)) return false;
+    if (!IsWindowVisible(h)) {
+        const Rgn st = RegionState(h);
+        if (st == Rgn::Empty || st == Rgn::Unreadable) return false;
+    }
     ConcealWindow(h);
     return true;
 }

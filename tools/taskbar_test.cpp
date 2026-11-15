@@ -128,13 +128,16 @@ bool Undrawable(HWND h) {
 }
 
 // ---- the guardian's re-hide, as in src/guardian.cpp: WinEvent SHOW -> ReconcealIfShown -----------
-std::atomic<int> g_reconcealed{0};
+std::atomic<int> g_reconcealed{0}, g_regionGoneAtShow{0};
+std::atomic<bool> g_hookOn{true};  // the guardian's hidden_ gate: off while it restores, or it would hide the window again
 
 void CALLBACK OnShow(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG child, DWORD, DWORD) {
-    if (obj != OBJID_WINDOW || child != CHILDID_SELF || !h) return;
+    if (!g_hookOn || obj != OBJID_WINDOW || child != CHILDID_SELF || !h) return;
     wchar_t cls[64] = {};
     GetClassNameW(h, cls, 63);
     if (wcscmp(cls, kClass) != 0) return;
+    RECT bx{};
+    if (GetWindowRgnBox(h, &bx) != NULLREGION) ++g_regionGoneAtShow;  // diagnostic: did the show drop our region?
     if (halo::taskbar::ReconcealIfShown(h)) ++g_reconcealed;
 }
 
@@ -168,15 +171,19 @@ bool WaitConcealed(const std::vector<HWND>& ws, DWORD ms) {
 struct Storm {
     std::atomic<bool> run{true};
     std::atomic<long> samples{0}, visibleSamples{0}, drawableSamples{0};
+    std::atomic<int> badType{-1}, badWin{-1};
+    std::atomic<int> diagPrinted{0};
+    std::atomic<long> noRegionObject{0}, readRetries{0}, unreadable{0};
+    std::atomic<long> bad0{0}, bad1{0};  // drawable samples per window (index in the list given to Start)
     std::thread hammer, sampler;
 
-    void Start(const std::vector<HWND>& ws, bool clearRegion) {
-        hammer = std::thread([this, ws, clearRegion] {
+    void Start(const std::vector<HWND>& ws, bool clearRegion, bool toggle = false) {
+        hammer = std::thread([this, ws, clearRegion, toggle] {
             unsigned i = 0;
             while (run) {
                 for (HWND w : ws) {
                     if (clearRegion && (i % 3) == 0) SetWindowRgn(w, nullptr, FALSE);
-                    ShowWindow(w, SW_SHOW);
+                    ShowWindow(w, toggle && (i % 2) ? SW_HIDE : SW_SHOW);
                 }
                 ++i;
                 Sleep(2 + (i * 7) % 15);
@@ -186,12 +193,46 @@ struct Storm {
             while (run) {
                 for (HWND w : ws) {
                     HRGN r = CreateRectRgn(0, 0, 0, 0);
-                    int t = GetWindowRgn(w, r);
+                    if (!r) {  // no region object to read into: this sample measured nothing
+                        ++noRegionObject;
+                        continue;
+                    }
+                    // GetWindowRgn sometimes fails outright (ERROR with a last-error code, ERROR_INVALID_HANDLE) while
+                    // another thread shows the window; that is a failed read, not "no region" (which sets no error).
+                    // Read again, up to 3 times, and judge the read that succeeded.
+                    int t = ERROR;
+                    DWORD le0 = 0;
+                    for (int attempt = 0; attempt < 3; ++attempt) {
+                        SetLastError(0);
+                        t = GetWindowRgn(w, r);
+                        le0 = GetLastError();
+                        if (!(t == ERROR && le0 != 0)) break;
+                        ++readRetries;
+                    }
                     DeleteObject(r);
+                    if (t == ERROR && le0 != 0) {  // still failing after 3 reads: inconclusive, reported, never a pass or a violation
+                        ++unreadable;
+                        continue;
+                    }
                     const bool vis = IsWindowVisible(w) != FALSE;
                     ++samples;
                     if (vis) ++visibleSamples;
-                    if (vis && t != NULLREGION) ++drawableSamples;
+                    if (vis && t != NULLREGION) {
+                        // classify: read it again, with GetWindowRgn and with GetWindowRgnBox
+                        const DWORD le = le0;
+                        RECT bx{};
+                        const int box = GetWindowRgnBox(w, &bx);
+                        HRGN r2 = CreateRectRgn(0, 0, 0, 0);
+                        const int again = GetWindowRgn(w, r2);
+                        DeleteObject(r2);
+                        const bool vis2 = IsWindowVisible(w) != FALSE;
+                        if (diagPrinted++ < 6)
+                            std::printf("      diag: t=%d lastErr=%lu box=%d again=%d visNow=%d\n", t, le, box, again, vis2);
+                        ++drawableSamples;
+                        badType = t;
+                        badWin = (w == ws[0]) ? 0 : 1;
+                        if (w == ws[0]) ++bad0; else ++bad1;
+                    }
                 }
                 Sleep(0);
             }
@@ -207,6 +248,7 @@ struct Storm {
 }  // namespace
 
 int wmain() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not swallow the lines printed so far
     wchar_t tmp[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tmp);
     const std::wstring ini = std::wstring(tmp) + L"halo-taskbar-test-" + std::to_wstring(GetCurrentProcessId()) + L".ini";
@@ -245,8 +287,9 @@ int wmain() {
         s.Start(both, false);
         Pump(1200);
         s.Stop();
-        std::printf("      A: %ld samples, %ld with the window marked visible\n", s.samples.load(), s.visibleSamples.load());
+        std::printf("      A: %ld samples, %ld with the window marked visible, %ld skipped (CreateRectRgn failed), %ld GetWindowRgn read failures retried, %ld still unreadable after 3 reads (inconclusive)\n", s.samples.load(), s.visibleSamples.load(), s.noRegionObject.load(), s.readRetries.load(), s.unreadable.load());
         Check(s.visibleSamples > 0, "A: the storm really made the windows visible (test is not vacuous)");
+        if (s.drawableSamples) std::printf("      A: %ld drawable samples (w1 %ld, w2 %ld), last region type %d\n", s.drawableSamples.load(), s.bad0.load(), s.bad1.load(), s.badType.load());
         Check(s.drawableSamples == 0, "A: never visible with a non-empty region, with no hook running");
     }
     for (HWND w : both) ShowWindow(w, SW_HIDE);
@@ -260,7 +303,9 @@ int wmain() {
         Pump(1200);
         s.Stop();
         const bool back = WaitConcealed(both, 1000);
-        std::printf("      B: %ld samples, %ld visible, %d re-concealed by the hook\n", s.samples.load(), s.visibleSamples.load(), g_reconcealed.load());
+        std::printf("      B: %ld samples, %ld visible, %d re-concealed by the hook, %ld read failures retried, %ld unreadable (inconclusive)\n", s.samples.load(), s.visibleSamples.load(), g_reconcealed.load(), s.readRetries.load(), s.unreadable.load());
+        std::printf("      B: single unretried GetWindowRgnBox read said not-empty at show time: %d of %d (read noise, see taskbar.cpp RegionState)\n", g_regionGoneAtShow.load(), g_reconcealed.load());
+        if (s.drawableSamples) std::printf("      B: %ld drawable samples (w1 %ld, w2 %ld), last region type %d\n", s.drawableSamples.load(), s.bad0.load(), s.bad1.load(), s.badType.load());
         Check(s.drawableSamples == 0, "B: never visible with a non-empty region, hook running");
         Check(g_reconcealed > 0, "B: the hook acted on the re-shows");
         Check(back, "B: both windows hidden again within 1 s of the last re-show");
@@ -270,7 +315,8 @@ int wmain() {
     Check(halo::taskbar::HideAll(), "C: second HideAll");
     Check(GetPrivateProfileIntW(L"taskbar", L"state", 99, ini.c_str()) == ABS_ALWAYSONTOP, "C: original appbar state not overwritten by our own auto-hide");
 
-    // ---- D: restore
+    // ---- D: restore (the guardian clears hidden_ first, so its hooks stand down)
+    g_hookOn = false;
     halo::taskbar::RestoreAll();
     Pump(100);
     Check(target.appBarState == ABS_ALWAYSONTOP, "D: appbar state back to the original");
@@ -284,6 +330,7 @@ int wmain() {
     DeleteFileW(ini.c_str());
     halo::taskbar::RestoreAll();
     Pump(100);
+    g_hookOn = true;
     CheckSame("E: w1 restored with no state file and no memory", o1, g_w1);
 
     // ---- F: Explorer also removes the region while re-showing
@@ -303,6 +350,20 @@ int wmain() {
     Pump(100);
     CheckSame("F: w1 equals its original after the final restore", o1, g_w1);
     Check(target.appBarState == ABS_ALWAYSONTOP, "F: appbar state back to the original");
+
+    // ---- G: control, no Halo code at all. A window given an empty region by hand and shown and hidden in a loop:
+    // if GetWindowRgn reports "no region" for it now and then, that is how Windows behaves, not our code.
+    {
+        SetWindowRgn(g_w1, CreateRectRgn(0, 0, 0, 0), FALSE);
+        Storm s;
+        s.Start({g_w1}, false, true);
+        Pump(1500);
+        s.Stop();
+        std::printf("      G (control, plain SetWindowRgn + show/hide loop): %ld samples, %ld visible, %ld conclusive 'visible with no or non-empty region', %ld unreadable\n",
+                    s.samples.load(), s.visibleSamples.load(), s.drawableSamples.load(), s.unreadable.load());
+        SetWindowRgn(g_w1, nullptr, FALSE);
+        ShowWindow(g_w1, SW_SHOWNA);
+    }
 
     halo::taskbar::SetTestTarget(nullptr);
     PostThreadMessageW(g_winThread, WM_QUIT, 0, 0);
