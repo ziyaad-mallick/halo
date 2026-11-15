@@ -79,6 +79,11 @@ build_start_test() {
   "$CXX" "${COMMON[@]}" src/usage.cpp tools/start_test.cpp -o build/start_test.exe -lpdh -luser32
 }
 
+build_start_perf() {
+  echo "== start_perf.exe"
+  "$CXX" "${COMMON[@]}" tools/start_perf.cpp src/launcher.cpp src/usage.cpp src/icons.cpp src/notif_column.cpp src/notif_feed.cpp src/notifications.cpp src/services.cpp src/settings.cpp     -lwbemuuid -lwlanapi -lpsapi -lpdh -o "${START_PERF_OUT:-build/start_perf.exe}" "${WINLIBS[@]}" -lkernel32
+}
+
 build_notification_preview() {
   echo "== notification_preview.exe"
   "$CXX" "${COMMON[@]}" -DHALO_NOTIF_TEST tools/notification_preview.cpp src/notifications.cpp src/services.cpp src/settings.cpp -o "${NOTIFICATION_OUT:-build/notification_preview.exe}" "${WINLIBS[@]}" -lwlanapi -lwbemuuid -lpsapi
@@ -102,6 +107,7 @@ case "${1:-halo}" in
   swoop_handoff_probe) build_swoop_handoff_probe ;;
   settings_launch_test) build_settings_launch_test ;;
   start_test) build_start_test ;;
+  start_perf) build_start_perf ;;
   notification_preview) build_notification_preview ;;
   all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test; build_start_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
