@@ -21,6 +21,7 @@
 #include <tuple>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -49,6 +50,7 @@
 #include "taskbar.h"
 #include "winkey.h"
 #include "edge.h"
+#include "crash.h"  // after the winrt headers: it hooks winrt_throw_hresult_handler
 
 // Interop interfaces missing from the MinGW SDK headers (layouts per the Windows SDK).
 struct ICompositorDesktopInterop : IUnknown {
@@ -123,6 +125,7 @@ constexpr DWORD kDwmUseHostBackdropBrush = 17;  // DWMWA_USE_HOSTBACKDROPBRUSH
 
 void Log(std::wstring const& msg) {
     auto line = L"[halo] " + msg + L"\n";
+    halo::crash::NoteLog(line.c_str());  // the last few lines go into any crash record
     OutputDebugStringW(line.c_str());
     fputws(line.c_str(), stderr);
     fflush(stderr);
@@ -145,8 +148,32 @@ bool Step(wchar_t const* name, F&& f) {
         Log(std::wstring(name) + L": FAILED " + Hex(e.code()) + L" " + e.message().c_str());
     } catch (std::exception const&) {
         Log(std::wstring(name) + L": FAILED (std::exception)");
+    } catch (...) {  // anything else would reach std::terminate during startup
+        Log(std::wstring(name) + L": FAILED (unknown exception)");
     }
     return false;
+}
+
+// Wraps a callback that halo.cpp hands to another module (a Menu / Launcher / Previews host hook, a tracker or panel
+// event). Those modules call it from their own window procedures, timers and WinEvent hooks, which have no try/catch
+// of their own: a winrt::hresult_error out of one unwinds through user32 into std::terminate (0xC0000409). The wrapper
+// logs, records the exception in crash.log (kind=handled) and returns a default value, so the next event retries.
+template <typename F>
+auto Guarded(char const* what, F f) {
+    return [what, f = std::move(f)](auto&&... a) mutable {
+        using R = decltype(f(std::forward<decltype(a)>(a)...));
+        try {
+            HALO_CRUMB(what);
+            return f(std::forward<decltype(a)>(a)...);
+        } catch (winrt::hresult_error const& e) {
+            Log(std::wstring(L"callback ") + std::wstring(what, what + strlen(what)) + L" threw " + Hex(e.code()) + L" " + e.message().c_str());
+            halo::crash::Handled(what);
+        } catch (...) {
+            Log(std::wstring(L"callback ") + std::wstring(what, what + strlen(what)) + L" threw");
+            halo::crash::Handled(what);
+        }
+        return R();
+    };
 }
 
 struct Scale {
@@ -180,6 +207,7 @@ void WatchGuardian(DWORD pid, HWND hwnd) {
 }
 
 void StartAdopter() {
+    HALO_CRUMB("StartAdopter");
     static int tries = 0;
     if (++tries > 3) {  // adopters that keep exiting at once (another guardian owns the mutex): stop respawning
         g_unguarded = true;
@@ -404,30 +432,30 @@ bool Halo::Create(HINSTANCE inst) {
             });
             Step(L"launcher", [&] {
                 halo::LauncherHost host;
-                host.glass = [this](int noiseHeight, halo::settings::Surface const& g, int noiseWidth, float radius) { return BuildPill(noiseHeight, radius, &g, noiseWidth); };
-                host.appIcon = [this](std::wstring const& target) { return IconBrushFor(target); };
-                host.launch = [this](std::wstring const& target) { LaunchRecent(target); };
-                host.closed = [this] { if (!m_trackingMouse) PointerLeave(); };  // the dock may auto-hide again
+                host.glass = Guarded("launcher.glass", [this](int noiseHeight, halo::settings::Surface const& g, int noiseWidth, float radius) { return BuildPill(noiseHeight, radius, &g, noiseWidth); });
+                host.appIcon = Guarded("launcher.appIcon", [this](std::wstring const& target) { return IconBrushFor(target); });
+                host.launch = Guarded("launcher.launch", [this](std::wstring const& target) { LaunchRecent(target); });
+                host.closed = Guarded("launcher.closed", [this] { if (!m_trackingMouse) PointerLeave(); });  // the dock may auto-hide again
                 m_launcher = std::make_unique<halo::Launcher>(inst, m_comp, m_gdev, std::move(host));
-                m_tracker->onForeground = [this](RunningApp const& app) { m_launcher->Note(LaunchTarget(app)); };
+                m_tracker->onForeground = Guarded("tracker.onForeground", [this](RunningApp const& app) { m_launcher->Note(LaunchTarget(app)); });
             });
             Step(L"menu", [&] {
                 halo::MenuHost host;
-                host.glass = [this](int noiseHeight, float radius) { return BuildPill(noiseHeight, radius); };
-                host.opened = [] { halo::winkey::WatchEscape(true); };  // the hook posts Esc to us
-                host.closed = [this] {
+                host.glass = Guarded("menu.glass", [this](int noiseHeight, float radius) { return BuildPill(noiseHeight, radius); });
+                host.opened = Guarded("menu.opened", [] { halo::winkey::WatchEscape(true); });  // the hook posts Esc to us
+                host.closed = Guarded("menu.closed", [this] {
                     if (!(m_launcher && m_launcher->IsOpen())) halo::winkey::WatchEscape(false);
                     if (!m_trackingMouse) PointerLeave();  // the dock may auto-hide again
-                };
+                });
                 m_menu = std::make_unique<halo::Menu>(inst, m_comp, m_gdev, std::move(host));
             });
             Step(L"previews", [&] {
                 halo::PreviewsHost host;
-                host.glass = [this](int noiseHeight) { return BuildPill(noiseHeight); };
-                host.activate = [this](HWND w) { ActivateWindow(w); };
-                host.entered = [this] { KillTimer(m_hwnd, kPreviewGrace); Reveal(); };
+                host.glass = Guarded("previews.glass", [this](int noiseHeight) { return BuildPill(noiseHeight); });
+                host.activate = Guarded("previews.activate", [this](HWND w) { ActivateWindow(w); });
+                host.entered = Guarded("previews.entered", [this] { KillTimer(m_hwnd, kPreviewGrace); Reveal(); });
                 host.left = [this] { SetTimer(m_hwnd, kPreviewGrace, kPreviewGraceMs, nullptr); };
-                host.refresh = [this] { RefreshPreviews(); };
+                host.refresh = Guarded("previews.refresh", [this] { RefreshPreviews(); });
                 m_previews = std::make_unique<halo::Previews>(inst, m_comp, m_gdev, std::move(host));
             });
         }
@@ -443,17 +471,17 @@ bool Halo::Create(HINSTANCE inst) {
         // outside closes both; the notification column tracks the Control Center's size.
         m_cc->siblingHwnd = [this] { return m_notif ? m_notif->Hwnd() : nullptr; };
         m_notif->siblingHwnd = [this] { return m_cc ? m_cc->Hwnd() : nullptr; };
-        m_notif->onDismiss = [this] { ClosePanel(); };
-        m_cc->onHidden = [this] {
+        m_notif->onDismiss = Guarded("notif.onDismiss", [this] { ClosePanel(); });
+        m_cc->onHidden = Guarded("cc.onHidden", [this] {
             KillTimer(m_hwnd, kPanelStagger);
             if (m_notif) m_notif->Close();
             Log(L"panel: closed");
-        };
-        m_cc->onResized = [this] { if (m_notif && m_notif->IsOpen()) m_notif->SetAnchor(m_cc->PanelRectScreen()); };
-        m_cc->onClock = [this] {  // the calendar and notifications rise out of the panel, or go
+        });
+        m_cc->onResized = Guarded("cc.onResized", [this] { if (m_notif && m_notif->IsOpen()) m_notif->SetAnchor(m_cc->PanelRectScreen()); });
+        m_cc->onClock = Guarded("cc.onClock", [this] {  // the calendar and notifications rise out of the panel, or go
             if (m_notif->IsOpen()) m_notif->Close();
             else OpenPanel(false, true);
-        };
+        });
     }
     if (_wgetenv(L"HALO_TEST_NOHOOK")) {}  // a test instance must not fight the live dock for Win / Win+A
     else if (!halo::winkey::Install(m_hwnd)) Log(L"Win-key hook failed " + std::to_wstring(GetLastError()));
@@ -650,6 +678,7 @@ wuc::ContainerVisual Halo::BuildPill(int noiseHeight, float radius, halo::settin
 // settings are read where they are used; glass, size and layout changes close the panel they touch, which
 // rebuilds on its next open, and the dock rebuilds its pill and icons in place.
 void Halo::ApplySettings(bool themeFlipped) {
+    HALO_CRUMB("Halo::ApplySettings");
     using halo::settings::Surface;
     const auto prev = m_cfg;
     halo::theme::Refresh();
@@ -693,6 +722,7 @@ void Halo::ApplySettings(bool themeFlipped) {
 // The pill, icons, cluster and label are rebuilt with the current settings; the window resizes if the icon
 // size or magnification moved its height. keepIcons: the icon surfaces are still the right size and look.
 void Halo::RebuildDock(bool keepIcons) {
+    HALO_CRUMB("Halo::RebuildDock");
     if (!m_dock) return;
     HidePreviews(true);
     if (m_menu && m_menu->IsOpen()) m_menu->Close();
@@ -885,6 +915,7 @@ wuc::CompositionBrush Halo::FallbackIconBrush() {
 
 // Pinned apps first, then the running apps that aren't pinned.
 void Halo::RefreshDock() {
+    HALO_CRUMB("Halo::RefreshDock");
     // Indices refer to the old app list. Clear them before ReleaseCapture,
     // which synchronously reenters WM_CAPTURECHANGED.
     m_hoverItem = -1;
@@ -1024,6 +1055,7 @@ void Halo::ComputeMetrics() {
 // resolution or scale, or went away. The Dock keeps its own copy of the metrics (centre, bottom, icon size), so a
 // different size or scale means a rebuild, not just moving the window.
 void Halo::MigrateToMonitor(HMONITOR mon, bool reveal) {
+    HALO_CRUMB("Halo::MigrateToMonitor");
     if (!mon) return;
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(mon, &mi)) return;
@@ -1085,6 +1117,7 @@ void Halo::ActivateWindow(HWND w) {
 // macOS: a running app comes to the front (its most recent window, restored if minimized) with a
 // short bob; clicking it while it is already in front minimizes it; one that isn't running is launched.
 void Halo::Activate(size_t item) {
+    HALO_CRUMB("Halo::Activate");
     Item const& it = m_items[item];
     HidePreviews();
     KillTimer(m_hwnd, kPreviewTimer);
@@ -1121,6 +1154,7 @@ void Halo::ReloadPins() {
 
 // The right-click menu of dock icon `item`: its open windows, then Keep in / Remove from Dock, Show in Explorer, Quit.
 void Halo::OpenMenuFor(int item) {
+    HALO_CRUMB("Halo::OpenMenuFor");
     if (!m_menu || !m_dock || item < 0 || item >= static_cast<int>(m_items.size())) return;
     Item const it = m_items[item];  // a copy: the menu outlives a RefreshDock
     const bool dry = _wgetenv(L"HALO_TEST_MENU_DRYRUN") != nullptr;
@@ -1140,23 +1174,25 @@ void Halo::OpenMenuFor(int item) {
             if (entries.size() >= kMenuWindows) { more++; continue; }  // 30 windows of one app would run the menu off the screen
             wchar_t t[256] = {};
             GetWindowTextW(w, t, ARRAYSIZE(t));
-            entries.push_back({t[0] ? t : L"Untitled", false, [this, w] { ActivateWindow(w); }});
+            entries.push_back({t[0] ? t : L"Untitled", false, Guarded("menu.activate", [this, w] { ActivateWindow(w); })});
         }
         if (more) entries.push_back({std::to_wstring(more) + (more == 1 ? L" more window" : L" more windows"), false, nullptr});
         if (!entries.empty()) entries.push_back({L"", true, nullptr});
     }
     if (pinned) {
-        entries.push_back({L"Remove from Dock", false, [this, it, dry] {
+        // ReloadPins -> RefreshDock -> Dock::SetItems -> BuildExpressions rethrows a rejected StartAnimation, and this runs
+        // from Menu::WndProc, which has no try/catch: on 11 Nov 21:25 that was the 0xC0000409 (see docs/CRASH-RECORDER.md).
+        entries.push_back({L"Remove from Dock", false, Guarded("menu.unpin", [this, it, dry] {
             if (dry) { Log(L"menu: DRY RUN, would unpin " + it.launch); return; }
             if (halo::pins::Unpin(it.launch)) ReloadPins();
-        }});
+        })});
     } else if (!it.pinPath.empty()) {
-        entries.push_back({L"Keep in Dock", false, [this, it] {
+        entries.push_back({L"Keep in Dock", false, Guarded("menu.pin", [this, it] {
             if (halo::pins::Pin(it.pinPath)) ReloadPins();
-        }});
+        })});
     }
     if (!it.file.empty()) {
-        entries.push_back({L"Show in Explorer", false, [it, dry] {
+        entries.push_back({L"Show in Explorer", false, Guarded("menu.explorer", [it, dry] {
             if (dry) { Log(L"menu: DRY RUN, would show " + it.file + L" in Explorer"); return; }
             PIDLIST_ABSOLUTE pidl = nullptr;
             if (SUCCEEDED(SHParseDisplayName(it.file.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) {
@@ -1165,15 +1201,15 @@ void Halo::OpenMenuFor(int item) {
             } else {
                 Log(L"menu: Show in Explorer failed for " + it.file);
             }
-        }});
+        })});
     }
     if (running) {
         if (!entries.empty()) entries.push_back({L"", true, nullptr});
-        entries.push_back({L"Quit", false, [this, it, dry] {
+        entries.push_back({L"Quit", false, Guarded("menu.quit", [this, it, dry] {
             auto wins = m_tracker->WindowsOf(it.key);
             if (dry) { Log(L"menu: DRY RUN, would close " + std::to_wstring(wins.size()) + L" windows of " + it.key); return; }
             for (HWND w : wins) PostMessageW(w, WM_CLOSE, 0, 0);
-        }});
+        })});
     }
     if (entries.empty()) return;
     Log(L"menu: item " + std::to_wstring(item) + L" '" + (item < static_cast<int>(m_appNames.size()) ? m_appNames[item] : L"") +
@@ -1316,6 +1352,7 @@ void Halo::PointerLeave() {
 // The Windows key and the Start logo: the Launcher panel (search, recent apps and files) above a
 // revealed dock. Not the real Start, which brings the hidden taskbar back with it. A second tap closes it.
 void Halo::OpenLauncher() {
+    HALO_CRUMB("Halo::OpenLauncher");
     Reveal();
     if (m_launcher) {
         if (m_launcher->IsOpen()) m_launcher->Hide();
@@ -1533,12 +1570,19 @@ LRESULT CALLBACK Halo::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (!self) return DefWindowProcW(h, m, w, l);
     // A throw out of a handler (a failed icon surface, a rejected expression, a dead device) would unwind
     // through user32 and take the whole shell with it. Log it and carry on: the next event retries.
+    halo::crash::Msg(m);
+    if (m != WM_MOUSEMOVE && m != WM_TIMER) HALO_CRUMB("Halo::WndProc");
     try {
         return self->OnMessage(m, w, l);
     } catch (winrt::hresult_error const& e) {
         Log(L"message " + std::to_wstring(m) + L" threw " + Hex(e.code()) + L" " + e.message().c_str());
+        halo::crash::Handled("Halo::WndProc");
     } catch (std::exception const&) {
         Log(L"message " + std::to_wstring(m) + L" threw std::exception");
+        halo::crash::Handled("Halo::WndProc");
+    } catch (...) {
+        Log(L"message " + std::to_wstring(m) + L" threw an unknown exception");
+        halo::crash::Handled("Halo::WndProc");
     }
     return DefWindowProcW(h, m, w, l);
 }
@@ -1632,9 +1676,11 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case kMsgMonitorSwitch:
+            HALO_CRUMB("kMsgMonitorSwitch");
             MigrateToMonitor(reinterpret_cast<HMONITOR>(w));
             return 0;
         case WM_DISPLAYCHANGE:
+            HALO_CRUMB("WM_DISPLAYCHANGE");
             if (m_multimon) m_multimon->OnDisplayChange();
             halo::edge::OnDisplayChange();
             {  // the dock's monitor may be gone (unplugged, laptop docked / undocked) or have a new size or scale
@@ -1645,6 +1691,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case kMsgEdge:
+            HALO_CRUMB("kMsgEdge");
             Log(w == halo::edge::kBottom ? L"edge: bottom right" : w == halo::edge::kTop ? L"edge: top" : L"edge: right");
             if (w == halo::edge::kBottom) {  // a fullscreen video's controls live there: not us. (Intellihide's
                 // "fullscreen" also counts any maximised window, since the taskbar is hidden: ask the shell.)
@@ -1660,6 +1707,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             OpenPanel(w == halo::edge::kBottom, w != halo::edge::kBottom);  // the corner: Quick Settings alone; touch: both, no auto-hide
             return 0;
         case WM_TIMER:
+            HALO_CRUMB("Halo::WM_TIMER");
             if (w == kMediaExpiry) {
                 KillTimer(m_hwnd, kMediaExpiry);
                 UpdateDockMedia();
@@ -1695,6 +1743,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             StartAdopter();
             return 0;
         case kMsgSettings:
+            HALO_CRUMB("kMsgSettings");
             if (halo::settings::Reload()) ApplySettings();
             return 0;
         case WM_SETTINGCHANGE:
@@ -1706,6 +1755,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (m_dock) m_dock->OnSettingChange();
             return 0;
         case WM_POWERBROADCAST:
+            HALO_CRUMB("WM_POWERBROADCAST");
             if (m_dock) m_dock->OnPowerBroadcast(w, l);
             return 0;
         case DockCluster::kMsgNetworkChanged:
@@ -1765,11 +1815,28 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case kMsgAppsChanged:
+            HALO_CRUMB("kMsgAppsChanged");
             if (m_dock) RefreshDock();
             RefreshPreviews();
             return 0;
         case WM_HOTKEY:
             if (w == kHotkeyQuit) PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        case WM_QUERYENDSESSION:
+            // Sign-out / shutdown / restart: agree, and from here on a death is the session ending, not a crash.
+            halo::crash::SessionEnding();
+            Log(L"session ending (query)");
+            return TRUE;
+        case WM_ENDSESSION:
+            if (w) {
+                halo::crash::SessionEnding();
+                Log(L"session ending: exiting cleanly");
+                // The taskbar belongs to whoever is left running: with the guardian gone nobody restores it.
+                if (g_unguarded) halo::taskbar::RestoreAll();
+                // Exit 0 at once rather than unwinding the compositor while Windows tears the session down: the guardian
+                // reads 0 as "closed", not "died", so it neither relaunches us (that run dies with 0xC000026B) nor counts a crash.
+                ExitProcess(0);
+            }
             return 0;
         case WM_CLOSE: m_swoop.reset(); m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); m_dockMedia.Stop(); m_dockRadios.Stop(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -1792,6 +1859,8 @@ int Halo::Run() {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+    halo::crash::Install();  // first: every death after this leaves a line in %LOCALAPPDATA%\Halo\crash.log and a dump
+    HALO_CRUMB("wWinMain: start");
     winrt::init_apartment(winrt::apartment_type::single_threaded);
     DWORD guardianPid = 0;
     int argc = 0;
@@ -1807,9 +1876,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             // A window with no dock must not look like a running shell: the guardian hides the taskbar
             // once the dock window is visible, and a non-zero exit makes it restore and retry.
             Log(L"startup incomplete; exiting");
+            halo::crash::StartupFailed("Halo::Create returned false");  // exit 2: the log tail names the failed step
             return 2;
         }
         if (guardianPid) WatchGuardian(guardianPid, app.Hwnd());
+        HALO_CRUMB("wWinMain: Run");
         code = app.Run();
     }
     if (g_unguarded) halo::taskbar::RestoreAll();
