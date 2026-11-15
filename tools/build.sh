@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|all]
+# Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|taskbar_test|all]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # Compiler: HALO_CXX (any LLVM-MinGW clang++ with C++/WinRT headers, or add them with HALO_INCLUDE),
@@ -89,6 +89,16 @@ build_settings_launch_test() {
   "$CXX" "${COMMON[@]}" tools/settings_launch_test.cpp -o build/settings_launch_test.exe -lole32 -luuid -lshell32 -luser32
 }
 
+build_taskbar_probe() {
+  echo "== taskbar_probe.exe"
+  "$CXX" "${COMMON[@]}" tools/taskbar_probe.cpp -o "${TASKBAR_PROBE_OUT:-build/taskbar_probe.exe}" -lshell32 -luser32 -lgdi32 -lole32
+}
+
+build_taskbar_test() {
+  echo "== taskbar_test.exe"
+  "$CXX" "${COMMON[@]}" src/taskbar.cpp tools/taskbar_test.cpp -o "${TASKBAR_TEST_OUT:-build/taskbar_test.exe}" -lshell32 -luser32 -lgdi32 -lole32 -ladvapi32
+}
+
 case "${1:-halo}" in
   halo) build_halo ;;
   guardian) build_guardian ;;
@@ -103,6 +113,8 @@ case "${1:-halo}" in
   settings_launch_test) build_settings_launch_test ;;
   start_test) build_start_test ;;
   notification_preview) build_notification_preview ;;
+  taskbar_probe) build_taskbar_probe ;;
+  taskbar_test) build_taskbar_test ;;
   all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test; build_start_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac

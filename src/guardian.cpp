@@ -6,10 +6,12 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -23,7 +25,8 @@ constexpr DWORD kRelaunchDelayMs = 1000;
 constexpr DWORD kHideAfterAliveMs = 3000;
 constexpr DWORD kCrashWindowMs = 120000;
 constexpr size_t kMaxCrashes = 3;
-constexpr UINT_PTR kRehideTimer = 1;
+constexpr UINT_PTR kRehideTimer = 1;     // one shot after TaskbarCreated: Explorer finishes building its windows late
+constexpr DWORD kReconcealLogEveryMs = 10000;  // the taskbar can be re-shown many times a minute; log a summary line
 constexpr DWORD kStartupGraceMs = 20000;  // halo gets this long to show its dock before the taskbar stays put
 constexpr DWORD kCloseWaitMs = 3000;  // how long halo gets to close itself before TerminateProcess
 constexpr int kHotkeyToggle = 1;      // Win+Alt+T
@@ -77,10 +80,24 @@ void Log(const wchar_t* fmt, ...) {
 }
 
 void SafeHide() {
-    try { halo::taskbar::HideAll(); } catch (...) { Log(L"HideAll threw"); }
+    try {
+        if (!halo::taskbar::HideAll()) Log(L"a taskbar window refused the empty region; it is only hidden");
+    } catch (...) { Log(L"HideAll threw"); }
 }
 void SafeRestore() {
     try { halo::taskbar::RestoreAll(); } catch (...) { Log(L"RestoreAll threw"); }
+}
+
+// However the guardian itself dies (access violation, uncaught exception), put the taskbar back first.
+// halo.exe notices a dead guardian and starts one that adopts it, which hides the taskbar again; if
+// that cannot happen the user is left with a normal taskbar rather than none (the idea of 7a44d36).
+std::atomic<bool> g_crashing{false};
+LONG WINAPI CrashFilter(EXCEPTION_POINTERS* e) {
+    if (!g_crashing.exchange(true)) {  // a fault inside this filter must not recurse
+        Log(L"guardian crashed (0x%08lX); restoring taskbar", e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionCode : 0);
+        SafeRestore();
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // ---- guardian ---------------------------------------------------------------
@@ -192,29 +209,44 @@ private:
     std::vector<DWORD> crashes_;
     int exitCode_ = 0;
 
-    HWINEVENTHOOK showHook_ = nullptr, foregroundHook_ = nullptr;
+    HWINEVENTHOOK showHook_ = nullptr, moveHook_ = nullptr, foregroundHook_ = nullptr;
     DWORD launchedAt_ = 0;
+    DWORD lastReconcealLog_ = 0, reconcealed_ = 0;
 
-    // Explorer shows the hidden taskbar again on its own (Win+A / Win+N flyouts, an edge swipe, a
-    // fullscreen app exiting). Watch explorer's window-show events and hide it again a moment later.
-    // Scoped to explorer's process, so it costs nothing while other apps open windows.
+    // Explorer shows the hidden taskbar again on its own (a toast or flyout, a flashing button, Win+B, a
+    // fullscreen app exiting, an autohide timer). The windows already carry an empty region (taskbar.cpp), so
+    // a re-show draws nothing; these hooks make it hidden again the moment Explorer reports it, in the hook
+    // callback itself with no timer in between. The show hook is scoped to Explorer's process (secondary
+    // taskbars on other monitors, and new ones after a hot-plug), the move hook to the thread that owns the
+    // primary taskbar, so neither costs anything while other apps open or move windows.
     void WatchTaskbar() {
         if (showHook_) UnhookWinEvent(showHook_);
-        showHook_ = nullptr;
-        DWORD pid = 0;
-        if (HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr)) GetWindowThreadProcessId(tray, &pid);
+        if (moveHook_) UnhookWinEvent(moveHook_);
+        showHook_ = moveHook_ = nullptr;
+        DWORD pid = 0, tid = 0;
+        if (HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr)) tid = GetWindowThreadProcessId(tray, &pid);
         if (!pid) return;
-        showHook_ = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, &Guardian::OnShow, pid, 0,
+        showHook_ = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, &Guardian::OnTaskbarEvent, pid, 0,
                                     WINEVENT_OUTOFCONTEXT);
+        moveHook_ = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+                                    &Guardian::OnTaskbarEvent, pid, tid, WINEVENT_OUTOFCONTEXT);
     }
 
-    static void CALLBACK OnShow(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG child, DWORD, DWORD) {
+    static void CALLBACK OnTaskbarEvent(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG child, DWORD, DWORD) {
         if (obj != OBJID_WINDOW || child != CHILDID_SELF || !h || !g_self || !g_self->proc_ || !g_self->hidden_) return;
         wchar_t cls[32] = {};
         GetClassNameW(h, cls, 32);
-        if (wcscmp(cls, L"Shell_TrayWnd") != 0 && wcscmp(cls, L"Shell_SecondaryTrayWnd") != 0) return;
-        Log(L"taskbar shown by explorer; hiding it again");
-        SetTimer(g_self->hwnd_, kRehideTimer, 40, nullptr);
+        if (!halo::taskbar::IsTaskbarClass(cls)) return;
+        if (halo::taskbar::ReconcealIfShown(h)) g_self->NoteReconcealed();
+    }
+
+    void NoteReconcealed() {
+        ++reconcealed_;
+        const DWORD now = GetTickCount();
+        if (lastReconcealLog_ != 0 && now - lastReconcealLog_ < kReconcealLogEveryMs) return;
+        Log(L"taskbar shown by explorer; concealed again (%lu since the last line)", reconcealed_);
+        reconcealed_ = 0;
+        lastReconcealLog_ = now;
     }
 
     static DWORD Remaining(DWORD at, DWORD now) {
@@ -240,8 +272,8 @@ private:
         if (!CreateProcessW(path.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
             Log(L"failed to launch %ls (error %lu)", path.c_str(), GetLastError());
             // Treat a launch failure like a crash so we cannot spin forever.
-            SafeRestore();
             hidden_ = false;
+            SafeRestore();
             RecordCrashAndDecide(L"launch failure");
             return;
         }
@@ -267,8 +299,8 @@ private:
             return;
         }
         Log(L"halo died (exit code 0x%08lX); restoring taskbar", code);
-        SafeRestore();
         hidden_ = false;
+        SafeRestore();
         RecordCrashAndDecide(L"crash");
     }
 
@@ -296,8 +328,8 @@ private:
         on_ = false;
         pendingHide_ = false;
         relaunchPending_ = false;
+        hidden_ = false;  // first: the hooks must not hide it again while we put it back
         SafeRestore();
-        hidden_ = false;
     }
 
     void TurnOn(const wchar_t* why) {
@@ -389,8 +421,11 @@ private:
             WaitForSingleObject(proc_.get(), 3000);
             proc_.reset();
         }
-        SafeRestore();
         hidden_ = false;
+        SafeRestore();
+        if (showHook_) UnhookWinEvent(showHook_);
+        if (moveHook_) UnhookWinEvent(moveHook_);
+        showHook_ = moveHook_ = nullptr;
         Log(L"taskbar restored; guardian exiting");
     }
 
@@ -672,6 +707,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         SafeRestore();
         return 0;
     }
+    SetUnhandledExceptionFilter(CrashFilter);
+    std::set_terminate([] {  // an uncaught C++ exception on a thread we do not wrap
+        if (!g_crashing.exchange(true)) {
+            Log(L"guardian terminate(); restoring taskbar");
+            SafeRestore();
+        }
+        std::abort();
+    });
     try {
         Guardian g;
         g.noUi = noUi;
