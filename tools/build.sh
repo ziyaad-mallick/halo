@@ -97,6 +97,11 @@ build_start_test() {
   "$CXX" "${COMMON[@]}" src/usage.cpp tools/start_test.cpp -o build/start_test.exe -lpdh -luser32
 }
 
+build_panel_preview() {
+  echo "== panel_preview.exe"
+  "$CXX" "${COMMON[@]}" -DHALO_NOTIF_TEST tools/panel_preview.cpp src/control_center.cpp src/notifications.cpp src/icons.cpp src/services.cpp src/settings.cpp -o "${PANEL_PREVIEW_OUT:-build/panel_preview.exe}" "${WINLIBS[@]}" -lwlanapi -lwbemuuid -lpsapi
+}
+
 build_notification_preview() {
   echo "== notification_preview.exe"
   "$CXX" "${COMMON[@]}" -DHALO_NOTIF_TEST tools/notification_preview.cpp src/notifications.cpp src/services.cpp src/settings.cpp -o "${NOTIFICATION_OUT:-build/notification_preview.exe}" "${WINLIBS[@]}" -lwlanapi -lwbemuuid -lpsapi
@@ -139,6 +144,7 @@ case "${1:-halo}" in
   notification_preview) build_notification_preview ;;
   taskbar_probe) build_taskbar_probe ;;
   taskbar_test) build_taskbar_test ;;
+  panel_preview) build_panel_preview ;;
   all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test; build_start_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac
