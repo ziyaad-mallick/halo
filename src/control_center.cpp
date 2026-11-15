@@ -50,15 +50,15 @@ using D2D1::ColorF;
 namespace halo {
 namespace {
 
-// Grid, in logical px (all drawing is scaled by the monitor DPI): 14 outer inset, 10 between modules,
-// 24 panel radius, 18 module radius. The window is the panel plus motion::kPad of empty margin on every
-// side, so the spring's overshoot never clips; everything below is in panel ("pill") coordinates.
-// Geometry, all from tokens.h: a 344 px panel, the inset and gaps on the 4 px scale, concentric corners.
-constexpr float kW = 380, kInset = ui::kPanelInset, kGap = ui::kS3, kRadius = ui::kPanelRadius;
-constexpr float kHeaderH = 56, kTitleLine = 20, kCaptionLine = 16, kPowH = 52;
-constexpr float kMaxH = 900, kMargin = ui::kS2;
+// Geometry, all from tokens.h: a 360 px panel, a 16 px inset, 16 px between groups and 8 px inside one,
+// concentric corners. The window is the panel plus motion::kPad of empty margin on every side, so the
+// spring's overshoot never clips; everything below is in panel coordinates (logical px).
+constexpr float kW = ui::kPanelW, kInset = ui::kPanelInset, kRadius = ui::kPanelRadius;
+constexpr float kHeaderH = ui::kRowH, kTitleLine = ui::kS4 + ui::kS1, kCaptionLine = ui::kS4, kPowH = ui::kRoundAction + ui::kS2;
+constexpr float kMaxH = 900, kMargin = ui::kS2, kActW = 4 * ui::kS6;  // the width of a text button on a details page
 // The home view at its full (non-dense) height: the details page and the "does it fit" test measure against it.
-constexpr float kHomeH = 620;
+// Five group gaps between the header, the two connectivity pills, two rows of minis, two sliders, the media card and the footer.
+constexpr float kHomeH = 2 * ui::kPanelInset + 5 * ui::kGroupGap + ui::kButton + ui::kTileH + 2 * ui::kRoundAction + ui::kInnerGap + 2 * ui::kButton + ui::kMediaH + ui::kButton;
 
 constexpr UINT kMsgAudio = WM_APP + 1, kMsgMic = WM_APP + 2, kMsgRadios = WM_APP + 3, kMsgBright = WM_APP + 4,
                kMsgMedia = WM_APP + 5, kMsgWifi = WM_APP + 6, kMsgBt = WM_APP + 7, kMsgLate = WM_APP + 8,
@@ -68,27 +68,20 @@ constexpr UINT_PTR kTimerClose = 1, kTimerChord = 2, kTimerClock = 3, kTimerLeav
 // brightness) are held and drawn once, kSettleMs after the show. A redraw mid-motion cost a frame.
 constexpr UINT kSettleMs = 240;
 // Auto-hide: while open, where the pointer is gets checked every kLeaveTickMs; kLeaveMs outside the panel
-// (plus kLeaveSlack px around it) closes it. Then the chips: a hovered control grows by about kLiftPx
-// logical px and leans toward the pointer by kLean of the distance, at most kLeanMax.
+// (plus kLeaveSlack px around it) closes it. Then the ring that springs out of a toggle (from kPulseFrom to
+// kPulseTo of its size) and how far an arrow key moves a slider.
 constexpr UINT kLeaveTickMs = 50, kLeaveMs = 200;
-constexpr float kLeaveSlack = 18, kLiftPx = 4, kPressScale = 0.96f, kLean = 0.07f, kLeanMax = 3.5f;
+constexpr float kLeaveSlack = 18, kPulseFrom = 0.9f, kPulseTo = 1.5f, kSliderStep = 0.05f;
 constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloControlCenterTimers";
 
 enum class Id {
-    None, WifiPill, BtPill, WifiText, BtText, Wifi, Bluetooth, RowTile, Airplane, Hotspot, Night, Dark, Dnd,
-    DisplayTile, Bright, SoundTile, Vol, OutRow, OutDev, ListTile, WifiNet, BtDev, MediaTile, Prev, PlayPause, Next,
-    Snip, Cast, Settings, Battery, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut, Clock, Label, Back, DeviceListTile, DiscoveryAction, RadioSettings
+    None, WifiPill, BtPill, WifiText, BtText, Wifi, Bluetooth, Airplane, Hotspot, Night, Dark, Dnd,
+    DisplayTile, Bright, Vol, OutRow, OutDev, WifiNet, BtDev, MediaTile, Prev, PlayPause, Next,
+    Snip, Cast, Settings, Battery, Lock, Power, Mic, PowerTile, PowSleep, PowRestart, PowShut, Clock, Back, DeviceListTile, DiscoveryAction, RadioSettings
 };
+// Passive items only hold a place (a tile, the sliders' area): the pointer and the keyboard skip them.
 bool Passive(Id id) {
-    return id == Id::WifiPill || id == Id::BtPill || id == Id::RowTile || id == Id::DisplayTile || id == Id::SoundTile ||
-           id == Id::ListTile || id == Id::MediaTile || id == Id::PowerTile || id == Id::Label || id == Id::DeviceListTile;
-}
-// Controls that grow under the pointer and squash under the finger (each is drawn on its own little
-// surface, a chip).
-bool Scalable(Id id) {
-    return id == Id::Wifi || id == Id::Bluetooth || id == Id::Airplane || id == Id::Hotspot || id == Id::Night ||
-           id == Id::Dark || id == Id::Dnd || id == Id::Snip || id == Id::Cast || id == Id::Settings ||
-           id == Id::Battery || id == Id::Lock || id == Id::Power || id == Id::Mic || id == Id::Prev || id == Id::PlayPause || id == Id::Next;
+    return id == Id::WifiPill || id == Id::BtPill || id == Id::DisplayTile || id == Id::MediaTile || id == Id::PowerTile || id == Id::DeviceListTile;
 }
 enum class Expand { None, Wifi, Bluetooth };
 
@@ -96,18 +89,19 @@ struct Item {
     Id id = Id::None;
     D2D1_RECT_F r{};
     int arg = 0;
-    float rad = 10;  // corner radius of the hover highlight
+    float rad = ui::kRadiusHover;  // corner radius of the hover highlight
 };
 bool Same(Item const& a, Item const& b) { return a.id == b.id && a.arg == b.arg; }
 
-winrt::Windows::Foundation::IReference<wfn::float3> Ref3(float v) {
-    return winrt::Windows::Foundation::IReference<wfn::float3>(wfn::float3{v, v, 1.0f});
-}
 bool In(D2D1_RECT_F const& r, float x, float y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
+winrt::Windows::UI::Color Col(D2D1_COLOR_F c) {
+    auto b = [](float v) { return static_cast<uint8_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255)); };
+    return winrt::Windows::UI::ColorHelper::FromArgb(b(c.a), b(c.r), b(c.g), b(c.b));
+}
 
-// Ink and fills come from the shared palette (light by default, HALO_THEME=dark for the old look). These
-// refer into the live palette, so a theme or accent change from settings.ini shows at the next paint.
-const D2D1_COLOR_F &kText = theme::detail::Cur().text, &kDim = theme::detail::Cur().dim, &kOff = theme::detail::Cur().off,
+// Ink and fills come from the shared palette. These refer into the live palette, so a theme or accent change
+// from settings.ini shows at the next paint. kDim is the palette's secondary text (`muted`).
+const D2D1_COLOR_F &kText = theme::detail::Cur().text, &kDim = theme::detail::Cur().muted, &kOff = theme::detail::Cur().off,
                    &kAccent = theme::detail::Cur().accent, &kOnAccent = theme::detail::Cur().onAccent;
 
 // A soft drop shadow that follows a rounded-rect mask. Lives under the clipped glass, so it
@@ -181,20 +175,8 @@ struct ControlCenter::Impl {
     wuc::InsetClip upperClip{nullptr}, lowerClip{nullptr};
     float split = 0;    // logical y in the new layout where it changed: what is above kept its place from the top
     float shownPx = 0;  // the panel height (px) the frame is at or springing to
-    struct Chip {
-        Item it;
-        wuc::SpriteVisual v{nullptr};
-        wuc::CompositionDrawingSurface surf{nullptr};
-        wfn::float3 rest{};  // offset in the pill, px
-        wfn::float2 size{};
-        float lift = 1;      // hover scale
-    };
-    std::vector<Chip> chips;
-    wuc::ContainerVisual chipLayer{nullptr};
-    wuc::CompositionPropertySet ptr{nullptr};  // "P": the pointer in pill px, read by the hovered chip's lean
-    int hotChip = -1;
-    wuc::CompositionRoundedRectangleGeometry clip{nullptr}, rim{nullptr}, hvGeo{nullptr}, specGeo{nullptr};
-    wuc::CompositionColorBrush hvBrush{nullptr};  // the highlight's fill: stronger while pressed
+    wuc::CompositionRoundedRectangleGeometry clip{nullptr}, rim{nullptr}, hvGeo{nullptr};
+    wuc::CompositionColorBrush hvBrush{nullptr};  // the highlight's fill: fillHover, or fillPress while pressed
     bool hvShown = false;
 
     // Kept across opens: the DirectWrite factory and formats, and the grain texture.
@@ -223,6 +205,12 @@ struct ControlCenter::Impl {
     std::wstring ssid;
     std::vector<Item> items;
     Item hover, pressed;
+    Item focus;             // the keyboard's control; drawn only once the keyboard has been used (kbFocus)
+    bool kbFocus = false;
+    // HALO_TEST + HALO_TEST_CC_MEDIA=1|0: a fixed Now Playing (or nothing playing) for design captures.
+    svc::MediaState demoMedia;
+    bool demoMediaOn = false;
+    svc::MediaState const& Playing() const { return demoMediaOn ? demoMedia : media.State(); }
     bool tracking = false, synced = false, settling = false, held = false, needSync = false;
     bool byPointer = false, entered = false;  // opened from the screen edge; the pointer has been over the panel
     ULONGLONG outSince = 0;
@@ -264,6 +252,11 @@ struct ControlCenter::Impl {
     void Paint(ID2D1DeviceContext* dc, float tx, float ty, Item const* only, Item const* skip, D2D1_RECT_F const* region = nullptr);
     void RepaintRegion(D2D1_RECT_F r);
     void PressFeedback(Item const* it);
+    bool Enabled(Item const& it) const;
+    void MoveFocus(int step);
+    void MoveFocusDir(int dy);
+    void NudgeSlider(int dir);
+    void FocusItem(Item const& it);
     // Motion for the CC's own feedback honours the surface's speed and reduce_motion (which also turns every effect into a fade).
     std::chrono::milliseconds Fast(int ms) const {
         return settings::Get().reduceMotion ? 1ms : std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(ms / settings::Speed(cfg())))));
@@ -272,10 +265,6 @@ struct ControlCenter::Impl {
     wuc::CompositionBrush NoiseBrush(int w, int h);
     void Pulse(Item const& it);
     void SetHover(Item const* it);
-    void SyncChips();
-    int ChipOf(Item const* it) const;
-    void HoverChip(int i);
-    void Squash(bool down);
     void Click(Item const& it);
     void ScrollDetails(int rows);
     void LaunchAfterClose(wchar_t const* uri);
@@ -371,12 +360,27 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 Close();
             }
             return 0;
-        case WM_KEYDOWN:
+        case WM_KEYDOWN: {
+            // Tab / Shift+Tab and Left / Right walk the controls; Up / Down walk them by row (on a details page they scroll
+            // its list); Enter or Space presses the focused one; Left / Right on a slider move it. Esc goes back, then closes.
+            const bool details = outsOpen || expand != Expand::None;
             if (w == VK_ESCAPE) {
-                if (outsOpen || expand != Expand::None) Click(Item{Id::Back});
+                if (details) Click(Item{Id::Back});
                 else Close();
-            } else if (w == VK_UP || w == VK_DOWN) ScrollDetails(w == VK_UP ? -1 : 1);
+            } else if (w == VK_TAB) {
+                MoveFocus((GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+            } else if (w == VK_LEFT || w == VK_RIGHT) {
+                if (focus.id == Id::Bright || focus.id == Id::Vol) NudgeSlider(w == VK_LEFT ? -1 : 1);
+                else MoveFocus(w == VK_LEFT ? -1 : 1);
+            } else if (w == VK_UP || w == VK_DOWN) {
+                if (details) ScrollDetails(w == VK_UP ? -1 : 1);
+                else MoveFocusDir(w == VK_UP ? -1 : 1);
+            } else if ((w == VK_RETURN || w == VK_SPACE) && focus.id != Id::Bright && focus.id != Id::Vol) {
+                for (auto const& it : items)
+                    if (Same(it, focus) && Enabled(it)) { Item c = it; Click(c); break; }
+            }
             return 0;
+        }
         case WM_MOUSEWHEEL: {
             POINT p{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
             ScreenToClient(h, &p);
@@ -393,15 +397,15 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (st != St::Open) return 0;
             Settle();  // a click shows its result at once
             if (x < 0 || y < 0 || x >= kW || y >= height) { Close(); return 0; }  // the transparent margin is "outside"
+            if (kbFocus) { kbFocus = false; Render(); }  // the pointer takes over from the keyboard: the ring goes
             if (auto* it = HitAt(x, y)) {
                 if (it->id == Id::Bright || it->id == Id::Vol) {
                     drag = it->id;
                     SetCapture(hwnd);
                     DragTo(x);
-                } else {
+                } else if (Enabled(*it)) {
                     pressed = *it;
-                    if (Scalable(it->id)) { HoverChip(ChipOf(it)); Squash(true); }
-                    else PressFeedback(it);  // the highlight answers at once, before anything else
+                    PressFeedback(it);  // the highlight answers at once, before anything else
                 }
             }
             return 0;
@@ -412,20 +416,17 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
                 tracking = TrackMouseEvent(&tme);
             }
-            if (ptr) ptr.InsertVector2(L"P", {x * s, y * s});
             auto* it = HitAt(x, y);
             Item now = it ? *it : Item{};
             if (!Same(now, hover)) {
                 hover = now;
-                SetHover(it);
-                if (pressed.id == Id::None) HoverChip(ChipOf(it));
+                SetHover(it && Enabled(*it) ? it : nullptr);
             }
             return 0;
         }
         case WM_MOUSELEAVE:
             tracking = false;
             if (hover.id != Id::None) { hover = {}; SetHover(nullptr); }
-            if (pressed.id == Id::None) HoverChip(-1);
             return 0;
         case WM_LBUTTONUP:
         case WM_CAPTURECHANGED:
@@ -436,13 +437,11 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             } else if (pressed.id != Id::None) {
                 Item p = std::exchange(pressed, Item{});
                 auto* it = (m == WM_LBUTTONUP && st == St::Open) ? HitAt(x, y) : nullptr;
-                if (Scalable(p.id)) Squash(false);
-                else PressFeedback(nullptr);
+                PressFeedback(nullptr);
                 if (it && Same(*it, p)) {
                     Item c = *it;  // Click re-lays-out and invalidates `it`
                     Click(c);
                 }
-                if (st == St::Open) HoverChip(ChipOf(hover.id != Id::None ? &hover : nullptr));
             }
             return 0;
         case kMsgTestClick:  // HALO_TEST: wParam = an Id, clicked as if by the pointer
@@ -531,6 +530,20 @@ void ControlCenter::Impl::Open(bool pointer) {
 
     try {
         BuildFonts();  // first open only
+        if (!demoMediaOn && _wgetenv(L"HALO_TEST") && _wgetenv(L"HALO_TEST_CC_MEDIA")) {
+            demoMediaOn = true;
+            demoMedia.has = _wgetenv(L"HALO_TEST_CC_MEDIA")[0] == L'1';
+            demoMedia.playing = demoMedia.canPrev = demoMedia.canNext = true;
+            demoMedia.title = L"Nightcall";
+            demoMedia.artist = L"Kavinsky";
+            demoMedia.artSize = 48;
+            for (int y = 0; y < 48; ++y)
+                for (int x = 0; x < 48; ++x) {
+                    const float t = (x + y) / 94.0f;  // a diagonal gradient, #C4553A to #40264F
+                    auto ch = [&](float a, float b) { return static_cast<uint32_t>(a + (b - a) * t); };
+                    demoMedia.art.push_back(0xFF000000 | ch(0xC4, 0x40) << 16 | ch(0x55, 0x26) << 8 | ch(0x3A, 0x4F));
+                }
+        }
         // The window and its visual tree are built once and kept hidden between opens (Park): a new
         // backdrop window per open cost DWM the first frames of the slide. Rebuilt only for a new DPI.
         if (hwnd && (builtScale != s || stale)) Teardown();
@@ -632,17 +645,11 @@ void ControlCenter::Impl::Park() {
     hover = pressed = {};
     tracking = false;
     if (hv) { hv.StopAnimation(L"Opacity"); hv.Opacity(0); }
-    if (hvBrush) hvBrush.Color(theme::C(theme::P().hover));
+    if (hvBrush) hvBrush.Color(Col(theme::P().fillHover));
     hvShown = false;
+    focus = {};
+    kbFocus = false;
     if (ghost) { inner.Children().Remove(ghost); ghost = nullptr; }
-    for (auto& c : chips) {  // back to rest, so the next open does not start with a lifted chip
-        c.v.StopAnimation(L"Scale");
-        c.v.StopAnimation(L"Offset");
-        c.v.Scale({1, 1, 1});
-        c.v.Offset(c.rest);
-    }
-    hotChip = -1;
-    if (ptr) ptr.InsertVector2(L"P", {-1000, -1000});
     if (hwnd) {
         KillTimer(hwnd, kTimerClose);
         ShowWindow(hwnd, SW_HIDE);
@@ -669,53 +676,50 @@ void ControlCenter::Impl::Teardown() {
     hwnd = nullptr;
     try {  // Close() throws once the compositor is gone (exit); this also runs from the destructor
         if (surf) surf.Close();
-        for (auto& c : chips) if (c.surf) c.surf.Close();
     } catch (winrt::hresult_error const&) {}
-    chips.clear();
-    hotChip = -1;
     shownPx = 0;
     ghost = lower = nullptr;
     upperClip = lowerClip = nullptr;
-    surf = nullptr; content = nullptr; chipLayer = nullptr; ptr = nullptr; hv = nullptr; hvGeo = nullptr;
-    hvBrush = nullptr; pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr; specGeo = nullptr;
+    surf = nullptr; content = nullptr; hv = nullptr; hvGeo = nullptr;
+    hvBrush = nullptr; pill = nullptr; inner = nullptr; shadowV = nullptr; fx = nullptr; root = nullptr; target = nullptr; clip = nullptr; rim = nullptr;
     items.clear();
     rect = {};
     if (wasOpen && api->onHidden) api->onHidden();
 }
 
-// A soft ring that springs out of a toggle's icon: the "springy" feedback for a click. One
-// compositor animation, no timer; the next pulse replaces it.
+// A soft ring that springs out of a toggle: the "springy" feedback for a click. One compositor animation, no
+// timer; the next pulse replaces it. Its colour is the accent, so it follows the theme.
 void ControlCenter::Impl::Pulse(Item const& it) {
     if (!fx || settings::Get().reduceMotion) return;
     fx.Children().RemoveAll();
-    float rad = std::min(it.r.right - it.r.left, it.r.bottom - it.r.top) / 2 - 2;
+    float rad = std::min(it.r.right - it.r.left, it.r.bottom - it.r.top) / 2 - ui::kFocusRing;
     auto geo = comp.CreateEllipseGeometry();
     geo.Radius({rad * s, rad * s});
     auto shape = comp.CreateSpriteShape(geo);
-    shape.StrokeBrush(comp.CreateColorBrush(theme::Dark() ? winrt::Windows::UI::ColorHelper::FromArgb(0xB0, 0xFF, 0xFF, 0xFF)
-                                                         : winrt::Windows::UI::ColorHelper::FromArgb(0x90, 0x0F, 0x76, 0x6E)));
-    shape.StrokeThickness(2 * s);
+    shape.StrokeBrush(comp.CreateColorBrush(Col(theme::A(kAccent, 0.75f))));
+    shape.StrokeThickness(ui::kFocusRing * s);
     auto v = comp.CreateShapeVisual();
     v.Size({1, 1});
     v.Offset({(it.r.left + it.r.right) / 2 * s, (it.r.top + it.r.bottom) / 2 * s, 0});
     v.Shapes().Append(shape);
     fx.Children().InsertAtTop(v);
     auto sc = comp.CreateVector3KeyFrameAnimation();
-    sc.InsertKeyFrame(0.0f, {0.9f, 0.9f, 1.0f});
-    sc.InsertKeyFrame(1.0f, {1.5f, 1.5f, 1.0f}, comp.CreateCubicBezierEasingFunction({0.2f, 0.8f}, {0.3f, 1.0f}));
-    sc.Duration(Fast(260));
+    sc.InsertKeyFrame(0.0f, {kPulseFrom, kPulseFrom, 1.0f});
+    sc.InsertKeyFrame(1.0f, {kPulseTo, kPulseTo, 1.0f}, comp.CreateCubicBezierEasingFunction({0.2f, 0.8f}, {0.3f, 1.0f}));
+    sc.Duration(Fast(ui::kPulseMs));
     v.StartAnimation(L"Scale", sc);
     auto op = comp.CreateScalarKeyFrameAnimation();
     op.InsertKeyFrame(0.0f, 1.0f);
     op.InsertKeyFrame(1.0f, 0.0f);
-    op.Duration(Fast(260));
+    op.Duration(Fast(ui::kPulseMs));
     v.StartAnimation(L"Opacity", op);
 }
 
-// One composition highlight that glides between controls (the surface itself is not redrawn on hover).
+// One composition highlight that glides between controls (the surface itself is not redrawn on hover): the
+// palette's fillHover, like every other panel.
 void ControlCenter::Impl::SetHover(Item const* it) {
     if (!hv || !hvGeo) return;
-    bool show = it && it->id != Id::Bright && it->id != Id::Vol && !Scalable(it->id);  // a chip is its own highlight
+    bool show = it && it->id != Id::Bright && it->id != Id::Vol;  // a slider is its own highlight
     if (!show) {
         if (hvShown) {
             hvShown = false;
@@ -751,133 +755,85 @@ void ControlCenter::Impl::SetHover(Item const* it) {
     hv.StartAnimation(L"Opacity", a);
 }
 
-// The pressed state of a plain control (a row, a text side of a pill): the hover highlight jumps to the control and
-// to its stronger fill in the same message that saw the button go down, with no animation to wait for. nullptr = released.
+// The pressed state of a control: the hover highlight jumps to the control and to fillPress in the same message that
+// saw the button go down, with no animation to wait for. nullptr = released.
 void ControlCenter::Impl::PressFeedback(Item const* it) {
     if (!hv || !hvBrush) return;
     const auto& p = theme::P();
-    if (!it) { hvBrush.Color(theme::C(p.hover)); return; }
-    hvBrush.Color(theme::C(p.press));
+    if (!it) { hvBrush.Color(Col(p.fillHover)); return; }
+    hvBrush.Color(Col(p.fillPress));
     SetHover(it);
     hv.StopAnimation(L"Opacity");
     hv.Opacity(1);
 }
 
-// Hover and press feedback, the dock's way: every Scalable control is drawn onto its own little surface
-// (a chip, like a dock icon), so hovering never redraws anything. The hovered chip springs up by about
-// kLiftPx and leans toward the pointer through an expression the compositor evaluates from `ptr`
-// (no animation restarts on mouse moves); it squashes to kPressScale under the finger and bounces back.
-void ControlCenter::Impl::SyncChips() {
-    if (!chipLayer) return;
-    std::vector<Chip> next;
+// Whether a control can act now (an adapter, a hotspot, a microphone, a player to talk to). Disabled ones draw
+// dimmed and neither highlight nor press; the keyboard skips them.
+bool ControlCenter::Impl::Enabled(Item const& it) const {
+    switch (it.id) {
+        case Id::Wifi: case Id::WifiText: return radios.HasWifi();
+        case Id::Bluetooth: case Id::BtText: return radios.HasBluetooth();
+        case Id::Airplane: return radios.HasWifi() || radios.HasBluetooth();
+        case Id::Hotspot: return hotspotAvail;
+        case Id::Mic: return mic.Available();
+        case Id::Battery: return mode != svc::PowerMode::Unknown;
+        case Id::Prev: return Playing().has && Playing().canPrev;
+        case Id::Next: return Playing().has && Playing().canNext;
+        case Id::PlayPause: return Playing().has;
+        default: return true;
+    }
+}
+
+// Keyboard. The items are in reading order, so Tab is the next one that can act; Up / Down pick the nearest one in
+// the row above or below. The ring shows only once the keyboard has been used.
+void ControlCenter::Impl::FocusItem(Item const& it) {
+    focus = it;  // a copy: Render() lays out again and invalidates `it`
+    kbFocus = true;
+    Render();
+}
+
+void ControlCenter::Impl::MoveFocus(int step) {
+    std::vector<Item const*> order;
+    for (auto const& it : items)
+        if (!Passive(it.id) && Enabled(it)) order.push_back(&it);
+    if (order.empty()) return;
+    const size_t n = order.size();
+    size_t at = n;
+    for (size_t i = 0; i < n; ++i)
+        if (Same(*order[i], focus)) at = i;
+    FocusItem(*order[at == n ? (step > 0 ? 0 : n - 1) : (at + n + step) % n]);
+}
+
+void ControlCenter::Impl::MoveFocusDir(int dy) {
+    Item const* from = nullptr;
+    for (auto const& it : items)
+        if (Same(it, focus) && focus.id != Id::None) from = &it;
+    if (!from) { MoveFocus(dy); return; }
+    const float fx = (from->r.left + from->r.right) / 2, fy = (from->r.top + from->r.bottom) / 2;
+    Item const* best = nullptr;
+    float bestScore = 0;
     for (auto const& it : items) {
-        if (!Scalable(it.id)) continue;
-        const int l = static_cast<int>(std::floor(it.r.left * s)), t = static_cast<int>(std::floor(it.r.top * s));
-        const int w = static_cast<int>(std::ceil(it.r.right * s)) - l, h = static_cast<int>(std::ceil(it.r.bottom * s)) - t;
-        Chip c;
-        for (auto& old : chips)  // the same control keeps its visual (and its animation); moved, it glides there
-            if (old.v && Same(old.it, it) && old.size.x == w && old.size.y == h) {
-                c = std::move(old);
-                old.v = nullptr;
-                if (c.rest.x != l || c.rest.y != t) {
-                    c.rest = {static_cast<float>(l), static_cast<float>(t), 0};
-                    auto glide = comp.CreateSpringVector3Animation();
-                    glide.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(c.rest));
-                    glide.DampingRatio(0.86f);
-                    glide.Period(Fast(40));
-                    c.v.StartAnimation(L"Offset", glide);
-                }
-                break;
-            }
-        if (!c.v) {
-            c.surf = gdev.CreateDrawingSurface({static_cast<float>(w), static_cast<float>(h)},
-                                               winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                                               winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-            c.v = comp.CreateSpriteVisual();
-            c.v.Size({static_cast<float>(w), static_cast<float>(h)});
-            c.rest = {static_cast<float>(l), static_cast<float>(t), 0};
-            c.size = {static_cast<float>(w), static_cast<float>(h)};
-            c.v.Offset(c.rest);
-            c.v.CenterPoint({w / 2.0f, h / 2.0f, 0});
-            auto sb = comp.CreateSurfaceBrush(c.surf);
-            sb.Stretch(wuc::CompositionStretch::None);
-            c.v.Brush(sb);
-            chipLayer.Children().InsertAtTop(c.v);
-        }
-        c.it = it;
-        c.lift = settings::Get().reduceMotion ? 1.0f : std::clamp(1 + kLiftPx / std::min(it.r.right - it.r.left, it.r.bottom - it.r.top), 1.03f, 1.09f);
-        auto interop = c.surf.as<ICompositionDrawingSurfaceInterop>();
-        winrt::com_ptr<ID2D1DeviceContext> dc;
-        POINT off{};
-        if (SUCCEEDED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), dc.put_void(), &off))) {
-            try {
-                Paint(dc.get(), off.x - c.rest.x, off.y - c.rest.y, &it, nullptr);
-            } catch (...) {}
-            interop->EndDraw();
-        }
-        next.push_back(std::move(c));
+        if (Passive(it.id) || !Enabled(it)) continue;
+        const float along = ((it.r.top + it.r.bottom) / 2 - fy) * dy;
+        if (along < ui::kS2) continue;  // not in the row above / below
+        const float score = along + 2 * std::fabs((it.r.left + it.r.right) / 2 - fx);
+        if (!best || score < bestScore) { best = &it; bestScore = score; }
     }
-    for (auto& old : chips)
-        if (old.v) {
-            chipLayer.Children().Remove(old.v);
-            if (old.surf) old.surf.Close();
-        }
-    const Item was = hotChip >= 0 && hotChip < static_cast<int>(chips.size()) ? chips[hotChip].it : Item{};
-    chips = std::move(next);
-    hotChip = -1;
-    for (size_t i = 0; i < chips.size(); i++)
-        if (was.id != Id::None && Same(chips[i].it, was)) hotChip = static_cast<int>(i);
+    if (best) FocusItem(*best);
 }
 
-int ControlCenter::Impl::ChipOf(Item const* it) const {
-    if (!it || !Scalable(it->id)) return -1;
-    for (size_t i = 0; i < chips.size(); i++)
-        if (Same(chips[i].it, *it)) return static_cast<int>(i);
-    return -1;
-}
-
-void ControlCenter::Impl::HoverChip(int i) {
-    if (i == hotChip) return;
-    if (hotChip >= 0 && hotChip < static_cast<int>(chips.size())) {  // the old one settles back
-        auto& c = chips[hotChip];
-        auto scale = comp.CreateSpringVector3Animation();
-        scale.FinalValue(Ref3(1.0f));
-        scale.DampingRatio(0.6f);
-        scale.Period(Fast(38));
-        c.v.StartAnimation(L"Scale", scale);
-        auto back = comp.CreateSpringVector3Animation();
-        back.FinalValue(winrt::Windows::Foundation::IReference<wfn::float3>(c.rest));
-        back.DampingRatio(0.6f);
-        back.Period(Fast(38));
-        c.v.StartAnimation(L"Offset", back);
+void ControlCenter::Impl::NudgeSlider(int dir) {
+    if (focus.id == Id::Vol) {
+        if (!speaker.Available()) return;
+        volume = std::clamp(volume + dir * kSliderStep, 0.0f, 1.0f);
+        speaker.SetVolume(volume);
+    } else if (focus.id == Id::Bright && bright >= 0) {
+        bright = std::clamp(bright + dir * static_cast<int>(std::lround(kSliderStep * 100)), 0, 100);
+        svc::brightness::Set(bright);
+    } else {
+        return;
     }
-    hotChip = i;
-    if (i < 0) return;
-    auto& c = chips[i];
-    auto grow = comp.CreateSpringVector3Animation();
-    grow.FinalValue(Ref3(c.lift));
-    grow.DampingRatio(0.55f);
-    grow.Period(Fast(38));
-    c.v.StartAnimation(L"Scale", grow);
-    if (settings::Get().reduceMotion) return;  // no lean toward the pointer
-    auto lean = comp.CreateExpressionAnimation(
-        L"Vector3(rest.X + Clamp((ptr.P.X - mid.X) * k, -m, m), rest.Y + Clamp((ptr.P.Y - mid.Y) * k, -m, m), 0)");
-    lean.SetReferenceParameter(L"ptr", ptr);
-    lean.SetVector3Parameter(L"rest", c.rest);
-    lean.SetVector2Parameter(L"mid", {c.rest.x + c.size.x / 2, c.rest.y + c.size.y / 2});
-    lean.SetScalarParameter(L"k", kLean);
-    lean.SetScalarParameter(L"m", kLeanMax * s);
-    c.v.StartAnimation(L"Offset", lean);
-}
-
-void ControlCenter::Impl::Squash(bool down) {
-    if (hotChip < 0 || hotChip >= static_cast<int>(chips.size())) return;
-    auto& c = chips[hotChip];
-    auto spring = comp.CreateSpringVector3Animation();
-    spring.FinalValue(Ref3(down ? kPressScale : c.lift));
-    spring.DampingRatio(down ? 0.8f : 0.42f);  // the press settles with no wobble; the release overshoots: the bounce
-    spring.Period(down ? Fast(20) : Fast(42));
-    c.v.StartAnimation(L"Scale", spring);
+    Render();
 }
 
 // Auto-hide. Inside: the panel (and kLeaveSlack around it), the notification column, and, until the
@@ -1172,7 +1128,7 @@ void ControlCenter::Impl::DragTo(float x) {
             if (now - lastBrightSet >= 33) { lastBrightSet = now; svc::brightness::Set(bright); }
         }
         // The track follows the pointer 1:1: the slider module is redrawn on its own, straight away, with no
-        // layout pass, no chip sync and no animation in between.
+        // layout pass and no animation in between.
         auto tile = std::find_if(items.begin(), items.end(), [](Item const& i) { return i.id == Id::DisplayTile; });
         if (st == St::Open && !settling && tile != items.end()) RepaintRegion(tile->r);
         else Render();
@@ -1195,29 +1151,40 @@ void ControlCenter::Impl::Layout() {
     items.clear();
     const bool dense = Dense() ||
         kHomeH + (outsOpen ? outs.size() * kListRowH + kS1 : 0) + (powerOpen ? kPowH + kS2 : 0) > MaxH();
-    const float insetY = dense ? kS2 : kInset;
-    // Grouped like the preview: tight inside a group (the toggles, the sliders), a larger step between groups.
-    const float gap = dense ? kS1 : kS2;
-    const float grp = dense ? kS2 : kS4;
-    const float headerH = kHeaderH;
-    const float pillH = dense ? 4 * kS3 : kPillH;
-    const float mediaH = dense ? 4 * kS3 : kMediaH;  // ui::kMediaH
-    const float actionD = dense ? kRound : kRoundAction;
+    const float insetY = dense ? kS3 : kInset;
+    // Grouped like the design: tight inside a group (the pills, the minis, the sliders), a larger step between groups.
+    const float gap = kInnerGap;
+    const float grp = dense ? kS2 : kGroupGap;
+    const float headH = dense ? kButton - kS2 : kButton;
+    const float pillH = dense ? kTileH - kS4 : kTileH;
+    const float miniH = dense ? kRound : kRoundAction;
+    const float rowH = dense ? kSliderHitH : kButton;  // a slider's row: the track (kSliderH) is centred in it
+    const float mediaH = dense ? kMediaArt + kS2 : kMediaH;
     const float powerH = dense ? kRoundAction : kPowH;
     const float x0 = kInset, x1 = kW - kInset;
     float y = insetY;
-    auto add = [&](Id id, D2D1_RECT_F r, int arg = 0, float rad = kRadiusSmall) { items.push_back({id, r, arg, rad}); };
+    auto add = [&](Id id, D2D1_RECT_F r, int arg = 0, float rad = kRadiusHover) { items.push_back({id, r, arg, rad}); };
+    // The footer: the battery and power mode at the left (a press cycles the mode), Lock, Settings and Power at the right.
+    auto footer = [&](float top) {
+        const float b = kButton;
+        add(Id::Battery, {x0, top, x1 - 3 * b - 2 * kS1 - kS2, top + b});
+        Id ids[] = {Id::Lock, Id::Settings, Id::Power};
+        for (int i = 0; i < 3; ++i) {
+            const float left = x1 - (3 - i) * b - (2 - i) * kS1;
+            add(ids[i], {left, top, left + b, top + b});
+        }
+    };
 
     // Details get their own bounded page: expanding devices must never bury the shell actions.
     if (outsOpen || expand != Expand::None) {
         height = std::min(MaxH(), kHomeH);
-        add(Id::Back, {x0, y, outsOpen ? x1 : x1 - 112, y + headerH});
-        if (!outsOpen) add(Id::RadioSettings, {x1 - 108, y, x1, y + headerH});
-        y += headerH + kS2;
-        const float footerTop = height - insetY - actionD;
+        add(Id::Back, {x0, y, outsOpen ? x1 : x1 - kActW - kS2, y + kHeaderH});
+        if (!outsOpen) add(Id::RadioSettings, {x1 - kActW, y + kS1, x1, y + kHeaderH - kS1});
+        y += kHeaderH + kS2;
+        const float footerTop = height - insetY - kButton;
         const float bottom = footerTop - kS3;
         add(Id::DeviceListTile, {x0, y, x1, bottom}, 0, kRadiusLarge);
-        if (!outsOpen) add(Id::DiscoveryAction, {x1 - 112, y + kS2, x1 - kS2, y + kS2 + kRound});
+        if (!outsOpen) add(Id::DiscoveryAction, {x1 - kActW - kS2, y + kS2, x1 - kS2, y + kS2 + kRound});
         const float rowTop = y + kS4 + kTitleLine + kS2 + (outsOpen ? 0 : kListRowH);
         const size_t capacity = static_cast<size_t>(std::max(0.0f, std::floor((bottom - kS2 - rowTop) / kListRowH)));
         const size_t total = outsOpen ? outs.size() : expand == Expand::Wifi ? wifiRows.size() : btRows.size();
@@ -1230,99 +1197,79 @@ void ControlCenter::Impl::Layout() {
             add(outsOpen ? Id::OutDev : expand == Expand::Wifi ? Id::WifiNet : Id::BtDev,
                 {x0 + kS2, top, x1 - kS2, top + kListRowH}, static_cast<int>(offset + row));
         }
-        Id ids[] = {Id::Mic, Id::Snip, Id::Cast, Id::Settings, Id::Lock, Id::Power};
-        const float step = (x1 - x0 - actionD) / 5;
-        for (int i = 0; i < 6; ++i) {
-            const float left = x0 + i * step;
-            add(ids[i], {left, footerTop, left + actionD, footerTop + actionD}, 0, actionD / 2);
-        }
+        footer(footerTop);
         return;
     }
 
-    // Header, on the glass itself: the time and date (opens the calendar), the battery chip (cycles the power mode).
-    add(Id::Clock, {x0, y, x1 - 136 - kGap, y + headerH}, 0, kRadiusSmall);
-    add(Id::Battery, {x1 - 136, y + kS2, x1, y + headerH - kS2}, 0, kRadiusSmall);
-    y += headerH + (dense ? kS1 : kS3);
+    // Header, on the glass itself: the time and date (opens the calendar and the notifications above the panel).
+    add(Id::Clock, {x0, y, x1, y + headH});
+    y += headH + grp;
 
-    // The toggle grid: three rows of 64 px on two columns.
-    //   Wi-Fi pill            | Bluetooth pill          (round toggle; the text side opens the list)
-    //   Airplane | Hotspot    | Do not disturb pill     (icon-only tiles)
-    //   Night light pill      | Dark mode pill
-    const float col = (x1 - x0 - kGap) / 2, half = (col - kGap) / 2, rx = x0 + col + kGap;
-    auto pill = [&](float l, float top, Id back, Id dot, Id text) {
-        const float r = l + col, icx = l + kS3 + kRound / 2, icy = top + pillH / 2;
-        add(back, {l, top, r, top + pillH}, 0, kRadiusLarge);
-        add(text, {icx + kRound / 2 + kS3, top + kS2, r - kS1, top + pillH - kS2}, 0, kRadiusSmall);
+    // Two connectivity pills: a round toggle, then the name over its state (the text side opens the list).
+    const float col = (x1 - x0 - gap) / 2, rx = x0 + col + gap;
+    auto pill = [&](float l, Id back, Id dot, Id text) {
+        const float r = l + col, icx = l + kS3 + kRound / 2, icy = y + pillH / 2;
+        add(back, {l, y, r, y + pillH}, 0, kRadiusLarge);
         add(dot, {icx - kRound / 2, icy - kRound / 2, icx + kRound / 2, icy + kRound / 2}, 0, kRound / 2);
+        add(text, {icx + kRound / 2 + kS3, y + kS2, r - kS1, y + pillH - kS2});
     };
-    pill(x0, y, Id::WifiPill, Id::Wifi, Id::WifiText);
-    pill(rx, y, Id::BtPill, Id::Bluetooth, Id::BtText);
-    y += pillH + gap;
-    add(Id::Airplane, {x0, y, x0 + half, y + pillH}, 0, kRadiusLarge);
-    add(Id::Hotspot, {x0 + half + kGap, y, x0 + col, y + pillH}, 0, kRadiusLarge);
-    add(Id::Dnd, {rx, y, x1, y + pillH}, 0, kRadiusLarge);
-    y += pillH + gap;
-    add(Id::Night, {x0, y, x0 + col, y + pillH}, 0, kRadiusLarge);
-    add(Id::Dark, {rx, y, x1, y + pillH}, 0, kRadiusLarge);
+    pill(x0, Id::WifiPill, Id::Wifi, Id::WifiText);
+    pill(rx, Id::BtPill, Id::Bluetooth, Id::BtText);
     y += pillH + grp;
 
-    // One module for both sliders: Display, then Sound (whose output list opens under it). The Sound row
-    // is always laid out (greyed when there is no output), so the height never depends on the audio read.
+    // Two rows of four small round toggles (Cast, Snip and the microphone sit among them).
+    {
+        const Id ids[2][4] = {{Id::Airplane, Id::Hotspot, Id::Dnd, Id::Night}, {Id::Dark, Id::Mic, Id::Snip, Id::Cast}};
+        const float w = (x1 - x0 - 3 * gap) / 4;
+        for (int row = 0; row < 2; ++row) {
+            for (int c = 0; c < 4; ++c) {
+                const float left = x0 + c * (w + gap);
+                add(ids[row][c], {left, y, left + w, y + miniH}, 0, miniH / 2);
+            }
+            y += miniH + (row ? grp : gap);
+        }
+    }
+
+    // The sliders: Display (when the panel has a brightness control), then Sound, with the audio output at its right
+    // end. The icon sits outside the track, the track is kSliderH tall, and the Sound row is always laid out (dimmed
+    // when there is no output), so the height never depends on the audio read.
     if (cfg().showSliders) {
         const bool disp = bright >= 0;
-        const float blk = kTitleLine + kS2 + kSliderH;  // a label over a track
-        const float padY = dense ? kS2 : kS4;
-        const float h = padY + (disp ? blk + padY : 0) + blk + padY;
-        // The track is kSliderH tall; its pointer target is kS1 taller on each side (kSliderHitH).
-        auto track = [&](Id id, float top) {
-            add(id, {x0 + kS4, top + blk - kSliderH - (kSliderHitH - kSliderH) / 2, x1 - kS4, top + blk + (kSliderHitH - kSliderH) / 2});
-        };
-        add(Id::DisplayTile, {x0, y, x1, y + h}, static_cast<int>(padY), kRadiusLarge);
-        float t = y + padY;
+        const float trackL = x0 + kTitleLine + kS3, trackR = x1 - kButton - kS2;
+        add(Id::DisplayTile, {x0, y, x1, y + (disp ? 2 : 1) * rowH}, 0, kRadiusLarge);  // the sliders' area (redrawn while one is dragged)
+        float t = y;
         if (disp) {
-            track(Id::Bright, t);
-            t += blk + padY;
+            add(Id::Bright, {trackL, t, trackR, t + rowH});
+            t += rowH;
         }
-        add(Id::SoundTile, {x0, t, x1, t + kTitleLine});  // only for the "Sound" label
-        add(Id::OutRow, {x0 + 112, t - kS1, x1 - kS2, t + kTitleLine + kS1}, 0, kRadiusSmall);
-        track(Id::Vol, t);
-        y += h + grp;
+        add(Id::Vol, {trackL, t, trackR, t + rowH});
+        add(Id::OutRow, {x1 - kButton, t + (rowH - kButton) / 2, x1, t + (rowH + kButton) / 2});
+        y = t + rowH + grp;
     }
 
     // Media arrival never changes the home height. The compact power choices temporarily use its space.
     if (cfg().showMedia && !(dense && powerOpen)) {
         add(Id::MediaTile, {x0, y, x1, y + mediaH}, 0, kRadiusLarge);
-        // One row of prev / play / next at the right, only while something plays (nothing to control otherwise).
-        if (media.State().has) {
-            const float cy = y + mediaH / 2, b = kRound, side = kRound - kS1;
-            float r = x1 - kS3;
-            add(Id::Next, {r - side, cy - b / 2, r, cy + b / 2}, 0, b / 2);
-            r -= side;
-            add(Id::PlayPause, {r - b, cy - b / 2, r, cy + b / 2}, 0, b / 2);
-            r -= b;
-            add(Id::Prev, {r - side, cy - b / 2, r, cy + b / 2}, 0, b / 2);
+        // One row of previous / play / next at the right, only while something plays (nothing to control otherwise).
+        if (Playing().has) {
+            const float cy = y + mediaH / 2, b = kButton - kS1, r = x1 - kS3;
+            add(Id::Next, {r - b, cy - b / 2, r, cy + b / 2});
+            add(Id::PlayPause, {r - 2 * b - kS1, cy - b / 2, r - b - kS1, cy + b / 2});
+            add(Id::Prev, {r - 3 * b - 2 * kS1, cy - b / 2, r - 2 * b - 2 * kS1, cy + b / 2});
         }
         y += mediaH + grp;
     }
 
-    // Actions: free-standing round buttons across the width.
-    {
-        Id ids[] = {Id::Mic, Id::Snip, Id::Cast, Id::Settings, Id::Lock, Id::Power};
-        const float d = actionD, step = (x1 - x0 - d) / 5;
-        for (int i = 0; i < 6; i++) {
-            float l = x0 + i * step;
-            add(ids[i], {l, y, l + d, y + d}, 0, d / 2);
-        }
-        y += d + gap;
-    }
-    // The inline Sleep / Restart / Shut down choice under the actions.
+    footer(y);
+    y += kButton + gap;
+    // The inline Sleep / Restart / Shut down choice under the footer.
     if (powerOpen) {
         add(Id::PowerTile, {x0, y, x1, y + powerH}, 0, kRadiusLarge);
         Id ids[] = {Id::PowSleep, Id::PowRestart, Id::PowShut};
         float w3 = (x1 - x0 - 2 * kS2 - 2 * kS1) / 3;
         for (int i = 0; i < 3; i++) {
             float l = x0 + kS2 + i * (w3 + kS1);
-            add(ids[i], {l, y + kS2, l + w3, y + powerH - kS2}, 0, kRadiusSmall);
+            add(ids[i], {l, y + kS2, l + w3, y + powerH - kS2});
         }
         y += powerH + gap;
     }
@@ -1342,8 +1289,7 @@ void ControlCenter::Impl::ApplySize() {
         if (GetCursorPos(&p) && pressed.id == Id::None && drag == Id::None) {
             auto* it = HitAt((p.x - rect.left) / s, (p.y - rect.top) / s);
             hover = it ? *it : Item{};
-            SetHover(it);
-            HoverChip(ChipOf(it));
+            SetHover(it && Enabled(*it) ? it : nullptr);
         }
         if (api->onResized) api->onResized();
     }
@@ -1378,7 +1324,6 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
         if (shadowV) size(shadowV, {wPx, hPx});
         size(clip, {wPx, hPx});
         size(rim, {wPx - s, hPx - s});
-        if (specGeo) size(specGeo, {wPx - 3 * s, hPx - 3 * s});
         if (ghost) { inner.Children().Remove(ghost); ghost = nullptr; }
         const float S = std::round(split * s), maxPx = MaxPx();
         // `inner` is springing to hPx: `lower` keeps its drawing on the bottom edge and starts where `content` ends.
@@ -1428,14 +1373,12 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
     clip.StopAnimation(L"Size");
     rim.StopAnimation(L"Size");
     if (shadowV) shadowV.StopAnimation(L"Size");
-    if (specGeo) specGeo.StopAnimation(L"Size");
     if (ghost) { inner.Children().Remove(ghost); ghost = nullptr; }
     pill.Size({wPx, hPx});
     inner.Size({wPx, hPx});
     if (shadowV) shadowV.Size({wPx, hPx});
     clip.Size({wPx, hPx});
     rim.Size({wPx - s, hPx - s});
-    if (specGeo) specGeo.Size({wPx - 3 * s, hPx - 3 * s});
     if (upperClip) upperClip.BottomInset(0);
     if (lower) {
         lower.StopAnimation(L"Offset.Y");
@@ -1472,7 +1415,6 @@ void ControlCenter::Impl::Render() {
         Paint(dc.get(), static_cast<float>(off.x), static_cast<float>(off.y), nullptr, nullptr);
     } catch (...) {}
     interop->EndDraw();
-    if (drag == Id::None) SyncChips();  // a slider drag changes no chip: don't redraw 17 of them per move
 }
 
 // Draws every item (or just `only`, minus `skip`) with the panel origin at (tx, ty) device px.
@@ -1485,38 +1427,30 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
     dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     winrt::com_ptr<ID2D1SolidColorBrush> br;
     dc->CreateSolidColorBrush(kText, br.put());
-    const bool darkTheme = theme::Dark();
-    const D2D1_COLOR_F kFill = darkTheme ? ColorF(1, 1, 1, 0.94f) : ColorF(1, 1, 1, 1.0f),
-                       kOnFill = darkTheme ? ColorF(0x1C1C1E) : ColorF(0.11f, 0.11f, 0.12f, 0.62f);
+    const auto& pal = theme::P();
+    constexpr float kMarkStroke = kHair + kHair / 2;  // the dark-mode glyph's outline
 
     auto box = [&](D2D1_RECT_F r, float rad, D2D1_COLOR_F c) {
         br->SetColor(c);
         dc->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), br.get());
     };
-    // A module: one flat fill on the glass. No border and no shading: the glass is the only surface with an
-    // edge, so modules read as parts of one panel instead of boxes in a box.
-    auto tile = [&](D2D1_RECT_F r) {
-        box(r, kRadiusLarge, theme::P().fill);
-        if (!darkTheme) {
-            br->SetColor(theme::P().line);
-            dc->DrawRoundedRectangle(D2D1::RoundedRect({r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f}, kRadiusLarge, kRadiusLarge), br.get(), 1.0f);
-        }
-    };
+    // A tile: one flat fill on the glass, the same in both themes. No border and no shading: the glass is the only
+    // surface with an edge, so tiles read as parts of one panel instead of boxes in a box.
+    auto tile = [&](D2D1_RECT_F r) { box(r, kRadiusLarge, pal.fill); };
     auto txt = [&](std::wstring const& t, IDWriteTextFormat* f, D2D1_RECT_F r, D2D1_COLOR_F c) {
         br->SetColor(c);
         dc->DrawText(t.c_str(), static_cast<UINT32>(t.size()), f, r, br.get());
     };
     auto glyph = [&](wchar_t g, IDWriteTextFormat* f, D2D1_RECT_F r, D2D1_COLOR_F c) { txt(std::wstring(1, g), f, r, c); };
-    // A round control: accent when on, a quiet disc when off; a glyph, or the half-filled disc for dark mode.
-    auto round = [&](float cx, float cy, float rad, bool on, bool avail, wchar_t g, IDWriteTextFormat* f, bool darkMark) {
+    // A toggle: the accent when on, `idle` when off; a glyph, or the half-filled disc for dark mode. Unavailable = dimmed.
+    auto toggle = [&](D2D1_RECT_F r, float rad, D2D1_COLOR_F idle, bool on, bool avail, wchar_t g, bool darkMark) {
         const float a = avail ? 1.0f : 0.4f;
-        br->SetColor(theme::A(on ? kAccent : kOff, a));
-        dc->FillEllipse(D2D1::Ellipse({cx, cy}, rad, rad), br.get());
+        box(r, rad, theme::A(on ? kAccent : idle, a));
         const D2D1_COLOR_F ink = theme::A(on ? kOnAccent : kText, a);
         if (darkMark) {
-            float k = rad * 0.36f;
+            const float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, k = std::min(r.right - r.left, r.bottom - r.top) / 2 * 0.36f;
             br->SetColor(ink);
-            dc->DrawEllipse(D2D1::Ellipse({cx, cy}, k, k), br.get(), 1.5f);
+            dc->DrawEllipse(D2D1::Ellipse({cx, cy}, k, k), br.get(), kMarkStroke);
             winrt::com_ptr<ID2D1Factory> fac;
             dc->GetFactory(fac.put());
             winrt::com_ptr<ID2D1PathGeometry> pg;
@@ -1529,7 +1463,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 dc->FillGeometry(pg.get(), br.get());
             }
         } else {
-            glyph(g, f, {cx - rad, cy - rad, cx + rad, cy + rad}, ink);
+            glyph(g, fIcon.get(), r, ink);
         }
     };
     // Two lines: a title over a muted status, left-aligned in r and centred vertically.
@@ -1538,53 +1472,48 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         txt(title, fTitle.get(), {r.left, cy - kTitleLine + 1, r.right, cy + 1}, theme::A(kText, a));
         txt(sub, fSub.get(), {r.left, cy + 1, r.right, cy + kCaptionLine + 1}, theme::A(kDim, a));
     };
-    // A toggle pill (Do not disturb, Night light, Dark mode): the round icon at the left, the name over its state.
-    auto togglePill = [&](D2D1_RECT_F r, bool on, wchar_t g, bool darkMark, std::wstring const& title) {
-        tile(r);
-        const float icx = r.left + kS3 + kRound / 2, icy = (r.top + r.bottom) / 2;
-        round(icx, icy, kRound / 2, on, true, g, fIcon.get(), darkMark);
-        twoLines(title, on ? L"On" : L"Off", {icx + kRound / 2 + kS3, r.top, r.right - kS2, r.bottom}, 1.0f);
+    // A small toggle's glyph centred in a round control; a control without a plate at rest is just its glyph.
+    auto round = [&](D2D1_RECT_F r, bool on, bool avail, wchar_t g, bool darkMark) {
+        toggle(r, (r.right - r.left) / 2, kOff, on, avail, g, darkMark);
     };
-    // An icon-only tile (Airplane mode, Hotspot): the round toggle centred on a tile.
-    auto iconTile = [&](D2D1_RECT_F r, bool on, bool avail, wchar_t g) {
-        tile(r);
-        round((r.left + r.right) / 2, (r.top + r.bottom) / 2, kRound / 2, on, avail, g, fIcon.get(), false);
+    auto mini = [&](D2D1_RECT_F r, bool on, bool avail, wchar_t g, bool darkMark) {
+        toggle(r, (r.bottom - r.top) / 2, pal.fill, on, avail, g, darkMark);
     };
     for (auto const& it : items) {
         if (only && !Same(it, *only)) continue;
         if (skip && Same(it, *skip)) continue;
-        if (!only && chipLayer && Scalable(it.id)) continue;  // drawn on its chip
         if (region && (it.r.right <= region->left || it.r.left >= region->right || it.r.bottom <= region->top || it.r.top >= region->bottom)) continue;
         auto const& r = it.r;
-        const float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+        const float cy = (r.top + r.bottom) / 2;
+        const float on1 = Enabled(it) ? 1.0f : 0.4f;
         switch (it.id) {
             case Id::Back: {
                 glyph(0xE72B, fIcon.get(), {r.left + kS2, r.top, r.left + kS2 + kS6, r.bottom}, kText);
-                txt(L"Control Center", fTitle.get(), {r.left + kS2 + kS6 + kS2, r.top, r.right - (outsOpen ? 112 : kS2), r.bottom}, kText);
+                txt(L"Control Center", fTitle.get(), {r.left + kS2 + kS6 + kS2, r.top, r.right - (outsOpen ? kActW : kS2), r.bottom}, kText);
                 const size_t total = outsOpen ? outs.size() : expand == Expand::Wifi ? wifiRows.size() : btRows.size();
                 const size_t offset = outsOpen ? outOffset : listOffset, visible = outsOpen ? outVisible : listVisible;
                 if (outsOpen && visible && total > visible) {
                     const auto range = std::to_wstring(offset + 1) + L"–" + std::to_wstring(offset + visible) + L" / " + std::to_wstring(total);
-                    txt(range, fSubR.get(), {r.right - 112, r.top, r.right - kS2, r.bottom}, kDim);
+                    txt(range, fSubR.get(), {r.right - kActW, r.top, r.right - kS2, r.bottom}, kDim);
                 }
                 break;
             }
             case Id::RadioSettings:
-                box(r, kRadiusSmall, kOff);
+                box(r, kRadiusHover, kOff);
                 txt(L"Settings", fCap.get(), r, kText);
                 break;
             case Id::DeviceListTile: {
                 tile(r);
                 const wchar_t* title = outsOpen ? L"Audio output" : expand == Expand::Wifi ? L"Wi-Fi networks" : L"Bluetooth devices";
-                txt(title, fTitle.get(), {r.left + kS4, r.top + kS4, r.right - (outsOpen ? kS4 : 128), r.top + kS4 + kTitleLine}, kText);
+                txt(title, fTitle.get(), {r.left + kS4, r.top + kS4, r.right - (outsOpen ? kS4 : kActW + kS4 + kS2), r.top + kS4 + kTitleLine}, kText);
                 const size_t total = outsOpen ? outs.size() : expand == Expand::Wifi ? wifiRows.size() : btRows.size();
                 const size_t offset = outsOpen ? outOffset : listOffset, visible = outsOpen ? outVisible : listVisible;
                 if (visible && total > visible) {
                     const float top = r.top + kS4 + kTitleLine + kS2 + (outsOpen ? 0 : kListRowH);
                     const float trackH = r.bottom - kS2 - top;
-                    const float thumbH = std::max(kS6, trackH * visible / total);
+                    const float thumbH = std::max(kThumbMin, trackH * visible / total);
                     const float thumbY = top + (trackH - thumbH) * offset / (total - visible);
-                    box({r.right - kS2, thumbY, r.right - kS2 + kS1 / 2, thumbY + thumbH}, kS1 / 2, kDim);
+                    box({r.right - kS2, thumbY, r.right - kS2 + kThumbW, thumbY + thumbH}, kThumbW / 2, kDim);
                 }
                 if (!outsOpen) {
                     const bool wifi = expand == Expand::Wifi;
@@ -1613,31 +1542,12 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
                 const bool loading = status.phase == svc::DiscoveryPhase::Loading || status.phase == svc::DiscoveryPhase::Connecting;
                 const wchar_t* label = status.phase == svc::DiscoveryPhase::Connecting ? L"Connecting…" : loading ? L"Scanning…" : status.phase == svc::DiscoveryPhase::AccessDenied || status.phase == svc::DiscoveryPhase::Unavailable ? L"Settings" : status.phase == svc::DiscoveryPhase::Failed ? L"Retry" : L"Refresh";
-                box(r, kRadiusSmall, kOff);
+                box(r, kRadiusHover, kOff);
                 txt(label, fCap.get(), r, theme::A(kText, loading ? 0.4f : 1.0f));
                 break;
             }
-            case Id::WifiPill: case Id::BtPill: case Id::RowTile: case Id::DisplayTile: case Id::ListTile: case Id::MediaTile: case Id::PowerTile:
+            case Id::WifiPill: case Id::BtPill: case Id::MediaTile: case Id::PowerTile:
                 tile(r);
-                if (it.id == Id::DisplayTile && bright >= 0)
-                    txt(L"Display", fTitle.get(), {r.left + kS4, r.top + it.arg, r.right - kS4, r.top + it.arg + kTitleLine}, kText);
-                if (it.id == Id::ListTile) {
-                    const bool wifi = expand == Expand::Wifi;
-                    txt(wifi ? L"Wi-Fi networks" : L"Bluetooth devices", fTitle.get(),
-                        {r.left + kS4, r.top + kS4, r.right - kS4, r.top + kS4 + kTitleLine}, kText);
-                    if (wifi ? wifiRows.empty() : btDone && btRows.empty()) {  // the one row Layout() always reserves
-                        const float t = r.top + kS4 + kTitleLine + kS1;
-                        txt(wifi ? L"No saved networks" : L"No paired devices", fSub.get(), {r.left + kS4, t, r.right - kS4, t + kListRowH}, kDim);
-                    }
-                }
-                break;
-            case Id::SoundTile:
-                {
-                    std::wstring label = L"Sound";
-                    if (outsOpen && outs.size() > outVisible)
-                        label += L" " + std::to_wstring(outOffset + (outVisible ? 1 : 0)) + L"/" + std::to_wstring(outs.size());
-                    txt(label, fTitle.get(), {r.left + kS4, r.top, r.left + 112, r.bottom}, theme::A(kText, speaker.Available() ? 1.0f : 0.5f));
-                }
                 break;
             case Id::Clock: {
                 wchar_t tb[32] = L"", db[64] = L"";
@@ -1646,15 +1556,14 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 lastMin = now.wMinute;
                 GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS | TIME_NOTIMEMARKER, &now, nullptr, tb, 32);
                 GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &now, L"dddd, d MMMM", db, 64, nullptr);
-                txt(tb, fTime.get(), {r.left + kS1, r.top, r.right, r.top + 36}, kText);
-                txt(db, fSub.get(), {r.left + kS1, r.top + 36, r.right, r.bottom - kS1}, kDim);
+                txt(tb, fTime.get(), {r.left + kS2, r.top, r.right, r.bottom}, kText);
+                txt(db, fSubR.get(), {r.left, r.top, r.right - kS2, r.bottom}, kDim);
                 break;
             }
             case Id::Battery: {
-                box(r, kRadiusSmall, theme::P().fill);
                 wchar_t g = 0xE83E;  // plug
                 if (battery.hasBattery) g = static_cast<wchar_t>((battery.ac ? 0xEBAB : 0xEBA0) + std::min(10, battery.percent / 10));
-                glyph(g, fIcon.get(), {r.left + kS3, r.top, r.left + kS3 + 20, r.bottom}, kText);
+                glyph(g, fIcon.get(), {r.left + kS2, r.top, r.left + kS2 + kTitleLine, r.bottom}, theme::A(kText, on1));
                 std::wstring cap = battery.ac ? L"Plugged in" : L"Battery";
                 switch (mode) {
                     case svc::PowerMode::Efficiency: cap = L"Efficiency"; break;
@@ -1662,7 +1571,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     case svc::PowerMode::Performance: case svc::PowerMode::Max: cap = L"Performance"; break;
                     default: break;
                 }
-                const float x = r.left + kS3 + 20 + kS2;
+                const float x = r.left + kS2 + kTitleLine + kS2;
                 if (battery.hasBattery) twoLines(std::to_wstring(battery.percent) + L"%", cap, {x, r.top, r.right - kS2, r.bottom}, 1.0f);
                 else txt(cap, fTitle.get(), {x, r.top, r.right - kS2, r.bottom}, kText);
                 break;
@@ -1677,63 +1586,59 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     sub = !avail ? missing : on ? L"On" : L"Off";
                     if (on) for (auto const& d : btRows) if (d.connected) { sub = d.name; break; }
                 }
-                twoLines(wifi ? L"Wi-Fi" : L"Bluetooth", sub, {r.left, r.top, r.right - 20, r.bottom}, avail ? 1.0f : 0.5f);
+                twoLines(wifi ? L"Wi-Fi" : L"Bluetooth", sub, {r.left, r.top, r.right - kTitleLine, r.bottom}, avail ? 1.0f : 0.5f);
                 bool open = expand == (wifi ? Expand::Wifi : Expand::Bluetooth);
-                glyph(open ? 0xE70E : 0xE76C, fIconS.get(), {r.right - 20, cy - 10, r.right, cy + 10}, kDim);
+                glyph(open ? 0xE70E : 0xE76C, fIconS.get(), {r.right - kTitleLine, cy - kTitleLine / 2, r.right, cy + kTitleLine / 2}, kDim);
                 break;
             }
-            case Id::Label: {
-                const bool air = it.arg == 0;
-                const bool avail = air ? (radios.HasWifi() || radios.HasBluetooth()) : hotspotAvail;
-                const bool on = air ? (avail && !wifiOn && !btOn) : hotspotOn;
-                twoLines(air ? L"Airplane mode" : L"Hotspot", !avail ? L"Unavailable" : on ? L"On" : L"Off", r, avail ? 1.0f : 0.5f);
-                break;
-            }
-            case Id::Wifi: round(cx, cy, kRound / 2, wifiOn, radios.HasWifi(), 0xE701, fIcon.get(), false); break;
-            case Id::Bluetooth: round(cx, cy, kRound / 2, btOn, radios.HasBluetooth(), 0xE702, fIcon.get(), false); break;
+            case Id::Wifi: round(r, wifiOn, radios.HasWifi(), 0xE701, false); break;
+            case Id::Bluetooth: round(r, btOn, radios.HasBluetooth(), 0xE702, false); break;
             case Id::Airplane: {
                 bool avail = radios.HasWifi() || radios.HasBluetooth();
-                iconTile(r, avail && !wifiOn && !btOn, avail, 0xE709);
+                mini(r, avail && !wifiOn && !btOn, avail, 0xE709, false);
                 break;
             }
-            case Id::Hotspot: iconTile(r, hotspotOn, hotspotAvail, 0xE704); break;
-            case Id::Dnd: togglePill(r, dnd, 0xE708, false, L"Do not disturb"); break;
-            case Id::Night: togglePill(r, night, 0xF08C, false, L"Night light"); break;
-            case Id::Dark: togglePill(r, dark, 0, true, L"Dark mode"); break;
-            case Id::Snip: round(cx, cy, (r.right - r.left) / 2, false, true, 0xE8C6, fIcon.get(), false); break;
-            case Id::Cast: round(cx, cy, (r.right - r.left) / 2, false, true, 0xE7F4, fIcon.get(), false); break;
-            case Id::Settings: round(cx, cy, (r.right - r.left) / 2, false, true, 0xE713, fIcon.get(), false); break;
-            case Id::Lock: round(cx, cy, (r.right - r.left) / 2, false, true, 0xE72E, fIcon.get(), false); break;
-            case Id::Power: round(cx, cy, (r.right - r.left) / 2, powerOpen, true, 0xE7E8, fIcon.get(), false); break;
-            case Id::Mic: round(cx, cy, (r.right - r.left) / 2, micMuted, mic.Available(), micMuted ? 0xEC54 : 0xE720, fIcon.get(), false); break;
+            case Id::Hotspot: mini(r, hotspotOn, hotspotAvail, 0xE704, false); break;
+            case Id::Dnd: mini(r, dnd, true, 0xE708, false); break;
+            case Id::Night: mini(r, night, true, 0xF08C, false); break;
+            case Id::Dark: mini(r, dark, true, 0, true); break;
+            case Id::Mic: mini(r, micMuted, mic.Available(), micMuted ? 0xEC54 : 0xE720, false); break;
+            case Id::Snip: mini(r, false, true, 0xE8C6, false); break;
+            case Id::Cast: mini(r, false, true, 0xE7F4, false); break;
+            case Id::Settings: glyph(0xE713, fIcon.get(), r, kText); break;
+            case Id::Lock: glyph(0xE72E, fIcon.get(), r, kText); break;
+            case Id::Power:
+                if (powerOpen) box(r, kRadiusHover, kAccent);
+                glyph(0xE7E8, fIcon.get(), r, powerOpen ? kOnAccent : kText);
+                break;
             case Id::PowSleep: case Id::PowRestart: case Id::PowShut:
-                box(r, kRadiusSmall, theme::P().fill);
+                box(r, kRadiusSmall, kOff);
                 txt(it.id == Id::PowSleep ? L"Sleep" : it.id == Id::PowRestart ? L"Restart" : L"Shut down", fBtn.get(), r, kText);
                 break;
-            case Id::Bright: case Id::Vol: {  // the track (kSliderH) centred in its taller pointer target; the fill carries the icon at its left end
+            case Id::Bright: case Id::Vol: {  // the icon outside the track at the left; the track kSliderH tall, centred in its row
                 const float h = kSliderH, f = it.id == Id::Vol ? volume : bright / 100.0f;
+                const bool avail = it.id == Id::Bright || speaker.Available();
                 const D2D1_RECT_F tr{r.left, cy - h / 2, r.right, cy + h / 2};
-                if (it.id == Id::Vol && !speaker.Available()) { box(tr, h / 2, theme::A(kOff, 0.5f)); break; }
+                const wchar_t g = it.id == Id::Bright ? 0xE706 : (muted || volume <= 0.001f ? 0xE74F : 0xE767);
+                glyph(g, fIcon.get(), {r.left - kS3 - kTitleLine, cy - kTitleLine / 2, r.left - kS3, cy + kTitleLine / 2}, theme::A(pal.textSoft, avail ? 1.0f : 0.5f));
+                if (!avail) { box(tr, h / 2, theme::A(kOff, 0.5f)); break; }
                 box(tr, h / 2, kOff);
                 D2D1_RECT_F fr{tr.left, tr.top, tr.left + h + f * (tr.right - tr.left - h), tr.bottom};
-                box(fr, h / 2, kFill);
-                wchar_t g = it.id == Id::Bright ? 0xE706 : (muted || volume <= 0.001f ? 0xE74F : 0xE767);
-                glyph(g, fIconS.get(), {tr.left, tr.top, tr.left + h, tr.bottom}, kOnFill);
+                box(fr, h / 2, pal.sliderFill);
+                if (!theme::Dark()) {  // a white fill needs its hairline on light glass
+                    br->SetColor(theme::Wash(0.16f));
+                    dc->DrawRoundedRectangle(D2D1::RoundedRect({fr.left + kHair / 2, fr.top + kHair / 2, fr.right - kHair / 2, fr.bottom - kHair / 2}, h / 2, h / 2), br.get(), kHair);
+                }
                 break;
             }
-            case Id::OutRow: {
-                std::wstring name = L"Output";
-                for (auto const& d : outs) if (d.isDefault) name = d.name;
-                if (auto p = name.find(L" ("); p != std::wstring::npos && p > 0) name.resize(p);  // "Speakers (Realtek…)" -> "Speakers"
-                txt(name, fSubR.get(), {r.left, r.top, r.right - 20, r.bottom}, kDim);
-                glyph(outsOpen ? 0xE70E : 0xE70D, fIconS.get(), {r.right - 20, r.top, r.right, r.bottom}, kDim);
+            case Id::OutRow:  // the audio output list: the chevron at the end of the Sound row
+                glyph(0xE76C, fIconS.get(), r, theme::A(pal.textSoft, on1));
                 break;
-            }
             case Id::OutDev: case Id::WifiNet: case Id::BtDev: {
                 std::wstring name, sub;
                 bool mark = false;
                 const size_t have = it.id == Id::OutDev ? outs.size() : it.id == Id::WifiNet ? wifiRows.size() : btRows.size();
-                if (static_cast<size_t>(it.arg) >= have) break;  // a chip or list changed under a stale item: draw nothing, never index past the end
+                if (static_cast<size_t>(it.arg) >= have) break;  // a list changed under a stale item: draw nothing, never index past the end
                 if (it.id == Id::OutDev) { name = outs[it.arg].name; mark = outs[it.arg].isDefault; }
                 else if (it.id == Id::WifiNet) {
                     auto const& n = wifiRows[it.arg];
@@ -1748,18 +1653,17 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     auto const& d = btRows[it.arg];
                     name = d.name; mark = d.connected; sub = d.connected ? L"Connected" : L"Paired";
                 }
-                txt(name, fSub.get(), {r.left + kS2 + (it.id == Id::WifiNet ? kS6 : 0), r.top, r.right - (sub.empty() ? 32 : 112), r.bottom}, mark ? kText : kDim);
-                if (!sub.empty()) txt(sub, fSubR.get(), {r.right - 104, r.top, r.right - 32, r.bottom}, kDim);
-                if (mark) glyph(0xE73E, fIconS.get(), {r.right - 28, r.top, r.right - kS2, r.bottom}, kAccent);
+                const float markL = r.right - kS2 - kS6;
+                txt(name, fSub.get(), {r.left + kS2 + (it.id == Id::WifiNet ? kS6 : 0), r.top, sub.empty() ? markL : markL - kActW - kS1, r.bottom}, mark ? kText : kDim);
+                if (!sub.empty()) txt(sub, fSubR.get(), {markL - kActW, r.top, markL - kS1, r.bottom}, kDim);
+                if (mark) glyph(0xE73E, fIconS.get(), {markL, r.top, r.right - kS2, r.bottom}, kAccent);
                 break;
             }
             case Id::Prev: case Id::PlayPause: case Id::Next: {
-                auto const& ms = media.State();
+                auto const& ms = Playing();
                 if (!ms.has) break;  // nothing to control: no controls
-                bool ok = it.id == Id::Prev ? ms.canPrev : it.id == Id::Next ? ms.canNext : true;
                 wchar_t g = it.id == Id::Prev ? 0xE892 : it.id == Id::Next ? 0xE893 : (ms.playing ? 0xE769 : 0xE768);
-                if (it.id == Id::PlayPause) round(cx, cy, (r.bottom - r.top) / 2, false, true, g, fIcon.get(), false);  // the one filled control
-                else glyph(g, fIconS.get(), r, theme::A(kText, ok ? 1.0f : 0.3f));
+                glyph(g, fIcon.get(), r, theme::A(kText, on1 < 1 ? 0.3f : 1.0f));
                 break;
             }
             default: break;
@@ -1767,7 +1671,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         if (it.id == Id::MediaTile) {
             // Artwork, then title over artist (each one line, ellipsis), then prev / play / next. Nothing playing:
             // a quiet placeholder and one explanatory line, with no controls.
-            auto const& ms = media.State();
+            auto const& ms = Playing();
             const float art = std::min(kMediaArt, r.bottom - r.top - 2 * kS2);
             D2D1_RECT_F ar{r.left + kS3, cy - art / 2, r.left + kS3 + art, cy + art / 2};
             if (ms.has && ms.artSize > 0 && ms.art.size() == static_cast<size_t>(ms.artSize) * ms.artSize) {
@@ -1779,10 +1683,10 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     float k = art / ms.artSize;
                     bb->SetTransform(D2D1::Matrix3x2F::Scale(k, k) * D2D1::Matrix3x2F::Translation(ar.left, ar.top));
                     bb->SetInterpolationMode(D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                    dc->FillRoundedRectangle(D2D1::RoundedRect(ar, kS3, kS3), bb.get());
+                    dc->FillRoundedRectangle(D2D1::RoundedRect(ar, kRadiusSmall, kRadiusSmall), bb.get());
                 }
             } else {
-                box(ar, kS3, theme::A(kOff, ms.has ? 1.0f : 0.6f));
+                box(ar, kRadiusSmall, theme::A(kOff, ms.has ? 1.0f : 0.6f));
                 glyph(0xE8D6, fIcon.get(), ar, theme::A(kDim, ms.has ? 1.0f : 0.7f));  // music note
             }
             const float tl = ar.right + kS3;
@@ -1795,6 +1699,22 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
             } else {
                 twoLines(L"Nothing playing", L"Play something and it shows up here", {tl, r.top, r.right - kS3, r.bottom}, 0.72f);
             }
+        }
+    }
+    // Keyboard focus: an accent ring kFocusGap outside the control, only once the keyboard has been used.
+    if (kbFocus && !only && focus.id != Id::None) {
+        for (auto const& it : items) {
+            if (!Same(it, focus)) continue;
+            D2D1_RECT_F fr = it.r;
+            float rad = it.rad;
+            if (it.id == Id::Bright || it.id == Id::Vol) {
+                const float cy = (fr.top + fr.bottom) / 2;
+                fr = {fr.left, cy - kSliderH / 2, fr.right, cy + kSliderH / 2};
+                rad = kSliderH / 2;
+            }
+            const float o = kFocusGap + kFocusRing / 2;
+            br->SetColor(kAccent);
+            dc->DrawRoundedRectangle(D2D1::RoundedRect({fr.left - o, fr.top - o, fr.right + o, fr.bottom + o}, rad + o, rad + o), br.get(), kFocusRing);
         }
     }
     if (region) dc->PopAxisAlignedClip();
@@ -1817,7 +1737,7 @@ void ControlCenter::Impl::RepaintRegion(D2D1_RECT_F r) {
     interop->EndDraw();
 }
 
-// HALO_CC_SNAPSHOT=<file.png>: once each open has settled, the panel's drawing (chips included) over a flat stand-in
+// HALO_CC_SNAPSHOT=<file.png>: once each open has settled, the panel's drawing over a flat stand-in
 // for the glass, written as a PNG. For design checks that do not depend on the screen (a locked
 // session shows nothing to a screen capture).
 void ControlCenter::Impl::Snapshot() {
@@ -1839,7 +1759,6 @@ void ControlCenter::Impl::Snapshot() {
     const auto t = theme::Glass(cfg()).tint;
     const float k = t.a / 255.0f, back = theme::Dark() ? 0.22f : 0.75f;
     auto mix = [&](uint8_t c) { return c / 255.0f * k + back * (1 - k); };
-    auto layer = std::exchange(chipLayer, nullptr);  // so Paint draws the chips too
     dc->BeginDraw();
     dc->Clear(D2D1::ColorF(0, 0.0f));
     winrt::com_ptr<ID2D1SolidColorBrush> glass;
@@ -1859,7 +1778,6 @@ void ControlCenter::Impl::Snapshot() {
         }
     }
     dc->EndDraw();
-    chipLayer = layer;
     winrt::com_ptr<IWICStream> stream;
     winrt::com_ptr<IWICBitmapEncoder> enc;
     winrt::com_ptr<IWICBitmapFrameEncode> frame;
@@ -1902,7 +1820,7 @@ void ControlCenter::Impl::BuildFonts() {
     mk(fIcon, ui::kFontIcons, R, ui::kIcon, C, M);
     mk(fIconS, ui::kFontIcons, R, ui::kIconSmall, C, M);
     mk(fCap, ui::kFontText, R, ui::kCaption, C, M);
-    mk(fTime, ui::kFontDisplay, SB, ui::kDisplay, L, M);
+    mk(fTime, ui::kFontDisplay, SB, ui::kHeading, L, M);
     mk(fDate, ui::kFontText, R, ui::kCaption, L, N);
     mk(fBtn, ui::kFontText, SB, ui::kBody, C, M);
 }
@@ -2008,7 +1926,7 @@ void ControlCenter::Impl::BuildVisuals() {
     hv.Opacity(0);
     hvGeo = comp.CreateRoundedRectangleGeometry();
     auto hs = comp.CreateSpriteShape(hvGeo);
-    hvBrush = comp.CreateColorBrush(theme::C(theme::P().hover));
+    hvBrush = comp.CreateColorBrush(Col(theme::P().fillHover));
     hs.FillBrush(hvBrush);
     hv.Shapes().Append(hs);
     inner.Children().InsertAtTop(hv);
@@ -2018,7 +1936,7 @@ void ControlCenter::Impl::BuildVisuals() {
     fx.RelativeSizeAdjustment({1, 1});
     inner.Children().InsertAtTop(fx);
 
-    const float t = s;  // 1 px rim, inset by half its width so it stays inside the clip
+    const float t = ui::kHair * s;  // 1 px rim, inset by half its width so it stays inside the clip
     rim = comp.CreateRoundedRectangleGeometry();
     rim.Offset({t / 2, t / 2});
     rim.CornerRadius({kRadius * s - t / 2, kRadius * s - t / 2});
@@ -2041,29 +1959,7 @@ void ControlCenter::Impl::BuildVisuals() {
         edge.StrokeThickness(t);
         rimVisual.Shapes().Append(edge);
     }
-    // A specular line just inside the rim along the top: light catching the glass's thickness. Static.
-    auto spec = comp.CreateRoundedRectangleGeometry();
-    spec.Offset({t * 1.5f, t * 1.5f});
-    spec.CornerRadius({kRadius * s - t * 1.5f, kRadius * s - t * 1.5f});
-    spec.Size({wPx - 3 * t, hPx - 3 * t});
-    auto sheen = comp.CreateLinearGradientBrush();
-    sheen.MappingMode(wuc::CompositionMappingMode::Absolute);
-    sheen.StartPoint({0, 0});
-    sheen.EndPoint({0, 72 * s});  // fixed depth, so it does not stretch with the panel's height
-    sheen.ColorStops().Append(comp.CreateColorGradientStop(0.0f, winrt::Windows::UI::ColorHelper::FromArgb(theme::Dark() ? 0x38 : 0x80, 0xFF, 0xFF, 0xFF)));
-    sheen.ColorStops().Append(comp.CreateColorGradientStop(1.0f, winrt::Windows::UI::ColorHelper::FromArgb(0, 0xFF, 0xFF, 0xFF)));
-    auto specShape = comp.CreateSpriteShape(spec);
-    specShape.StrokeBrush(sheen);
-    specShape.StrokeThickness(t);
-    rimVisual.Shapes().Append(specShape);
-    specGeo = spec;
     inner.Children().InsertAtTop(rimVisual);
-
-    chipLayer = comp.CreateContainerVisual();
-    chipLayer.RelativeSizeAdjustment({1, 1});
-    pill.Children().InsertAtTop(chipLayer);
-    ptr = comp.CreatePropertySet();
-    ptr.InsertVector2(L"P", {-1000, -1000});
 
     clip = comp.CreateRoundedRectangleGeometry();
     clip.CornerRadius({kRadius * s, kRadius * s});
