@@ -220,7 +220,16 @@ private:
     // expression animations the compositor evaluates every frame (no animation is created per mouse move).
     wuc::CompositionPropertySet m_wave{nullptr};
     bool m_waveOn = false;
+    // The expressions are bound only while the pointer is near the apps (a bound expression keeps the compositor producing a
+    // frame every refresh, even when nothing moves), and unbound a moment after it leaves.
+    struct WaveItem { IconV ic; float cx, cy, h; };
+    std::vector<WaveItem> m_waveItems;
+    bool m_waveLive = false;
     void AttachWave(IconV const& ic, float cx, float cy, float h);
+    void WaveStart();
+    void WaveStop();
+    UINT SettleDelayMs() const;
+    void SettleMotion();  // cancel the finished open animations and pin their end values
     void MoveWave(float x, float panelY);
     bool m_pressedNotif = false;           // the button went down in the notification column
     float m_lw = 0;                        // the middle column's width (== m_w without halo2)

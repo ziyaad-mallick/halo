@@ -150,7 +150,7 @@ constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
 constexpr int kH2Apps = 10, kH2Files = 10, kH2AppCols = 5;  // the 2.0 middle pane: 5 x 2 apps, 2 x 5 files
 constexpr int kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
-constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2, kCaretTimer = 3, kServicesTimer = 4, kOpenTimer = 5, kRehoverTimer = 6;  // kClockTimer: halo2, re-armed to each minute boundary
+constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2, kCaretTimer = 3, kServicesTimer = 4, kOpenTimer = 5, kRehoverTimer = 6, kWaveOffTimer = 7, kSettleTimer = 8;  // kClockTimer: halo2, re-armed to each minute boundary
 constexpr int kQuickTiles = 10;  // Airplane, Hotspot, Do not disturb, Night light, Dark mode, Microphone, Battery saver, Screenshot, Cast, Project
 constexpr int kStartSpringPeriodMs = 92, kStartHideMs = 170;  // the dock's reveal spring is 55 ms and its hide 200 ms, for a surface a tenth the height
 constexpr int kListBuffer = 4, kScrollMs = 180, kScrollSpringMs = 85;  // rows drawn past each end of the list; the scroll slide
@@ -1172,6 +1172,29 @@ void Launcher::AttachWave(IconV const& ic, float cx, float cy, float h) {
     ic.v.StartAnimation(L"Offset.Y", lift);
 }
 
+void Launcher::WaveStart() {
+    KillTimer(m_hwnd, kWaveOffTimer);
+    if (m_waveLive) return;
+    m_waveLive = true;
+    for (auto const& w : m_waveItems) AttachWave(w.ic, w.cx, w.cy, w.h);
+}
+
+// Unbind everything and put each icon back at rest.
+void Launcher::WaveStop() {
+    KillTimer(m_hwnd, kWaveOffTimer);
+    if (!m_waveLive) return;
+    m_waveLive = false;
+    for (auto const& w : m_waveItems) {
+        if (!w.ic.v) continue;
+        w.ic.v.Properties().StopAnimation(L"k");
+        w.ic.v.StopAnimation(L"Scale");
+        w.ic.v.StopAnimation(L"Offset.Y");
+        w.ic.v.Scale({1, 1, 1});
+        auto o = w.ic.v.Offset();
+        w.ic.v.Offset({o.x, w.ic.restY, o.z});
+    }
+}
+
 // Pointer in content coordinates. The wave is on while the pointer is within a radius of the apps.
 void Launcher::MoveWave(float x, float panelY) {
     if (!m_wave) return;
@@ -1185,6 +1208,8 @@ void Launcher::MoveWave(float x, float panelY) {
     }
     if (closeEnough != m_waveOn) {
         m_waveOn = closeEnough;
+        if (closeEnough) WaveStart();
+        else SetTimer(m_hwnd, kWaveOffTimer, 420, nullptr);  // after the 360 ms relax
         Animate(m_wave, L"Intensity", closeEnough ? 1.0f : 0.0f, closeEnough ? 140 : 360);  // eases in fast, relaxes slowly: the dock's feel
     }
 }
@@ -1194,6 +1219,7 @@ void Launcher::BuildBody() {
     const bool results = Listing();
     m_bodyIcons.Children().RemoveAll();
     m_appSprites.clear();
+    m_waveItems.clear();
     m_fileSprites.clear();
     m_resultRows.clear();
     m_hoverIcon = nullptr;
@@ -1259,7 +1285,10 @@ void Launcher::BuildBody() {
                                    : R(c.left - kIconPad * s, c.top - kIconPad * s, c.right + kIconPad * s, c.bottom + kIconPad * s),
                               Kind::App, static_cast<int>(i)});
             m_appSprites.push_back(sprite(m_host.appIcon(m_apps[i]), c));
-            if (m_h2 && m_appSprites.back().v) AttachWave(m_appSprites.back(), (c.left + c.right) / 2, (c.top + c.bottom) / 2, c.bottom - c.top);
+            if (m_h2 && m_appSprites.back().v) {
+                m_waveItems.push_back({m_appSprites.back(), (c.left + c.right) / 2, (c.top + c.bottom) / 2, c.bottom - c.top});
+                if (m_waveLive) AttachWave(m_waveItems.back().ic, m_waveItems.back().cx, m_waveItems.back().cy, m_waveItems.back().h);
+            }
         }
         for (size_t i = 0; i < m_files.size(); i++) {
             auto const& c = m_fileCells[i];
@@ -1590,6 +1619,7 @@ void Launcher::Show(LauncherAnchor const& anchor) {
         motion::In(m_comp, m_panel, {0, home, 0}, rise, st, corner);
         if (m_shadowHold) motion::In(m_comp, m_shadowHold, PanelHome(), rise, st, corner);
     }
+    if (!(m_h2 && DockLikeMotion())) SetTimer(m_hwnd, kSettleTimer, SettleDelayMs(), nullptr);  // the other path arms it from kOpenTimer, once the spring starts
     ShowDim(st.dimDesktop);
     Place();  // shows the window: after the slide is set up, so no frame shows the panel at rest first
     SetTimer(m_hwnd, kRefreshTimer, 900, nullptr);  // once, after the spring has settled (a rebuild mid-motion is a visible hitch)
@@ -1628,7 +1658,11 @@ void Launcher::Hide() {
     if (!m_open) return;
     m_open = false;
     KillTimer(m_hwnd, kOpenTimer);
+    KillTimer(m_hwnd, kSettleTimer);
     KillTimer(m_hwnd, kRehoverTimer);
+    if (m_wave) m_wave.InsertScalar(L"Intensity", 0.0f);
+    m_waveOn = false;
+    WaveStop();
     if (m_notifCol) m_notifCol->SetActive(false);
     unsigned gen = ++m_gen;
     auto batch = m_comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
@@ -1662,9 +1696,29 @@ void Launcher::ParkBelow(wuc::Visual const& v, float3 rest) {
     const bool rises = settings::Get().start.effect == settings::Effect::Bounce || settings::Get().start.effect == settings::Effect::Rise;
     v.Offset({rest.x, rest.y + (rises ? OpenTravel() : 0.0f), rest.z});
     v.StopAnimation(L"Scale");
-    v.CenterPoint({PanelW() / 2, m_h, 0});  // grows from the bottom centre, where the dock is
-    const float s0 = settings::Get().start.effect == settings::Effect::Bounce ? 0.94f : 1.0f;
-    v.Scale({s0, s0, 1});
+    v.Scale({1, 1, 1});  // never scaled: a scale animation on three blurred panes drops the open to ~30 fps
+}
+
+// How long after the motion starts it is certainly over: 1 s, longer when the speed setting slows it down.
+UINT Launcher::SettleDelayMs() const {
+    return static_cast<UINT>(std::clamp(1000.0f / settings::Speed(settings::Get().start), 1000.0f, 2500.0f));
+}
+
+// A finished animation still counts as an animated property to the compositor, which then re-composes the whole panel
+// (three blurred panes) every other refresh for as long as it is open. Cancel them and pin the end values.
+void Launcher::SettleMotion() {
+    auto pin = [&](wuc::Visual const& v, float3 rest) {
+        if (!v) return;
+        v.StopAnimation(L"Offset");
+        v.StopAnimation(L"Offset.Y");
+        v.StopAnimation(L"Opacity");
+        v.StopAnimation(L"Scale");
+        v.Opacity(1.0f);
+        v.Scale({1, 1, 1});
+        v.Offset(rest);
+    };
+    pin(m_panel, {0, kTop * m_s, 0});
+    pin(m_shadowHold, PanelHome());
 }
 
 // How far Bounce / Rise start below their resting place: a short rise, not the panel's whole height (a spring's
@@ -1690,13 +1744,12 @@ void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
         auto ms = [&](float x) { return std::chrono::milliseconds(std::max(1, static_cast<int>(std::lround(x / speed)))); };
         auto outCurve = m_comp.CreateCubicBezierEasingFunction({0.0f, 0.0f}, {0.2f, 1.0f});
         const bool bounce = st.effect == settings::Effect::Bounce;
-        v.CenterPoint({PanelW() / 2, m_h, 0});
         if (in) {
             v.StopAnimation(L"Offset");
             v.StopAnimation(L"Offset.Y");
             v.StopAnimation(L"Opacity");
             v.StopAnimation(L"Scale");
-            v.Scale({bounce ? 0.94f : 1.0f, bounce ? 0.94f : 1.0f, 1});
+            v.Scale({1, 1, 1});
             v.Opacity(0.0f);
             v.Offset({rest.x, rest.y + (rises ? travel : 0.0f), rest.z});
             auto fade = m_comp.CreateScalarKeyFrameAnimation();
@@ -1712,13 +1765,6 @@ void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
                 spring.DampingRatio(zeta);
                 spring.Period(ms(kStartSpringPeriodMs));
                 v.StartAnimation(L"Offset.Y", spring);
-                if (bounce) {  // and it swells into size on the same spring
-                    auto grow = m_comp.CreateSpringVector3Animation();
-                    grow.FinalValue(Ref3({1.0f, 1.0f, 1.0f}));
-                    grow.DampingRatio(zeta);
-                    grow.Period(ms(kStartSpringPeriodMs));
-                    v.StartAnimation(L"Scale", grow);
-                }
             }
         } else {
             auto down = m_comp.CreateCubicBezierEasingFunction({0.5f, 0.0f}, {0.9f, 0.5f});
@@ -1731,12 +1777,6 @@ void Launcher::OpenMotion(wuc::Visual const& v, float3 rest, bool in) {
                 slide.InsertKeyFrame(1.0f, rest.y + travel * 0.5f, down);
                 slide.Duration(ms(kStartHideMs));
                 v.StartAnimation(L"Offset.Y", slide);
-                if (bounce) {
-                    auto shrink = m_comp.CreateVector3KeyFrameAnimation();
-                    shrink.InsertKeyFrame(1.0f, {0.96f, 0.96f, 1.0f}, down);
-                    shrink.Duration(ms(kStartHideMs));
-                    v.StartAnimation(L"Scale", shrink);
-                }
             }
         }
         return;
@@ -1805,6 +1845,8 @@ void Launcher::ReleaseVisuals() {
     m_notifRoot = nullptr;
     m_root.Children().RemoveAll();
     m_appSprites.clear();
+    m_waveItems.clear();
+    m_waveLive = false;
     m_fileSprites.clear();
     m_hoverIcon = nullptr;
     m_fileBrushes.clear();
@@ -1824,6 +1866,8 @@ void Launcher::Close() {
     ShowWindow(m_hwnd, SW_HIDE);
     if (m_caret) m_caret.StopAnimation(L"Opacity");  // nothing animates while hidden
     KillTimer(m_hwnd, kCaretTimer);
+    KillTimer(m_hwnd, kWaveOffTimer);
+    KillTimer(m_hwnd, kSettleTimer);
     ReleaseVisuals();
     m_tracking = false;
     if (m_host.closed) m_host.closed();
@@ -2495,7 +2539,19 @@ LRESULT CALLBACK Launcher::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         static_cast<Launcher*>(cs->lpCreateParams)->m_hwnd = h;
     }
     auto* self = reinterpret_cast<Launcher*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    return self ? self->OnMessage(m, w, l) : DefWindowProcW(h, m, w, l);
+    if (!self) return DefWindowProcW(h, m, w, l);
+    // A throw out of a handler (a failed surface, a rejected expression, a lost device) would unwind through user32 and
+    // take the whole shell with it (Halo::WndProc has the same guard). Log it; the next event retries.
+    try {
+        return self->OnMessage(m, w, l);
+    } catch (winrt::hresult_error const& e) {
+        Log(L"message " + std::to_wstring(m) + L" threw " + std::to_wstring(static_cast<unsigned>(e.code().value)) + L" " + e.message().c_str());
+    } catch (std::exception const&) {
+        Log(L"message " + std::to_wstring(m) + L" threw std::exception");
+    } catch (...) {
+        Log(L"message " + std::to_wstring(m) + L" threw");
+    }
+    return DefWindowProcW(h, m, w, l);
 }
 
 LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
@@ -2563,6 +2619,14 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 KillTimer(m_hwnd, kRefreshTimer);
                 if (m_open) Refresh();
             }
+            else if (w == kSettleTimer) {
+                KillTimer(m_hwnd, kSettleTimer);
+                if (m_open) SettleMotion();
+            }
+            else if (w == kWaveOffTimer) {
+                KillTimer(m_hwnd, kWaveOffTimer);
+                if (!m_waveOn) WaveStop();
+            }
             else if (w == kRehoverTimer) {
                 KillTimer(m_hwnd, kRehoverTimer);
                 if (m_open) RehoverAtCursor();
@@ -2572,6 +2636,7 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 if (m_open) {
                     OpenMotion(m_panel, {0, kTop * m_s, 0}, true);
                     if (m_shadowHold) OpenMotion(m_shadowHold, PanelHome(), true);
+                    SetTimer(m_hwnd, kSettleTimer, SettleDelayMs(), nullptr);
                 }
             }
             else if (w == kCaretTimer) {
