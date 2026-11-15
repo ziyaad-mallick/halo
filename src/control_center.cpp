@@ -62,7 +62,7 @@ constexpr float kHomeH = 2 * ui::kPanelInset + 5 * ui::kGroupGap + ui::kButton +
 
 constexpr UINT kMsgAudio = WM_APP + 1, kMsgMic = WM_APP + 2, kMsgRadios = WM_APP + 3, kMsgBright = WM_APP + 4,
                kMsgMedia = WM_APP + 5, kMsgWifi = WM_APP + 6, kMsgBt = WM_APP + 7, kMsgLate = WM_APP + 8,
-               kMsgTestClick = WM_APP + 30;
+               kMsgToggles = WM_APP + 9, kMsgTestClick = WM_APP + 30;
 constexpr UINT_PTR kTimerClose = 1, kTimerChord = 2, kTimerClock = 3, kTimerLeave = 4, kTimerSettle = 5;
 // While the opening spring runs nothing redraws: updates that arrive (the deferred reads, radios, media,
 // brightness) are held and drawn once, kSettleMs after the show. A redraw mid-motion cost a frame.
@@ -141,8 +141,10 @@ wuc::SpriteVisual MakeShadow(wuc::Compositor const& comp, wuc::CompositionGraphi
 
 // Results of the slow reads (hotspot, SSID) done off the UI thread.
 struct Late {
+    bool hasHotspot = false, hasSsid = false, hasOuts = false;  // which of the parts below this result carries
     bool hotspotAvail = false, hotspotOn = false;
     std::wstring ssid;
+    std::vector<svc::Device> outs;
 };
 
 }  // namespace
@@ -193,6 +195,8 @@ struct ControlCenter::Impl {
     std::vector<svc::WifiNet> wifiRows;
     std::vector<svc::BtDevice> btRows;
     bool outsOpen = false;
+    bool outsLoaded = false;   // the audio outputs have been listed (off the UI thread, with the open's other late reads)
+    bool pageLoading = false;  // a details page has just opened and its scan is about to start: it shows "looking" at once
     size_t outOffset = 0, outVisible = 0;
     size_t listOffset = 0, listVisible = 0;
     Expand expand = Expand::None;
@@ -246,6 +250,9 @@ struct ControlCenter::Impl {
     void SyncMic();
     void SyncRadios();
     void StartLate();
+    void StartSsid();
+    void SetHotspotAsync(bool on);
+    void SetDarkAsync(bool on);
     void Layout();
     void ApplySize();
     void Render();
@@ -395,18 +402,19 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_LBUTTONDOWN:
             if (st != St::Open) return 0;
-            Settle();  // a click shows its result at once
             if (x < 0 || y < 0 || x >= kW || y >= height) { Close(); return 0; }  // the transparent margin is "outside"
+            // The pressed look comes first: it is one compositor change. The settle that follows (the deferred reads,
+            // a redraw) must not be waited on by the finger.
+            if (auto* it = HitAt(x, y); it && it->id != Id::Bright && it->id != Id::Vol && Enabled(*it)) {
+                pressed = *it;
+                PressFeedback(it);
+            }
+            Settle();  // a click shows its result at once
             if (kbFocus) { kbFocus = false; Render(); }  // the pointer takes over from the keyboard: the ring goes
-            if (auto* it = HitAt(x, y)) {
-                if (it->id == Id::Bright || it->id == Id::Vol) {
-                    drag = it->id;
-                    SetCapture(hwnd);
-                    DragTo(x);
-                } else if (Enabled(*it)) {
-                    pressed = *it;
-                    PressFeedback(it);  // the highlight answers at once, before anything else
-                }
+            if (auto* it = HitAt(x, y); it && (it->id == Id::Bright || it->id == Id::Vol)) {
+                drag = it->id;
+                SetCapture(hwnd);
+                DragTo(x);
             }
             return 0;
         case WM_MOUSEMOVE: {
@@ -473,19 +481,23 @@ LRESULT ControlCenter::Impl::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case kMsgWifi:
             pressed = {};
             wifiRows = svc::WifiNets();
-            ssid = wifiOn ? svc::ConnectedSsid() : std::wstring();
+            if (wifiOn) StartSsid(); else ssid.clear();
             Render();
             return 0;
         case kMsgLate: {
             std::unique_ptr<Late> r(reinterpret_cast<Late*>(l));
             if (st == St::Open && r) {
-                hotspotAvail = r->hotspotAvail;
-                hotspotOn = r->hotspotOn;
-                ssid = r->ssid;
+                if (r->hasHotspot) { hotspotAvail = r->hotspotAvail; hotspotOn = r->hotspotOn; }
+                if (r->hasSsid) ssid = r->ssid;
+                if (r->hasOuts) { outs = std::move(r->outs); outsLoaded = true; }
                 Render();
             }
             return 0;
         }
+        case kMsgToggles:  // the system's answer to a toggle flipped optimistically: put the truth back
+            if (!svc::DryRun()) { dark = svc::ReadDarkMode(); night = svc::ReadNightLight(); dnd = svc::ReadDnd(); }
+            Render();
+            return 0;
         case WM_TIMER:
             if (w == kTimerClose) Park();
             else if (w == kTimerLeave) CheckPointer();
@@ -878,7 +890,8 @@ void ControlCenter::Impl::SyncMic() { micMuted = mic.Available() && mic.Muted();
 void ControlCenter::Impl::SyncRadios() {
     wifiOn = radios.WifiOn();
     btOn = radios.BluetoothOn();
-    ssid = wifiOn ? svc::ConnectedSsid() : std::wstring();
+    if (wifiOn) { if (hwnd) StartSsid(); }  // the SSID is read off the UI thread; the old one stays until it arrives
+    else ssid.clear();
 }
 
 // Only fast reads here: the hotspot and SSID queries (20+ ms between them) come in through StartLate.
@@ -887,7 +900,6 @@ void ControlCenter::Impl::SyncAll() {
     mic.Bind(eCapture, hot, kMsgMic);
     SyncSpeaker();
     SyncMic();
-    outs = svc::OutputDevices();
     battery = svc::ReadBattery();
     mode = svc::ReadPowerMode();
     dnd = svc::ReadDnd();
@@ -904,7 +916,46 @@ void ControlCenter::Impl::StartLate() {
         r->hotspotAvail = svc::HotspotAvailable();
         r->hotspotOn = r->hotspotAvail && svc::ReadHotspot();
         r->ssid = svc::ConnectedSsid();
+        r->outs = svc::OutputDevices();  // a property store per endpoint: not on the UI thread
+        r->hasHotspot = r->hasSsid = r->hasOuts = true;
         if (!PostMessageW(h, kMsgLate, 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+// The connected network's name alone (its read goes through WinRT and can take tens of ms).
+void ControlCenter::Impl::StartSsid() {
+    HWND h = hwnd;
+    std::thread([h] {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        auto* r = new Late;
+        r->ssid = svc::ConnectedSsid();
+        r->hasSsid = true;
+        if (!PostMessageW(h, kMsgLate, 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+// A hotspot or dark-mode switch goes to the system off the UI thread (the first starts a WinRT operation, the second
+// broadcasts a setting change to every window); the toggle already shows its new state, and the answer puts the truth back.
+void ControlCenter::Impl::SetHotspotAsync(bool on) {
+    HWND h = hwnd;
+    std::thread([h, on] {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        svc::SetHotspot(on);
+        if (svc::DryRun()) return;
+        Sleep(1500);  // there is no event for it: ask again once it has had time to start or stop
+        auto* r = new Late;
+        r->hotspotAvail = svc::HotspotAvailable();
+        r->hotspotOn = r->hotspotAvail && svc::ReadHotspot();
+        r->hasHotspot = true;
+        if (!PostMessageW(h, kMsgLate, 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+void ControlCenter::Impl::SetDarkAsync(bool on) {
+    HWND h = hwnd;
+    std::thread([h, on] {
+        svc::SetDarkMode(on);
+        if (!svc::DryRun()) PostMessageW(h, kMsgToggles, 0, 0);
     }).detach();
 }
 
@@ -999,22 +1050,36 @@ void ControlCenter::Impl::Click(Item const& it) {
         case Id::Hotspot:
             if (!hotspotAvail) return;
             hotspotOn = !hotspotOn;
-            svc::SetHotspot(hotspotOn);
             Pulse(it);
+            Render();  // the new state first
+            SetHotspotAsync(hotspotOn);
             break;
         case Id::WifiText:
             if (!radios.HasWifi()) return;  // no adapter (an Ethernet-only desktop): nothing to list
             outsOpen = powerOpen = false;
             listOffset = 0;
             expand = expand == Expand::Wifi ? Expand::None : Expand::Wifi;
-            if (expand == Expand::Wifi) { wifiRows.clear(); svc::WifiRefresh(hwnd, kMsgWifi); }
+            if (expand == Expand::Wifi) {
+                wifiRows.clear();
+                pageLoading = true;
+                Render();  // the page is up with its loading row before the scan is started
+                svc::WifiRefresh(hwnd, kMsgWifi);
+                pageLoading = false;
+            }
             break;
         case Id::BtText:
             if (!radios.HasBluetooth()) return;
             outsOpen = powerOpen = false;
             listOffset = 0;
             expand = expand == Expand::Bluetooth ? Expand::None : Expand::Bluetooth;
-            if (expand == Expand::Bluetooth) { btRows.clear(); btDone = false; svc::BtRefresh(hwnd, kMsgBt); }
+            if (expand == Expand::Bluetooth) {
+                btRows.clear();
+                btDone = false;
+                pageLoading = true;
+                Render();  // the page is up with its loading row before the watcher is created
+                svc::BtRefresh(hwnd, kMsgBt);
+                pageLoading = false;
+            }
             break;
         case Id::WifiNet:
             if (static_cast<size_t>(it.arg) >= wifiRows.size()) return;
@@ -1028,9 +1093,9 @@ void ControlCenter::Impl::Click(Item const& it) {
             break;
         case Id::Dark:
             dark = !dark;
-            svc::SetDarkMode(dark);
-            if (!svc::DryRun()) dark = svc::ReadDarkMode();
             Pulse(it);
+            Render();  // the new state first
+            SetDarkAsync(dark);
             break;
         case Id::Night:
             night = !night;
@@ -1070,6 +1135,7 @@ void ControlCenter::Impl::Click(Item const& it) {
             outOffset = 0;
             break;
         case Id::Back:
+            pageLoading = false;
             expand = Expand::None;
             outsOpen = false;
             listOffset = outOffset = 0;
@@ -1080,8 +1146,19 @@ void ControlCenter::Impl::Click(Item const& it) {
             if (status.phase == svc::DiscoveryPhase::Loading || status.phase == svc::DiscoveryPhase::Connecting) return;
             if (status.phase == svc::DiscoveryPhase::AccessDenied || status.phase == svc::DiscoveryPhase::Unavailable)
                 LaunchAfterClose(wifi ? (status.phase == svc::DiscoveryPhase::AccessDenied ? L"ms-settings:privacy-location" : L"ms-settings:network-wifi") : L"ms-settings:bluetooth");
-            else if (wifi) { wifiRows.clear(); svc::WifiRefresh(hwnd, kMsgWifi); }
-            else { btRows.clear(); svc::BtRefresh(hot, kMsgBt); }
+            else if (wifi) {
+                wifiRows.clear();
+                pageLoading = true;
+                Render();
+                svc::WifiRefresh(hwnd, kMsgWifi);
+                pageLoading = false;
+            } else {
+                btRows.clear();
+                pageLoading = true;
+                Render();
+                svc::BtRefresh(hot, kMsgBt);
+                pageLoading = false;
+            }
             break;
         }
         case Id::OutDev: {
@@ -1517,7 +1594,8 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                 }
                 if (!outsOpen) {
                     const bool wifi = expand == Expand::Wifi;
-                    const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
+                    auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
+                    if (pageLoading) status.phase = svc::DiscoveryPhase::Loading;
                     const wchar_t* message = wifi ? L"New networks open Windows Settings" : L"Select a device to open Bluetooth settings";
                     switch (status.phase) {
                         case svc::DiscoveryPhase::Idle: message = L"Refresh to find devices"; break;
@@ -1533,13 +1611,14 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
                     }
                     txt(message, fSub.get(), {r.left + kS4, r.top + kS4 + kTitleLine + kS2, r.right - kS4, r.top + kS4 + kTitleLine + kS2 + kListRowH}, kDim);
                 } else if (!total) {
-                    txt(L"No audio outputs available", fSub.get(), {r.left + kS4, r.top + kS4 + kTitleLine + kS2, r.right - kS4, r.top + kS4 + kTitleLine + kS2 + kListRowH}, kDim);
+                    txt(outsLoaded ? L"No audio outputs available" : L"Looking for audio outputs…", fSub.get(), {r.left + kS4, r.top + kS4 + kTitleLine + kS2, r.right - kS4, r.top + kS4 + kTitleLine + kS2 + kListRowH}, kDim);
                 }
                 break;
             }
             case Id::DiscoveryAction: {
                 const bool wifi = expand == Expand::Wifi;
-                const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
+                auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
+                if (pageLoading) status.phase = svc::DiscoveryPhase::Loading;
                 const bool loading = status.phase == svc::DiscoveryPhase::Loading || status.phase == svc::DiscoveryPhase::Connecting;
                 const wchar_t* label = status.phase == svc::DiscoveryPhase::Connecting ? L"Connecting…" : loading ? L"Scanning…" : status.phase == svc::DiscoveryPhase::AccessDenied || status.phase == svc::DiscoveryPhase::Unavailable ? L"Settings" : status.phase == svc::DiscoveryPhase::Failed ? L"Retry" : L"Refresh";
                 box(r, kRadiusHover, kOff);
