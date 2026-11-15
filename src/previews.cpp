@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "crash.h"
+
 struct ICompositorDesktopInterop : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE CreateDesktopWindowTarget(HWND hwnd, BOOL isTopmost, void** target) = 0;
     virtual HRESULT STDMETHODCALLTYPE EnsureOnThread(DWORD threadId) = 0;
@@ -366,7 +368,21 @@ bool Previews::OnClose(int index, int x, int y) const {
 }
 
 LRESULT CALLBACK Previews::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (g_self && g_self->m_hwnd) return g_self->OnMessage(m, w, l);  // not during CreateWindowEx
+    if (g_self && g_self->m_hwnd) {  // not during CreateWindowEx
+        // Same as Halo::WndProc: a throw out of a handler must not unwind through user32 (std::terminate).
+        try {
+            return g_self->OnMessage(m, w, l);
+        } catch (winrt::hresult_error const& e) {
+            Log(L"message " + std::to_wstring(m) + L" threw hr=" + std::to_wstring(static_cast<int>(e.code())) + L" " + e.message().c_str());
+            halo::crash::Handled("Previews::WndProc");
+        } catch (std::exception const&) {
+            Log(L"message " + std::to_wstring(m) + L" threw std::exception");
+            halo::crash::Handled("Previews::WndProc");
+        } catch (...) {
+            Log(L"message " + std::to_wstring(m) + L" threw an unknown exception");
+            halo::crash::Handled("Previews::WndProc");
+        }
+    }
     return DefWindowProcW(h, m, w, l);
 }
 

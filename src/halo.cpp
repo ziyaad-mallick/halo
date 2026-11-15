@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -172,7 +173,9 @@ auto Guarded(char const* what, F f) {
             Log(std::wstring(L"callback ") + std::wstring(what, what + strlen(what)) + L" threw");
             halo::crash::Handled(what);
         }
-        return R();
+        if constexpr (std::is_void_v<R>) return;
+        else if constexpr (std::is_constructible_v<R, std::nullptr_t>) return R(nullptr);  // a null winrt object
+        else return R();
     };
 }
 

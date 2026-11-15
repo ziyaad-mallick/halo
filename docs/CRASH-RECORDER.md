@@ -35,7 +35,7 @@ its own. Keep a try/catch around every coroutine body.
 
 `at=` / `bt=` are `module+0xRVA`. For halo.exe: `llvm-nm -n --demangle halo.exe` (the release exe keeps its COFF symbol
 table; the VA is `0x140000000 + RVA`), the linker map `build/halo.map` (always written next to the exe), or build with
-`HALO_DEBUG=1 bash tools/build.sh halo` and run `llvm-addr2line -e build/halo.debug -f -C -a 0x<VA>` for file:line. The
+`HALO_DEBUG=1 bash tools/build.sh halo` (the exe it leaves is stripped of DWARF but keeps its symbol table, and is smaller than a plain build) and run `llvm-addr2line -e build/halo.debug -f -C -a 0x<VA>` for file:line. The
 dump opens in WinDbg / Visual Studio against the matching exe; keep the exe that crashed (match the PE timestamp).
 
 ## Pending patches in files this change does not own

@@ -15,6 +15,7 @@
 #include "tokens.h"
 #include "lamp_geometry.h"
 #include "swoop_compositor.h"
+#include "crash.h"
 
 namespace halo {
 namespace {
@@ -70,17 +71,37 @@ LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_ERASEBKGND: return 1;
         case WM_TIMER:
-            if (w == kFrameTimer && g_self) g_self->OnFrame();
-            return 0;
         case kFrameMessage:
-            if (g_self) g_self->OnFrame();
+            if (m == kFrameMessage || (w == kFrameTimer)) {
+                // OnFrame drives the compositor at frame rate; a throw out of a window procedure goes through user32
+                // into std::terminate (0xC0000409). Skip the frame, record it, and let the next one retry.
+                try {
+                    if (g_self) g_self->OnFrame();
+                } catch (std::exception const&) {
+                    Log(L"OnFrame threw std::exception");
+                    halo::crash::Handled("Swoop::OverlayProc");
+                } catch (...) {  // includes winrt::hresult_error
+                    Log(L"OnFrame threw");
+                    halo::crash::Handled("Swoop::OverlayProc");
+                }
+            }
             return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
 
 void CALLBACK HookProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
-    if (g_self && hwnd && idObject == OBJID_WINDOW && idChild == CHILDID_SELF) g_self->OnMinimize(hwnd);
+    if (g_self && hwnd && idObject == OBJID_WINDOW && idChild == CHILDID_SELF) {
+        try {
+            g_self->OnMinimize(hwnd);
+        } catch (std::exception const&) {
+            Log(L"OnMinimize threw std::exception");
+            halo::crash::Handled("Swoop::HookProc");
+        } catch (...) {
+            Log(L"OnMinimize threw");
+            halo::crash::Handled("Swoop::HookProc");
+        }
+    }
 }
 
 }  // namespace

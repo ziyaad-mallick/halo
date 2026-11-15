@@ -89,6 +89,21 @@ void Check(bool ok, char const* what) {
     if (!ok) ++failures;
 }
 
+// Removes the scratch folder (flat: crash.log, crash.log.old, dumps\*.dmp) so repeated runs leave nothing behind.
+void RemoveScratch(std::wstring const& dir) {
+    for (std::wstring sub : {dir + L"\\dumps", dir}) {
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileW((sub + L"\\*").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileW((sub + L"\\" + fd.cFileName).c_str());
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+        }
+        RemoveDirectoryW(sub.c_str());
+    }
+}
+
 void RunCase(std::wstring const& self, wchar_t const* kind, DWORD wantExit, char const* wantKind, char const* wantCode,
              char const* wantCrumb, char const* wantExtra, bool plantStale) {
     wchar_t tmp[MAX_PATH];
@@ -131,6 +146,7 @@ void RunCase(std::wstring const& self, wchar_t const* kind, DWORD wantExit, char
     }
     Check(magic, "the new dump is a non-trivial MDMP file");
     if (plantStale) Check(dumps.size() == 3, "only the newest 3 dumps are kept");
+    RemoveScratch(dir);
 }
 
 }  // namespace
