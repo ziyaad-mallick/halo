@@ -160,9 +160,13 @@ inline MonthGrid MakeMonthGrid(int y, int m, int today, int firstDow) {
 namespace tk {
 constexpr float kHero = ui::kDisplay, kTitle = ui::kHeading, kText = ui::kBody, kCap = ui::kCaption;
 constexpr float kInCard = ui::kS2, kPad = ui::kS3, kInGroup = ui::kS4, kGroup = ui::kS6, kMargin = ui::kS6;
-constexpr float kRCard = ui::kRadiusLarge, kRRow = ui::kRadiusSmall, kRPanel = ui::kPanelRadius;
-constexpr float kTile = 56, kBadge = 32, kTrack = 28, kCardH = 88, kAppCellH = 92, kAppIcon = 48, kFileRowH = 34, kFileIcon = 20,
-                kFileRows = 5, kSeg = 24, kMedia = 72, kMediaArt = 48, kMediaBtn = 32, kUsageRow = 22, kChevBtn = 28;
+constexpr float kRCard = ui::kRadiusLarge, kRRow = ui::kRadiusHover, kRPanel = ui::kPanelRadius;
+constexpr float kTile = 56, kBadge = 32, kTrack = 28, kCardH = ui::kWidgetH, kAppCellH = 88, kAppIcon = ui::kAppIcon, kFileRowH = ui::kRowH,
+                kFileIcon = ui::kFileIcon, kFileRows = 3, kSeg = 24, kMedia = ui::kMediaH, kMediaArt = ui::kMediaArt, kMediaBtn = ui::kButton,
+                kUsageRow = 24, kChevBtn = ui::kSliderHitH;
+constexpr float kAppPadTop = ui::kS3, kAppNameGap = ui::kS2;  // inside an app cell: above the icon, between icon and name
+constexpr float kWidgetPad = ui::kS3, kMini = ui::kRoundAction;  // inside a widget card; a small round-ended toggle
+constexpr int kMiniCols = 5;                                      // the small toggles: 10 of them, 5 across, 2 rows
 constexpr float kMenuShadowBlur = 24, kMenuShadowDy = 8;  // the one raised surface besides the panel: the Power menu
 constexpr int kFastMs = ui::kFastMs, kSlowMs = ui::kSlowMs;
 }  // namespace tk
@@ -170,12 +174,14 @@ constexpr int kFastMs = ui::kFastMs, kSlowMs = ui::kSlowMs;
 // ---- Layout -------------------------------------------------------------------------------------------
 inline constexpr float kScreenMargin = 24, kPanelTop = 8;
 inline constexpr float kLeftMax = 664, kLeftMin = 480, kRightW = 330, kRightMinW = 290;
-inline constexpr float kSearchTop = 252, kSearchH = 44, kGap = 26, kLabelH = 16;
+inline constexpr float kSearchTop = 252, kSearchH = ui::kSearchH, kGap = 26, kLabelH = 16;
 inline constexpr float kAppRowH = tk::kAppCellH, kFileCellH = tk::kFileRowH, kBottomH = 56;
 inline constexpr float kGreetQuoteH = 84, kGreetH = 36;
+inline constexpr float kGreetBlockH = kGreetH + ui::kS1 + kLabelH;  // the 28 px greeting and the 12 px date under it
 inline constexpr float kGreetingClockW = 96;
 inline constexpr float kWidgetsH = tk::kCardH;
-inline constexpr float kRightPad = 14, kRightMinH = 336;
+inline constexpr float kRightPad = ui::kS4, kRightMinH = 336;
+inline constexpr float kRightFootH = ui::kS3 + ui::kButton + ui::kS4;  // the control column's footer: a rule, 12, the 36 px buttons, 16
 
 struct Widths {
     float left, right, total;
@@ -232,7 +238,7 @@ inline LeftPlan PlanLeft(float avail, bool wantApps, bool wantFiles) {
 // The panel is `notif + mid + right` wide. Narrow screens shrink the control centre first, then the notification
 // column, never the middle (search and apps are what Start is for). On a screen too small for all three the
 // notification column is dropped (notif = 0).
-inline constexpr float kNotifW = 256, kNotifMinW = 230, kMidW = 440, kMidMinW = 380, kPanelGap = 12;  // 1050 wide in all: the notification pane stays, the middle and control panes are fat
+inline constexpr float kNotifW = 320, kNotifMinW = 256, kMidW = 480, kMidMinW = 400, kPanelGap = ui::kS3;  // 1154 wide in all (three cards, two 12 px gaps)
 struct Widths3 {
     float notif, mid, right, total;
 };
@@ -248,31 +254,28 @@ inline Widths3 PlanWidths3(float monitorW) {
     return {notif, mid, right, notif + mid + right};
 }
 
-// The middle column's plan, top to bottom: the greeting and a quote, a slim strip (battery and power mode), search,
-// two rows of apps, files. Same fields as the two-column plan, so the Launcher keeps one shape of plan.
-inline constexpr float kHeroTop = 24;
+// The middle column's plan, top to bottom: the greeting and its date, three widget cards, search, two rows of apps,
+// files. Same fields as the two-column plan, so the Launcher keeps one shape of plan. The 2.0 middle card has no footer
+// (Lock, Settings and Power are the control column's), so `dividerY` is the card's bottom edge.
+inline constexpr float kHeroTop = ui::kS6;
 inline LeftPlan PlanCenter(float avail, bool wantApps, bool wantFiles) {
     LeftPlan p;
     p.files = wantFiles;
     p.greetY = kHeroTop;
-    p.greetH = kGreetQuoteH;
-    if (avail < 560) {  // short, high-DPI screens: a tighter hero (the quote drops to a compact line)
-        p.greetY = 20;
-        p.greetH = kGreetQuoteH - tk::kGroup + 8;
-    }
-    p.widgetsY = p.greetY + p.greetH;  // no strip any more (the battery bar is in the control pane)
-    p.widgetsH = 0;
-    p.searchY = p.greetY + p.greetH + 14;
-    float y = p.searchY + kSearchH + kGap;
+    p.greetH = kGreetBlockH;
+    p.widgetsY = p.greetY + p.greetH + ui::kS4;
+    p.widgetsH = ui::kWidgetH;
+    p.searchY = p.widgetsY + p.widgetsH + ui::kS4;
+    float y = p.searchY + kSearchH + tk::kGroup;
     p.appsLabelY = y;
     p.appsTop = y + kLabelH + tk::kInCard;
-    if (wantApps) y = p.appsTop + 2 * kAppRowH + kGap;  // 5 x 2 apps
+    if (wantApps) y = p.appsTop + 2 * kAppRowH + ui::kS4;  // 6 x 2 apps
     p.filesLabelY = y;
     p.filesTop = y + kLabelH + tk::kInCard;
-    if (wantFiles) y = p.filesTop + tk::kFileRows * tk::kFileRowH + tk::kInGroup;
+    if (wantFiles) y = p.filesTop + tk::kFileRows * tk::kFileRowH + tk::kGroup;
     p.contentBottom = y;
-    p.height = std::min(avail, y + 4 + kBottomH);
-    p.dividerY = p.height - kBottomH - 4;
+    p.height = std::min(avail, y);
+    p.dividerY = p.height;
     return p;
 }
 
@@ -286,23 +289,25 @@ struct RightPlan {
     float tilesY = 24, tilesH = tk::kTile;  // the first row
     float brightY = 0, volY = 0, sliderH = tk::kTrack;
     float mediaY = 0, mediaH = tk::kMedia;
-    float battY = 0, battH = 0;  // the compact plan's battery bar: battery and power mode, between the tiles and the sliders
-    float usageY = 0, usageH = kLabelH + 6 + 2 * tk::kUsageRow;
+    float battY = 0, battH = 0;  // the old compact plan's battery bar (the 2.0 column has none: battery is in its footer, power mode in the widgets)
+    float miniY = 0, miniH = 0;  // the compact plan's small round-ended toggles (rows of kMiniCols), under the Wi-Fi / Bluetooth pills
+    float usageY = 0, usageH = kLabelH + tk::kInCard + 2 * tk::kUsageRow;
     float gap = tk::kGroup, bottom = 0;
 };
-// `rows` tile rows (the 2.0 panel has 6: Wi-Fi/Bluetooth, then ten quick tiles in pairs); `compact` is the small 2.0 panel's sizes.
+// `rows` tile rows (legacy); for the compact (2.0) plan `rows` is the number of small toggles, laid out kMiniCols across.
 inline RightPlan PlanRight(float height, int rows = 4, bool compact = false) {
     RightPlan r;
     r.rows = rows;
     float top = 24;
-    if (compact) {
-        r.rowH = 48; r.rowGap = 8; r.sliderH = 38; r.mediaH = 60; r.gap = 14; top = 18; r.battH = 44;
-        for (int i = 0; i < rows; i++) r.rowY[i] = top + i * (r.rowH + r.rowGap);
+    if (compact) {  // the mock's control column: two 64 px pills, the small toggles, two 22 px sliders, now playing, usage
+        r.rowH = ui::kPillH; r.rowGap = tk::kInCard; r.sliderH = ui::kSliderH; r.mediaH = tk::kMedia; r.gap = ui::kS4; top = ui::kS4;
+        r.rowY[0] = top;
         r.tilesY = top; r.tilesH = r.rowH;
-        const float rowsEnd = r.rowY[rows - 1] + r.rowH;
-        r.battY = rowsEnd + r.gap;
-        r.brightY = r.battY + r.battH + r.gap;
-        r.volY = r.brightY + r.sliderH + r.rowGap;
+        const int miniRows = (std::max(rows, 1) + tk::kMiniCols - 1) / tk::kMiniCols;
+        r.miniY = r.rowY[0] + r.rowH + r.rowGap;
+        r.miniH = miniRows * tk::kMini + (miniRows - 1) * tk::kInCard;
+        r.brightY = r.miniY + r.miniH + r.gap;
+        r.volY = r.brightY + r.sliderH + ui::kS3;
         r.mediaY = r.volY + r.sliderH + r.gap;
         r.usageY = r.mediaY + r.mediaH + r.gap;
         r.bottom = r.usageY + r.usageH + kRightPad;

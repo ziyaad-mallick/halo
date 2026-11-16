@@ -20,9 +20,11 @@ constexpr int kRegular = 400, kSemibold = 600;
 constexpr wchar_t kFontText[] = L"Segoe UI Variable Text", kFontDisplay[] = L"Segoe UI Variable Display",
                   kFontIcons[] = L"Segoe Fluent Icons";
 constexpr float kIcon = 16, kIconSmall = 14;  // glyph sizes
+constexpr float kIconTile = 28;               // an app's icon on a notification card
 
 // Radius.
 constexpr float kRadiusSmall = 12, kRadiusLarge = 20;
+constexpr float kRadiusHover = kRadiusSmall;  // the one hover / pressed plate: rows, buttons, cells
 constexpr float kPanelInset = kS4, kPanelRadius = kRadiusLarge + kPanelInset;
 
 // Control sizes (multiples of 4).
@@ -33,6 +35,17 @@ constexpr float kSliderH = 22;    // the slider track as drawn (was 28: ~21 % sh
 constexpr float kSliderHitH = kSliderH + 2 * kS1;  // its pointer target: 4 px taller on each side, so it is still easy to grab
 constexpr float kMediaArt = 48;   // now-playing artwork
 constexpr float kMediaH = kMediaArt + 2 * kS3;  // the now-playing module
+constexpr float kSearchH = 44;    // the round-ended search field
+constexpr float kRowH = 40;       // a list row: recent files
+constexpr float kMenuRowH = 32;   // a row of the Power menu
+constexpr float kButton = 36;     // a small icon button (Lock, Settings, Power, media transport)
+constexpr float kAvatar = 28;     // the account picture
+constexpr float kFileIcon = 16;   // a file's icon in a row
+constexpr float kAppIcon = 44;    // an app's icon in the grid
+constexpr float kWidgetH = 72;    // a widget card on Start
+constexpr float kThumbW = 3, kThumbMin = 24;  // a scroll thumb
+constexpr float kFocusRing = 2, kFocusGap = 2;  // the keyboard focus ring: stroke, and its gap from the control
+constexpr float kHair = 1;        // a hairline, in logical px
 
 // Notification Center: compact floating cards, a quiet heading, then a calendar widget.
 constexpr float kNotificationWidth = 360, kNotificationEdge = kS4;
@@ -46,5 +59,12 @@ constexpr float kNotificationCalendarHead = kS4, kNotificationCalendarRow = 28;
 constexpr int kFastMs = 90, kSlowMs = 280;  // fast was 120
 constexpr int kHoverMs = 80;                // a highlight gliding between controls, and fading in/out
 constexpr float kEnterTravel = 16;  // logical px a panel rises/sinks while it fades in/out
+constexpr int kPanelEnterMs = 140;          // a panel's fade in
+constexpr int kPanelExitMs = 120, kPanelExitMoveMs = 170;  // fade out, and the sink (it accelerates)
+constexpr int kPanelSpringMs = 130;         // the entrance spring's period (the compositor's SpringScalarAnimation)
+constexpr float kPanelSpringDamping = 0.55f;  // Bounce: about a sixth of overshoot on the 16 px, then it settles
+constexpr float kPanelRiseDamping = 0.85f;    // Rise: the same spring with a hint of overshoot
+constexpr int kPressDownMs = 70, kPressUpMs = 110;  // a press answers in 70 ms and comes back in 110
+constexpr float kPressScale = 0.96f;        // a pressed plate or tile
 
 }  // namespace halo::ui
