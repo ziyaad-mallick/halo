@@ -88,9 +88,18 @@ enum class AudioOpResult { Succeeded, FellBackToSettings, Failed };
 // SetDefaultOutput on a worker thread. `done` (optional) runs on that worker; `msg` is also posted to `notify`.
 void SetDefaultAudioOutput(std::wstring const& endpointId, HWND notify, UINT msg,
                            std::function<void(AudioOpResult)> done = {});
-// ConnectBluetoothAudio is deliberately NOT implemented: the KS one-shot reconnect route is documented
-// (KSPROPERTY_ONESHOT_RECONNECT) but its property-set GUID and the endpoint-to-IKsControl chain could not be
-// confirmed from a primary source here. See the report for the design.
+// Connect a paired Bluetooth audio device and make it the default output. `btDeviceId` is BtDevice::id (the
+// container id). Off-thread; the row shows pending (BtDevice::pending, a message is posted to `notify`/`msg` at the
+// start and the end). Sequence: KSPROPERTY_ONESHOT_RECONNECT (KSPROPSETID_BtAudio, id 0, a GET on the Bluetooth KS
+// filter behind each of the device's render endpoints), poll up to ~10 s for an endpoint to become ACTIVE, then
+// SetDefaultAudioOutput to the stereo endpoint. Any failure (no endpoint for the device, the reconnect refused, the
+// connection not up in time) opens ms-settings:bluetooth and reports FellBackToSettings. A device that is already
+// connected for audio skips straight to making it the default.
+void ConnectBluetoothAudio(std::wstring const& btDeviceId, HWND notify, UINT msg,
+                           std::function<void(AudioOpResult)> done = {});
+// KSPROPERTY_ONESHOT_DISCONNECT (id 1) on the same filters; polls until no endpoint of the device is ACTIVE.
+void DisconnectBluetoothAudio(std::wstring const& btDeviceId, HWND notify, UINT msg,
+                              std::function<void(AudioOpResult)> done = {});
 
 // ---- Power ----------------------------------------------------------------------------
 struct Battery {
@@ -192,7 +201,13 @@ struct BtDevice {
     bool connected = false;
     std::wstring id;     // stable key of the physical device: container id (Classic + LE entries merged), else address
     std::wstring aepId;  // the Classic entry's device id (else the LE one): what BluetoothDevice::FromIdAsync takes
-    bool pending = false;
+    bool pending = false;  // a ConnectBluetoothAudio / DisconnectBluetoothAudio for this device is running
+    // Audio facts, from the render endpoints that share the device's container id (filled by BtDevices() from the
+    // output cache; all false until the first output enumeration has landed or for a non-audio device).
+    bool audio = false;         // Windows has a render endpoint for it (any state): it can be connected as audio
+    bool audioActive = false;   // that endpoint is ACTIVE: the earphones are connected for audio
+    bool audioDefault = false;  // ... and it is the default output
+    std::wstring endpointId;    // the endpoint to pass to SetDefaultAudioOutput (stereo preferred over hands-free)
 };
 using DiscoveryPhase = radio_policy::DiscoveryPhase;
 struct DiscoveryStatus {

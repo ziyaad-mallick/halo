@@ -1,6 +1,7 @@
 #include "services.h"
 #include "shell_launch.h"
 
+#include <devicetopology.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <propsys.h>
 #include <shellapi.h>
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace halo::svc {
 namespace {
@@ -268,12 +270,88 @@ AudioOpResult SetDefaultNow(std::wstring const& id) {
     return reinterpret_cast<INT_PTR>(h) > 32 ? AudioOpResult::FellBackToSettings : AudioOpResult::Failed;
 }
 
+// Every render endpoint in any state, with its container id (the key that ties a Bluetooth device to its endpoints).
+struct EpInfo {
+    std::wstring id, name, container;  // container: lower-case, no braces (see NormId)
+    DWORD state = 0;
+    bool isDefault = false;
+    bool operator==(EpInfo const&) const = default;
+};
+
+std::wstring NormId(std::wstring const& s) {
+    std::wstring out;
+    for (wchar_t c : s) if (c != L'{' && c != L'}') out.push_back(static_cast<wchar_t>(towlower(c)));
+    return out;
+}
+
+// PKEY_Device_ContainerId {8C7ED206-3F8A-4827-B3AB-AE9E1FAEFC6C}, 2: groups every endpoint and node of one physical device.
+constexpr PROPERTYKEY kPkeyContainerId = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
+
+std::vector<EpInfo> AllRenderEndpoints() {
+    std::vector<EpInfo> out;
+    winrt::com_ptr<IMMDeviceEnumerator> en;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), en.put_void())))
+        return out;
+    std::wstring defId;
+    winrt::com_ptr<IMMDevice> def;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, def.put()))) {
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(def->GetId(&id)) && id) { defId = id; CoTaskMemFree(id); }
+    }
+    winrt::com_ptr<IMMDeviceCollection> col;
+    UINT n = 0;
+    if (FAILED(en->EnumAudioEndpoints(eRender, DEVICE_STATEMASK_ALL, col.put())) || FAILED(col->GetCount(&n))) return out;
+    for (UINT i = 0; i < n; i++) {
+        winrt::com_ptr<IMMDevice> dev;
+        LPWSTR id = nullptr;
+        if (FAILED(col->Item(i, dev.put())) || FAILED(dev->GetId(&id)) || !id) continue;
+        EpInfo ep;
+        ep.id = id;
+        CoTaskMemFree(id);
+        ep.isDefault = ep.id == defId;
+        dev->GetState(&ep.state);
+        winrt::com_ptr<IPropertyStore> props;
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, props.put()))) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) ep.name = pv.pwszVal;
+            PropVariantClear(&pv);
+            PropVariantInit(&pv);
+            if (SUCCEEDED(props->GetValue(kPkeyContainerId, &pv)) && pv.vt == VT_CLSID && pv.puuid) {
+                wchar_t g[48] = {};
+                StringFromGUID2(*pv.puuid, g, 48);
+                ep.container = NormId(g);
+            }
+            PropVariantClear(&pv);
+        }
+        out.push_back(std::move(ep));
+    }
+    return out;
+}
+
+// The stereo (A2DP) endpoint is the one to make default; the hands-free (telephony) one is a worse choice. Names are
+// all there is to tell them apart, so this is a heuristic: UNVERIFIED on the owner's earphones.
+bool LooksHandsFree(std::wstring const& name) {
+    std::wstring n = NormId(name);
+    return n.find(L"hands-free") != std::wstring::npos || n.find(L"hands free") != std::wstring::npos ||
+           n.find(L"handsfree") != std::wstring::npos || n.find(L"freisprech") != std::wstring::npos;
+}
+EpInfo const* BestEndpoint(std::vector<EpInfo const*> const& eps, bool activeOnly) {
+    EpInfo const* best = nullptr;
+    for (auto const* ep : eps) {
+        if (activeOnly && ep->state != DEVICE_STATE_ACTIVE) continue;
+        if (!best || (LooksHandsFree(best->name) && !LooksHandsFree(ep->name))) best = ep;
+    }
+    return best;
+}
+
 struct OutHub {
     std::mutex m;
     std::vector<Device> list;
+    std::vector<EpInfo> all;  // every render endpoint in any state
     ULONGLONG updated = 0;
     bool busy = false, dirty = false, subscribed = false;
-    std::atomic<bool> active{false};  // someone listens: endpoint changes re-enumerate only then
+    std::atomic<int> listeners{0};  // bit 0: the output page, bit 1: the Bluetooth page. Endpoint changes re-enumerate only while one is set
     Coalescer post;
     winrt::com_ptr<IMMDeviceEnumerator> en;
     winrt::com_ptr<IMMNotificationClient> nc;
@@ -285,6 +363,7 @@ OutHub& Out() {
 
 void OutputsKick();
 void OutputsNote();
+void BtNoteAudioChanged();  // defined with the Bluetooth hub: the audio facts of a row changed
 
 // Endpoint changes only mark the cache dirty; the callback itself never calls back into the enumerator.
 struct OutChanged : winrt::implements<OutChanged, IMMNotificationClient> {
@@ -321,16 +400,21 @@ void OutputsWorker() {
     for (;;) {
         { std::lock_guard lock(h.m); h.dirty = false; }
         auto devices = OutputDevices();
-        bool changed;
+        auto all = AllRenderEndpoints();
+        bool changed, allChanged;
         {
             std::lock_guard lock(h.m);
             changed = !h.updated || !SameOutputs(h.list, devices);
+            allChanged = h.all != all;
             h.list = std::move(devices);
+            h.all = std::move(all);
             h.updated = GetTickCount64();
             if (!h.dirty) { h.busy = false; break; }
         }
         if (changed) h.post.Poke();
+        if (allChanged) BtNoteAudioChanged();
     }
+    BtNoteAudioChanged();
     h.post.PostNow();  // the last enumeration also clears the refreshing flag, so always tell the page
 }
 
@@ -347,7 +431,7 @@ void OutputsKick() {
     }
 }
 void OutputsNote() {
-    if (Out().active) OutputsKick();
+    if (Out().listeners.load()) OutputsKick();
 }
 }  // namespace
 
@@ -358,13 +442,13 @@ std::vector<Device> OutputDevicesCached() {
 }
 void OutputsRefresh(HWND notify, UINT msg) {
     auto& h = Out();
-    h.active = true;
+    h.listeners |= 1;
     h.post.SetTarget(notify, msg);
     h.post.PostNow();  // the page re-reads the cache straight away
     OutputsKick();
 }
 void OutputsStop() {
-    Out().active = false;
+    Out().listeners &= ~1;
     Out().post.SetTarget(nullptr, 0);
 }
 ListInfo OutputsInfo() {
@@ -1359,12 +1443,14 @@ struct BtHub {
     ULONGLONG updated = 0;
     bool sawConnectionProperty = false, workerBusy = false;
     BtTransport t[2];  // 0 = Classic, 1 = LE
+    std::unordered_set<std::wstring> connecting;  // NormId of the devices with a connect/disconnect in flight
     Coalescer post;
 };
 BtHub& Bt() {
     static BtHub* hub = new BtHub;  // never destroyed: watcher callbacks may still run at process exit
     return *hub;
 }
+void BtNoteAudioChanged() { Bt().post.Poke(); }
 
 auto BtProps() {
     return winrt::single_threaded_vector<winrt::hstring>({L"System.Devices.Aep.IsConnected", L"System.Devices.Aep.ContainerId", L"System.Devices.Aep.DeviceAddress"});
@@ -1747,6 +1833,8 @@ ListInfo WifiInfo() {
 void BtRefresh(HWND notify, UINT msg) {
     auto& h = Bt();
     h.post.SetTarget(notify, msg);
+    Out().listeners |= 2;  // the rows' audio facts follow the endpoints
+    OutputsKick();
     bool start;
     {
         std::lock_guard lock(h.m);
@@ -1768,12 +1856,38 @@ void BtRefresh(HWND notify, UINT msg) {
 }
 
 // The watchers keep running and keep the cache current; only the notifications stop.
-void BtStop() { Bt().post.SetTarget(nullptr, 0); }
+void BtStop() {
+    Out().listeners &= ~2;
+    Bt().post.SetTarget(nullptr, 0);
+}
 
 std::vector<BtDevice> BtDevices() {
     auto& h = Bt();
-    std::lock_guard lock(h.m);
-    return h.list;
+    std::vector<BtDevice> list;
+    std::unordered_set<std::wstring> connecting;
+    {
+        std::lock_guard lock(h.m);
+        list = h.list;
+        connecting = h.connecting;
+    }
+    auto& out = Out();
+    std::lock_guard lock(out.m);
+    for (auto& d : list) {
+        const std::wstring key = NormId(d.id);
+        d.pending = connecting.count(key) != 0;
+        std::vector<EpInfo const*> mine;
+        for (auto const& ep : out.all) if (!ep.container.empty() && ep.container == key) mine.push_back(&ep);
+        if (mine.empty()) continue;
+        d.audio = true;
+        if (auto const* active = BestEndpoint(mine, true)) {
+            d.audioActive = true;
+            d.audioDefault = active->isDefault;
+            d.endpointId = active->id;
+        } else if (auto const* any = BestEndpoint(mine, false)) {
+            d.endpointId = any->id;
+        }
+    }
+    return list;
 }
 DiscoveryStatus BtStatus() {
     auto& h = Bt();
@@ -1784,6 +1898,157 @@ ListInfo BtInfo() {
     auto& h = Bt();
     std::lock_guard lock(h.m);
     return {h.updated != 0, h.status.phase == DiscoveryPhase::Loading, h.updated};
+}
+
+// ---- Bluetooth audio: connect / disconnect through the audio driver's one-shot properties ---------------------------
+// Windows has no public "connect this paired device" call for desktop apps. The Bluetooth audio drivers implement
+// KSPROPERTY_ONESHOT_RECONNECT / _DISCONNECT on their KS filter (Microsoft Learn: "prompt the audio driver to attempt
+// to connect to the Bluetooth audio device"; Get-only, target Filter, no value, success only means the driver tried);
+// that is what the Sound control panel's Connect command uses. Reaching the filter from an endpoint:
+//   IMMDevice(endpoint) -> Activate(IDeviceTopology) -> IConnector -> GetDeviceIdConnectedTo() -> IMMDeviceEnumerator::
+//   GetDevice(that id) -> Activate(IKsControl) -> KsProperty({KSPROPSETID_BtAudio, id, GET}).
+// Constants: KSPROPSETID_BtAudio {7FA06C40-B8F6-4C7E-8556-E8C33A12E54D}, KSPROPERTY_ONESHOT_RECONNECT = 0, _DISCONNECT = 1
+// (microsoft/windows-rs metadata/win32/ksmedia.rdl, generated from the SDK headers; MicrosoftDocs kspropsetid-btaudio.md).
+// The sequence was cross-checked against two independent open implementations (read for the approach only; this code
+// is written fresh).
+namespace {
+constexpr GUID kKsetBtAudio = {0x7fa06c40, 0xb8f6, 0x4c7e, {0x85, 0x56, 0xe8, 0xc3, 0x3a, 0x12, 0xe5, 0x4d}};
+constexpr ULONG kBtOneShotReconnect = 0, kBtOneShotDisconnect = 1;
+
+bool SendKsBtProperty(IMMDeviceEnumerator* en, wchar_t const* filterDeviceId, ULONG propId) {
+    winrt::com_ptr<IMMDevice> dev;
+    if (FAILED(en->GetDevice(filterDeviceId, dev.put()))) return false;
+    winrt::com_ptr<IKsControl> ks;
+    if (FAILED(dev->Activate(__uuidof(IKsControl), CLSCTX_ALL, nullptr, ks.put_void()))) return false;
+    KSPROPERTY prop{};
+    prop.Set = kKsetBtAudio;
+    prop.Id = propId;
+    prop.Flags = KSPROPERTY_TYPE_GET;
+    ULONG returned = 0;
+    return SUCCEEDED(ks->KsProperty(&prop, sizeof(prop), nullptr, 0, &returned));
+}
+
+// One endpoint -> its Bluetooth filter -> the one-shot. True if the driver accepted a request.
+bool SendBtOneShot(IMMDeviceEnumerator* en, std::wstring const& endpointId, ULONG propId) {
+    winrt::com_ptr<IMMDevice> endpoint;
+    if (FAILED(en->GetDevice(endpointId.c_str(), endpoint.put()))) return false;
+    winrt::com_ptr<IDeviceTopology> topo;
+    if (FAILED(endpoint->Activate(__uuidof(IDeviceTopology), CLSCTX_ALL, nullptr, topo.put_void()))) return false;
+    UINT count = 0;
+    if (FAILED(topo->GetConnectorCount(&count))) return false;
+    for (UINT i = 0; i < count; ++i) {
+        winrt::com_ptr<IConnector> conn;
+        if (FAILED(topo->GetConnector(i, conn.put()))) continue;
+        LPWSTR other = nullptr;
+        if (SUCCEEDED(conn->GetDeviceIdConnectedTo(&other)) && other) {
+            std::wstring id = other;
+            CoTaskMemFree(other);
+            if (SendKsBtProperty(en, id.c_str(), propId)) return true;
+        }
+        // Second route to the same filter: the connected connector's part -> its topology object -> device id.
+        winrt::com_ptr<IConnector> peer;
+        if (FAILED(conn->GetConnectedTo(peer.put()))) continue;
+        auto part = peer.try_as<IPart>();
+        winrt::com_ptr<IDeviceTopology> peerTopo;
+        LPWSTR peerId = nullptr;
+        // (mingw-w64's header spells IPart::GetTopologyObject with an s; it is the same vtable slot.)
+        if (part && SUCCEEDED(part->GetTopologyObjects(peerTopo.put())) && SUCCEEDED(peerTopo->GetDeviceId(&peerId)) && peerId) {
+            std::wstring id = peerId;
+            CoTaskMemFree(peerId);
+            if (SendKsBtProperty(en, id.c_str(), propId)) return true;
+        }
+    }
+    return false;
+}
+
+bool AnyActive(std::vector<EpInfo> const& all, std::wstring const& container) {
+    for (auto const& ep : all) if (ep.container == container && ep.state == DEVICE_STATE_ACTIVE) return true;
+    return false;
+}
+
+// Runs on a worker. Returns the result; the caller does the bookkeeping.
+AudioOpResult RunBtAudio(std::wstring const& container, bool connect) {
+    const AudioOpResult kSettings = AudioOpResult::FellBackToSettings;
+    auto openSettings = [&] {
+        OpenSettings(L"ms-settings:bluetooth");
+        return kSettings;
+    };
+    if (DryRun()) { Log(std::wstring(L"DRYRUN bluetooth audio ") + (connect ? L"connect " : L"disconnect ") + container); return AudioOpResult::Succeeded; }
+    if (container.empty()) return connect ? openSettings() : AudioOpResult::Failed;
+    winrt::com_ptr<IMMDeviceEnumerator> en;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), en.put_void())))
+        return connect ? openSettings() : AudioOpResult::Failed;
+    auto all = AllRenderEndpoints();
+    std::vector<EpInfo const*> mine;
+    for (auto const& ep : all) if (ep.container == container) mine.push_back(&ep);
+    if (mine.empty()) return connect ? openSettings() : AudioOpResult::Failed;  // not an audio device Windows knows
+
+    const bool wasActive = AnyActive(all, container);
+    if (connect == wasActive && connect) {
+        // already connected for audio: only the default output is left to do
+    } else if (connect == wasActive) {
+        // asked to disconnect something that is not connected: nothing to do
+        return AudioOpResult::Succeeded;
+    } else {
+        int sent = 0;
+        for (auto const* ep : mine)
+            if (SendBtOneShot(en.get(), ep->id, connect ? kBtOneShotReconnect : kBtOneShotDisconnect)) ++sent;
+        if (!sent) return connect ? openSettings() : AudioOpResult::Failed;
+        bool settled = false;
+        for (int waited = 0; waited < 10000 && !settled; waited += 250) {
+            Sleep(250);
+            settled = AnyActive(AllRenderEndpoints(), container) == connect;
+        }
+        if (!settled) return connect ? openSettings() : AudioOpResult::Failed;
+    }
+    if (!connect) return AudioOpResult::Succeeded;
+    // Connected for audio: make the stereo endpoint the default output (unless it already is).
+    all = AllRenderEndpoints();
+    mine.clear();
+    for (auto const& ep : all) if (ep.container == container) mine.push_back(&ep);
+    if (auto const* best = BestEndpoint(mine, true)) {
+        if (!best->isDefault) return SetDefaultNow(best->id);
+    }
+    return AudioOpResult::Succeeded;
+}
+
+void BtAudioOp(std::wstring const& deviceId, bool connect, HWND notify, UINT msg, std::function<void(AudioOpResult)> done) {
+    auto& h = Bt();
+    const std::wstring key = NormId(deviceId);
+    {
+        std::lock_guard lock(h.m);
+        if (!h.connecting.insert(key).second) return;  // one at a time per device
+    }
+    h.post.PostNow();  // the row shows "Connecting…" at once
+    const bool started = RunOffThread([key, connect, notify, msg, done] {
+        AudioOpResult result = AudioOpResult::Failed;
+        try { result = RunBtAudio(key, connect); } catch (...) {}
+        {
+            auto& hub = Bt();
+            std::lock_guard lock(hub.m);
+            hub.connecting.erase(key);
+        }
+        if (done) done(result);
+        OutputsKick();
+        Bt().post.PostNow();
+        if (notify) PostMessageW(notify, msg, 0, 0);
+    });
+    if (!started) {
+        {
+            std::lock_guard lock(h.m);
+            h.connecting.erase(key);
+        }
+        h.post.PostNow();
+        if (done) done(AudioOpResult::Failed);
+    }
+}
+}  // namespace
+
+void ConnectBluetoothAudio(std::wstring const& btDeviceId, HWND notify, UINT msg, std::function<void(AudioOpResult)> done) {
+    BtAudioOp(btDeviceId, true, notify, msg, std::move(done));
+}
+void DisconnectBluetoothAudio(std::wstring const& btDeviceId, HWND notify, UINT msg, std::function<void(AudioOpResult)> done) {
+    BtAudioOp(btDeviceId, false, notify, msg, std::move(done));
 }
 
 // ---- Now Playing ------------------------------------------------------------------------------
