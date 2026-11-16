@@ -99,6 +99,7 @@ struct NotifColumn::Impl {
     std::vector<Row> rows;
     float contentH = 0, scroll = 0;
     float listTop = 0, listH = 0, calTop = 0, calH = 0, headTop = 0;
+    int calRows = 6;  // week rows the shown month needs (4 to 6): the card is as tall as that, and the list below uses the rest
     D2D1_RECT_F clearR{}, prevR{}, nextR{}, monthR{};
     int calYear = 0, calMonth = 1, todayY = 0, todayM = 1, todayD = 1, firstDow = 0;
 
@@ -214,6 +215,9 @@ struct NotifColumn::Impl {
     void DrawClose();
     void SetToday();
     void ShiftMonth(int d);
+    float CalH(int rows) const { return (kCalPad + kCalNav + kCalDow + rows * kCalRow + kCalPad) * s; }
+    void Fit();     // positions below the calendar card for `calRows`
+    void FitCal();  // the shown month changed: take its row count, move what is below, redo the list
     void Unpress();
     D2D1_COLOR_F HoverFill(Kind k) const { return down && pressKind == k ? Cf(theme::P().press) : theme::P().fillHover; }
 
@@ -257,13 +261,11 @@ wuc::ContainerVisual NotifColumn::Impl::Build(float w, float h, float scale) {
     root = comp.CreateContainerVisual();
     root.Size({W, H});
 
-    // Top to bottom: the calendar card (month and arrows, weekday initials, six weeks: it never changes height), then the
-    // heading "Notifications" with Clear all, then the notification cards.
-    calH = (kCalPad + kCalNav + kCalDow + 6 * kCalRow + kCalPad) * s;
+    // Top to bottom: the calendar card (month and arrows, weekday initials, the weeks the month needs), then the heading
+    // "Notifications" with Clear all, then the notification cards.
     calTop = kMargin * s;
-    headTop = calTop + calH + kGap * s;
-    listTop = headTop + kHeadH * s + ui::kS2 * s;
-    listH = std::max(0.0f, H - kMargin * s - listTop);
+    calRows = start::MakeMonthGrid(calYear, calMonth, 0, firstDow).rows;
+    Fit();
 
     headV = nullptr;
     headS = Surface(W, kHeadH * s);
@@ -271,8 +273,8 @@ wuc::ContainerVisual NotifColumn::Impl::Build(float w, float h, float scale) {
     headV.Offset({0, headTop, 0});
     root.Children().InsertAtTop(headV);
 
-    calS = Surface(W - 2 * kMargin * s, calH);
-    calV = SurfaceVisual(calS, W - 2 * kMargin * s, calH);
+    calS = Surface(W - 2 * kMargin * s, CalH(6));  // room for six weeks: a month that needs fewer draws a shorter card in it
+    calV = SurfaceVisual(calS, W - 2 * kMargin * s, CalH(6));
     calV.Offset({kMargin * s, calTop, 0});
     root.Children().InsertAtTop(calV);
 
@@ -333,7 +335,7 @@ void NotifColumn::Impl::SetActive(bool on) {
             feedStarted = true;
             feed.Start(inst, [this] { if (built && active) { Relayout(); DrawHead(); } });
         }
-        if (built) { SetToday(); DrawCal(); }
+        if (built) { SetToday(); FitCal(); DrawCal(); }
         feed.SetActive(true);
     } else if (feedStarted) {
         feed.SetActive(false);
@@ -351,7 +353,27 @@ void NotifColumn::Impl::ShiftMonth(int d) {
     calMonth += d;
     if (calMonth < 1) { calMonth = 12; calYear--; }
     if (calMonth > 12) { calMonth = 1; calYear++; }
+    FitCal();
     DrawCal();
+}
+
+void NotifColumn::Impl::Fit() {
+    calH = CalH(calRows);
+    headTop = calTop + calH + kGap * s;
+    listTop = headTop + kHeadH * s + ui::kS2 * s;
+    listH = std::max(0.0f, H - kMargin * s - listTop);
+}
+
+void NotifColumn::Impl::FitCal() {
+    if (!built) return;
+    const int rows = start::MakeMonthGrid(calYear, calMonth, 0, firstDow).rows;
+    if (rows == calRows) return;
+    calRows = rows;
+    Fit();
+    headV.Offset({0, headTop, 0});
+    listClip.Size({W, listH});
+    listClip.Offset({0, listTop, 0});
+    Relayout();  // the list's room changed: clamp the scroll, redraw the cards and the heading
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -672,7 +694,7 @@ bool NotifColumn::Click(float x, float y) {
         case Impl::Kind::Clear: m->feed.Clear(); break;
         case Impl::Kind::Prev: m->ShiftMonth(-1); break;
         case Impl::Kind::Next: m->ShiftMonth(1); break;
-        case Impl::Kind::Month: m->SetToday(); m->DrawCal(); break;
+        case Impl::Kind::Month: m->SetToday(); m->FitCal(); m->DrawCal(); break;
         case Impl::Kind::Close:
             m->feed.Remove({m->rows[h.row].n.id});
             break;

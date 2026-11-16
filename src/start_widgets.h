@@ -311,6 +311,17 @@ inline RightPlan PlanRight(float height, int rows = 4, bool compact = false) {
         r.mediaY = r.volY + r.sliderH + r.gap;
         r.usageY = r.mediaY + r.mediaH + r.gap;
         r.bottom = r.usageY + r.usageH + kRightPad;
+        // A panel taller than the controls need (the middle card sets the height) spreads the spare room over the three gaps
+        // between groups, up to 16 px more each, so the column does not end in an empty strip above the footer.
+        const float spare = std::max(0.0f, height - kRightFootH - r.bottom), add = std::min(spare / 3, static_cast<float>(ui::kS4));
+        if (add > 0) {
+            r.gap += add;
+            r.brightY = r.miniY + r.miniH + r.gap;
+            r.volY = r.brightY + r.sliderH + ui::kS3;
+            r.mediaY = r.volY + r.sliderH + r.gap;
+            r.usageY = r.mediaY + r.mediaH + r.gap;
+            r.bottom = r.usageY + r.usageH + kRightPad;
+        }
         return r;
     }
     auto total = [&](float rowH, float gap) {

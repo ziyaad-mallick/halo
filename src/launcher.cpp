@@ -155,7 +155,7 @@ constexpr UINT kMsgAppsFolder = WM_APP + 1;  // lParam: a Launcher::Found* from 
 constexpr UINT kMsgRecent = WM_APP + 2;  // result stays in shared state; no owned message payload
 // halo2: service notifications for the right column (the Control Center's own numbering is its own window's business).
 constexpr UINT kMsgAudio = WM_APP + 10, kMsgRadios = WM_APP + 11, kMsgBright = WM_APP + 12, kMsgMedia = WM_APP + 13,
-               kMsgWifi = WM_APP + 14, kMsgBt = WM_APP + 15, kMsgUsage = WM_APP + 16, kMsgMic = WM_APP + 17, kMsgLate = WM_APP + 18;
+               kMsgWifi = WM_APP + 14, kMsgBt = WM_APP + 15, kMsgUsage = WM_APP + 16, kMsgMic = WM_APP + 17, kMsgLate = WM_APP + 18, kMsgOutputs = WM_APP + 19;
 // Icon motion, matched to the dock: hover swells and lifts on a spring, a press squashes, a click bounces.
 constexpr float kHoverScale = 1.25f, kHoverLift = 6, kPressScale = 0.94f, kBounceRise = 8;  // (an icon's own squash; a plate or tile uses ui::kPressScale)
 constexpr float kHoverDamping = 0.6f;
@@ -1590,6 +1590,7 @@ void Launcher::Show(LauncherAnchor const& anchor) {
     m_allApps = false;
     m_activated = false;
     m_pressedIndex = -1;  // a press from the last visit must not complete a click on this one
+    m_pressedRowKey.clear();
     m_wheel = 0;
     ++m_gen;
     m_detail = Detail::None;  // halo2: the right column starts on its home controls, with the keyboard on search
@@ -2576,6 +2577,10 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    if (m == kMsgOutputs) {  // the cached output list changed (or a switch of default output finished)
+        OnServiceMessage(m);
+        return 0;
+    }
     if (m >= kMsgAudio && m <= kMsgMic) {  // halo2 services
         if (m == kMsgAudio) m_speaker.OnMessage(w);  // follows a default-device change
         if (m == kMsgMic) m_mic.OnMessage(w);
@@ -2773,6 +2778,7 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (m_open) {
                 auto const* hit = HitAt(PX(mx), my - kTop * m_s);
                 m_pressedIndex = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
+                m_pressedRowKey = hit && hit->kind == Kind::CcRow ? RowKey(hit->index) : std::wstring();
                 if (hit && (hit->kind == Kind::CcBright || hit->kind == Kind::CcVol)) {  // a slider takes the pointer until the button comes up
                     m_drag = static_cast<int>(hit->kind);
                     m_pressedIndex = -1;
@@ -2810,7 +2816,10 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 if (m_h2) CcPress(false);
                 auto const* hit = HitAt(PX(mx), my - kTop * m_s);
                 int key = hit ? static_cast<int>(hit->kind) * 1000 + hit->index : -1;
-                if (hit && key == m_pressedIndex) {
+                bool same = hit && key == m_pressedIndex;
+                if (hit && hit->kind == Kind::CcRow && m_pressedIndex >= 0 && m_pressedIndex / 1000 == static_cast<int>(Kind::CcRow))
+                    same = !m_pressedRowKey.empty() && RowKey(hit->index) == m_pressedRowKey;  // by id: the same device, wherever its row is now
+                if (same) {
                     Hit copy = *hit;
                     Click(copy);
                 } else {
@@ -3129,7 +3138,8 @@ void Launcher::StartServices() {
     m_muted = m_speaker.Available() && m_speaker.Muted();
     m_mic.Bind(eCapture, m_hwnd, kMsgMic);
     m_micMuted = m_mic.Available() && m_mic.Muted();
-    m_radios.Start(m_hwnd, kMsgRadios);
+    m_radios.Start(m_hwnd, kMsgRadios);  // finds the radios once per process; keeps the cached SSID fresh and posts kMsgRadios
+    m_ssid = svc::CachedSsid();
     svc::brightness::Probe(m_hwnd, kMsgBright);
     m_bright = svc::brightness::Supported() ? svc::brightness::Level() : -1;
     m_media.Start(m_hwnd, kMsgMedia, [this] {
@@ -3158,6 +3168,7 @@ void Launcher::StopServices() {
     m_mic.Unbind();
     svc::WifiStop();
     svc::BtStop();
+    svc::OutputsStop();  // (the cached lists stay for the next opening)
     if (m_hwnd) {
         KillTimer(m_hwnd, kServicesTimer);
         KillTimer(m_hwnd, kClockTimer);
@@ -3186,7 +3197,7 @@ void Launcher::OnServiceMessage(UINT m) {
         case kMsgRadios:
             m_wifiOn = m_radios.WifiOn();
             m_btOn = m_radios.BluetoothOn();
-            m_ssid = m_wifiOn ? svc::ConnectedSsid() : std::wstring();
+            m_ssid = m_wifiOn ? svc::CachedSsid() : std::wstring();  // (ConnectedSsid blocks: not on the UI thread)
             RedrawRight();
             break;
         case kMsgBright:
@@ -3195,17 +3206,38 @@ void Launcher::OnServiceMessage(UINT m) {
             RedrawRight();
             break;
         case kMsgMedia: m_media.Pull(); break;
-        case kMsgWifi:
-            m_wifiRows = svc::WifiNets();
-            m_ssid = m_wifiOn ? svc::ConnectedSsid() : std::wstring();
-            LayoutRight();
+        // The cached lists update in place: the same rows redraw where they are; only a changed row count re-lays out the hits
+        // (a data update never rebuilds the hit list under the pointer, and never resets a press).
+        case kMsgWifi: {
+            auto rows = svc::WifiNets();
+            const bool resized = rows.size() != m_wifiRows.size();
+            m_wifiRows = std::move(rows);
+            m_ssid = m_wifiOn ? svc::CachedSsid() : std::wstring();
+            if (resized && m_detail == Detail::Wifi) LayoutRight();
             RedrawRight();
             break;
-        case kMsgBt:
-            m_btRows = svc::BtDevices();
-            LayoutRight();
+        }
+        case kMsgBt: {
+            auto rows = svc::BtDevices();
+            const bool resized = rows.size() != m_btRows.size();
+            m_btRows = std::move(rows);
+            if (resized && m_detail == Detail::Bt) LayoutRight();
             RedrawRight();
             break;
+        }
+        case kMsgOutputs: {
+            auto outs = svc::OutputDevicesCached();
+            const bool resized = outs.size() != m_outs.size();
+            m_outs = std::move(outs);
+            if (m_detail == Detail::Bt) {  // a Bluetooth row's audio facts come from the output list
+                const size_t before = m_btRows.size();
+                m_btRows = svc::BtDevices();
+                if (before != m_btRows.size()) LayoutRight();
+            }
+            if (resized && m_detail == Detail::Output) LayoutRight();
+            RedrawRight();
+            break;
+        }
         case kMsgUsage:
             m_use = m_sampler.Latest();
             RedrawUsage();
@@ -3279,6 +3311,17 @@ void Launcher::BuildRight(float rightW) {
     LayoutRight();
     RedrawRight();
     RedrawUsage();
+}
+
+// The stable id of the list row at `index` on the open page (empty when there is none): a press is keyed by it, so a reorder
+// between button-down and button-up cannot click a different device.
+std::wstring Launcher::RowKey(int index) const {
+    if (index < 0) return {};
+    const size_t i = static_cast<size_t>(index);
+    if (m_detail == Detail::Wifi) return i < m_wifiRows.size() ? m_wifiRows[i].id : std::wstring();
+    if (m_detail == Detail::Bt) return i < m_btRows.size() ? m_btRows[i].id : std::wstring();
+    if (m_detail == Detail::Output) return i < m_outs.size() ? m_outs[i].id : std::wstring();
+    return {};
 }
 
 int Launcher::CcIndexOf(Kind kind, int index) const {
@@ -3587,6 +3630,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
                 const bool wifi = h.kind == Kind::CcWifi;
                 const bool has = wifi ? hasWifi : hasBt, on = has && (wifi ? m_wifiOn : m_btOn);
                 std::wstring sub = !has ? (!m_servicesOn || m_radios.Loading() ? L"Checking…" : m_radios.Failed() ? L"Check Settings" : L"Unavailable") : on ? (wifi && !m_ssid.empty() ? m_ssid : L"On") : L"Off";
+                if (has && !demo && (wifi ? m_radios.WifiPending() : m_radios.BluetoothPending())) sub = on ? L"Turning on…" : L"Turning off…";
                 tile(r, wifi ? 0xE701 : 0xE702, on, has, wifi ? L"Wi-Fi" : L"Bluetooth", sub);
                 break;
             }
@@ -3627,7 +3671,8 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
                 const auto status = wifi ? svc::WifiStatus() : svc::BtStatus();
                 using P = svc::DiscoveryPhase;
                 const bool loading = status.phase == P::Loading || status.phase == P::Connecting;
-                const wchar_t* label = status.phase == P::Connecting ? L"Connecting…" : loading ? L"Scanning…"
+                const size_t rowCount = wifi ? m_wifiRows.size() : m_btRows.size();
+                const wchar_t* label = status.phase == P::Connecting ? L"Connecting…" : loading ? (rowCount ? L"Updating…" : L"Scanning…")
                                        : status.phase == P::AccessDenied || status.phase == P::Unavailable ? L"Settings"
                                        : status.phase == P::Failed ? L"Retry" : L"Refresh";
                 pill(r, h2, c.hover.get());
@@ -3649,16 +3694,17 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
                         pill(R(bx, Mid(r.top, r.bottom) + 7 * s - bh, bx + bw, Mid(r.top, r.bottom) + 7 * s), 1 * s, br);
                     }
                     txt.Draw(dc, n.ssid.empty() ? L"Hidden network" : n.ssid, n.connected ? fName.get() : fBody.get(),
-                             R(r.left + 40 * s, r.top, r.right - 48 * s, r.bottom), c.ink.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
-                    if (n.connected) glyph(0xE73E, R(r.right - 32 * s, r.top, r.right - 8 * s, r.bottom), c.ink.get(), fIconS.get());
+                             R(r.left + 40 * s, r.top, r.right - (n.pending ? 104 : 48) * s, r.bottom), c.ink.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+                    if (n.pending) txt.Draw(dc, L"Connecting…", fSub.get(), R(r.right - 96 * s, r.top, r.right - 8 * s, r.bottom), c.muted.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    else if (n.connected) glyph(0xE73E, R(r.right - 32 * s, r.top, r.right - 8 * s, r.bottom), c.ink.get(), fIconS.get());
                     else if (n.secure) glyph(0xE72E, R(r.right - 32 * s, r.top, r.right - 8 * s, r.bottom), c.muted.get(), fIconS.get());
                 } else if (m_detail == Detail::Bt) {
                     auto const& d = m_btRows[h.index];
                     glyph(0xE702, R(r.left + 8 * s, r.top, r.left + 32 * s, r.bottom), c.soft.get(), fIconS.get());
-                    txt.Draw(dc, d.name, d.connected ? fName.get() : fBody.get(), R(r.left + 40 * s, r.top, r.right - 80 * s, r.bottom),
+                    txt.Draw(dc, d.name, d.connected ? fName.get() : fBody.get(), R(r.left + 40 * s, r.top, r.right - 104 * s, r.bottom),
                              c.ink.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
-                    if (d.connected)
-                        txt.Draw(dc, L"Connected", fSub.get(), R(r.right - 76 * s, r.top, r.right - 8 * s, r.bottom), c.muted.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    const wchar_t* state = d.pending ? L"Connecting…" : d.connected ? (d.audio && !d.audioDefault ? L"Switch to" : L"Connected") : d.audio ? L"Connect" : L"Paired";
+                    txt.Draw(dc, state, fSub.get(), R(r.right - 96 * s, r.top, r.right - 8 * s, r.bottom), d.pending || d.connected ? c.ink.get() : c.muted.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
                 } else {
                     auto const& d = m_outs[h.index];
                     glyph(0xE767, R(r.left + 8 * s, r.top, r.left + 32 * s, r.bottom), c.soft.get(), fIconS.get());
@@ -3808,21 +3854,26 @@ void Launcher::ToggleDetail(Detail d) {
     m_rightScroll = 0;
     m_ccHold.StopAnimation(L"Offset.Y");
     m_ccHold.Offset({0, 0, 0});
+    // A page opens at once with the services' last rows and updates in place when they post; nothing is cleared.
     if (d == Detail::Wifi) {
         svc::BtStop();
-        m_wifiRows.clear();
+        svc::OutputsStop();
+        m_wifiRows = svc::WifiNets();
         svc::WifiRefresh(m_hwnd, kMsgWifi);
     } else if (d == Detail::Bt) {
         svc::WifiStop();
-        m_btRows.clear();
+        m_btRows = svc::BtDevices();
         svc::BtRefresh(m_hwnd, kMsgBt);
+        svc::OutputsRefresh(m_hwnd, kMsgOutputs);  // the rows' audio state (connected, default) follows the output list
     } else if (d == Detail::Output) {
         svc::WifiStop();
         svc::BtStop();
-        m_outs = svc::OutputDevices();
+        m_outs = svc::OutputDevicesCached();
+        svc::OutputsRefresh(m_hwnd, kMsgOutputs);
     } else {
         svc::WifiStop();
         svc::BtStop();
+        svc::OutputsStop();
     }
     LayoutRight();
     if (m_col == 1) {
@@ -3898,10 +3949,10 @@ void Launcher::CcClick(Hit const& hit) {
                         m_wifiOn = m_savedWifi || !hasBt;
                         m_btOn = m_savedBt;
                     }
-                    later([this, w = m_wifiOn, b = m_btOn] {
-                        if (m_radios.HasWifi()) m_radios.SetWifi(w);
-                        if (m_radios.HasBluetooth()) m_radios.SetBluetooth(b);
-                    });
+                    if (!dry) {  // non-blocking; Radios::WifiOn()/BluetoothOn() hold the requested state until it lands
+                        if (m_radios.HasWifi()) m_radios.SetWifi(m_wifiOn);
+                        if (m_radios.HasBluetooth()) m_radios.SetBluetooth(m_btOn);
+                    }
                     note(L"airplane mode");
                     break;
                 case 1:
@@ -3936,14 +3987,14 @@ void Launcher::CcClick(Hit const& hit) {
         case Kind::CcWifi:
             if (!hasWifi) return;
             m_wifiOn = !m_wifiOn;
-            later([this, on = m_wifiOn] { m_radios.SetWifi(on); });
+            if (!dry) m_radios.SetWifi(m_wifiOn);
             if (!m_wifiOn) m_ssid.clear();
             note(L"wifi");
             break;
         case Kind::CcBt:
             if (!hasBt) return;
             m_btOn = !m_btOn;
-            later([this, on = m_btOn] { m_radios.SetBluetooth(on); });
+            if (!dry) m_radios.SetBluetooth(m_btOn);
             note(L"bluetooth");
             break;
         case Kind::CcWifiMore:
@@ -3981,38 +4032,54 @@ void Launcher::CcClick(Hit const& hit) {
                 OpenQuietly(wifi ? (status.phase == P::AccessDenied ? L"ms-settings:privacy-location" : L"ms-settings:network-wifi")
                                  : L"ms-settings:bluetooth");
             } else if (wifi) {
-                m_wifiRows.clear();
-                svc::WifiRefresh(m_hwnd, kMsgWifi);
+                svc::WifiRefresh(m_hwnd, kMsgWifi);  // the rows stay and update in place
             } else {
-                m_btRows.clear();
                 svc::BtRefresh(m_hwnd, kMsgBt);
             }
-            LayoutRight();
             break;
         }
-        case Kind::CcRow:
+        case Kind::CcRow: {
+            // Rows are found by id (RowKey), copied, and acted on; every service call below returns at once.
+            const std::wstring key = RowKey(hit.index);
+            if (key.empty()) return;
             if (m_detail == Detail::Wifi) {
-                if (hit.index < static_cast<int>(m_wifiRows.size()) && !dry) svc::WifiConnect(m_wifiRows[hit.index]);
+                auto it = std::find_if(m_wifiRows.begin(), m_wifiRows.end(), [&](svc::WifiNet const& n) { return n.id == key; });
+                if (it == m_wifiRows.end() || it->pending) return;
+                const svc::WifiNet row = *it;
+                if (!dry) svc::WifiConnect(row);
+                note(L"wifi connect");
+                if (!dry) m_wifiRows = svc::WifiNets();  // the row now shows its pending state
             } else if (m_detail == Detail::Output) {
-                if (hit.index < static_cast<int>(m_outs.size())) {
-                    const std::wstring id = m_outs[hit.index].id;
-                    if (!dry) svc::SetDefaultOutput(id);
-                    note(L"default output");
-                    for (auto& d : m_outs) d.isDefault = d.id == id;
+                const std::wstring id = key;
+                if (!dry) svc::SetDefaultAudioOutput(id, m_hwnd, kMsgOutputs);  // off the UI thread; kMsgAudio rebinds the sliders when Windows has switched
+                note(L"default output");
+                for (auto& d : m_outs) d.isDefault = d.id == id;
+                ToggleDetail(Detail::None);
+                return;
+            } else {
+                auto it = std::find_if(m_btRows.begin(), m_btRows.end(), [&](svc::BtDevice const& d) { return d.id == key; });
+                if (it == m_btRows.end() || it->pending) return;
+                const svc::BtDevice d = *it;
+                if (d.audio && !d.audioActive) {  // a paired audio device that is not connected: connect it and make it the output
                     if (!dry) {
-                        m_speaker.Bind(eRender, m_hwnd, kMsgAudio);
-                        m_vol = m_speaker.Available() ? m_speaker.Volume() : 0.0f;
-                        m_muted = m_speaker.Available() && m_speaker.Muted();
+                        svc::ConnectBluetoothAudio(d.id, m_hwnd, kMsgBt);
+                        m_btRows = svc::BtDevices();  // the row shows "Connecting…"
                     }
-                    ToggleDetail(Detail::None);
+                    note(L"bluetooth audio connect");
+                } else if (d.audio && d.audioActive && !d.audioDefault && !d.endpointId.empty()) {  // connected: switch the output to it
+                    if (!dry) svc::SetDefaultAudioOutput(d.endpointId, m_hwnd, kMsgOutputs);
+                    for (auto& o : m_outs) o.isDefault = o.id == d.endpointId;
+                    note(L"bluetooth audio switch");
+                } else if (d.audio) {
+                    return;  // already the output
+                } else {
+                    Hide();
+                    OpenQuietly(L"ms-settings:bluetooth");  // no audio endpoint (a mouse, a keyboard): pairing and the rest are in Settings
                     return;
                 }
-            } else if (hit.index < static_cast<int>(m_btRows.size())) {
-                Hide();
-                OpenQuietly(L"ms-settings:bluetooth");  // Windows has no public "connect" API
-                return;
             }
             break;
+        }
         default: return;
     }
     RedrawRight();  // the new state, on screen now

@@ -191,6 +191,7 @@ private:
     void DrawUsage(ID2D1DeviceContext* dc, float ox, float oy);    // the usage monitor
     void DrawFoot(ID2D1DeviceContext* dc, float ox, float oy);     // the control column's footer: battery, Lock, Settings, Power
     void PressFeel(Hit const* hit, bool down);                     // the mouse-down look of any control, drawn at once
+    std::wstring RowKey(int index) const;                          // the id of the list row at `index` on the open page (Wi-Fi, Bluetooth, output): presses are keyed by it
     void RunDeferred();                                            // service calls queued behind an optimistic redraw
     void RedrawRight();
     void RedrawUsage();
@@ -263,6 +264,7 @@ private:
     wuc::CompositionSpriteShape m_hoverSprite{nullptr}, m_menuHoverSprite{nullptr};
     wuc::CompositionColorBrush m_menuHoverBrush{nullptr};
     wuc::CompositionDrawingSurface m_footSurface{nullptr};
+    std::wstring m_pressedRowKey;                   // the id of the list row the button went down on (a data update must not move or reset it)
     std::vector<std::function<void()>> m_deferred;  // the slow part of a click (radio, DND, ...): runs after the new state is on screen
     D2D1_RECT_F m_lockRect{}, m_modeCard{};  // the control footer's Lock button; the power-mode widget card
     bool m_menuGlassBuilt = false;           // the Power menu's glass is built on its first opening, not with the panel
