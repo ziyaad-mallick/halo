@@ -778,8 +778,6 @@ struct Text {
 // Lays out the panel for the current content and builds its visual tree.
 void Launcher::Build() {
     const float s = m_s;
-    Text txt{m_dwrite};
-    auto fButton = txt.Format(L"Segoe UI Variable Text", 13 * s, DWRITE_FONT_WEIGHT_NORMAL);
 
     // HALO 2.0: the panel is a left column (this Start) plus a right column (the control centre); without halo2 the
     // left column is the whole panel and nothing below changes.
@@ -1903,7 +1901,7 @@ void Launcher::Place() {
     SetWindowPos(m_hwnd, HWND_TOPMOST, x - mx, top, winW, winH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     if (EnvIs(L"HALO_TEST")) {
         auto mid0 = [&](D2D1_RECT_F const& r) {
-            return std::to_wstring(static_cast<int>((r.left + r.right) / 2 + m_shadowM)) + L"," +
+            return std::to_wstring(static_cast<int>((r.left + r.right) / 2 + m_shadowM + m_nw)) + L"," +
                    std::to_wstring(static_cast<int>((r.top + r.bottom) / 2 + kTop * m_s));
         };
         if (m_h2 && !m_ccBase.empty()) {  // the right column's controls, for the screenshot drivers
@@ -1918,7 +1916,7 @@ void Launcher::Place() {
                 mid0(m_modeSeg[0]) + L" seg2=" + mid0(m_modeSeg[2]));
         }
         auto mid = [&](D2D1_RECT_F const& r) {
-            return std::to_wstring(static_cast<int>((r.left + r.right) / 2 + m_shadowM)) + L"," +
+            return std::to_wstring(static_cast<int>((r.left + r.right) / 2 + m_shadowM + m_nw)) + L"," +
                    std::to_wstring(static_cast<int>((r.top + r.bottom) / 2 + kTop * m_s));
         };
         auto none = std::wstring(L"0,0");
