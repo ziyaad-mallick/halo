@@ -1,5 +1,6 @@
 """Execute Start snapshot application without rendering or real shell data."""
 from pathlib import Path
+import os
 import subprocess
 root=Path(__file__).resolve().parents[1]
 source=(root/'src/launcher.cpp').read_text(encoding='utf-8')
@@ -15,12 +16,14 @@ code=r'''
 #include <string>
 #include <vector>
 constexpr int kMaxFiles=12;
+constexpr int kH2Files=10;
 void Log(std::wstring const&){}
 struct IconImage { int width=1,height=1; std::vector<unsigned char> bgra{1}; };
 struct FileEntry { std::wstring name,path; };
 struct State { std::mutex mutex; bool ready=true; std::vector<FileEntry> files{{L"a",L"a.txt"}}; std::map<std::wstring,IconImage> icons{{L".txt",{}}}; };
 struct Fixture {
  bool m_menuOpen=false,m_open=true; int searches=0,layouts=0;
+ bool m_h2=false;
  std::shared_ptr<State> m_recentRefresh=std::make_shared<State>();
  std::vector<FileEntry> m_allFiles{{L"a",L"a.txt"}},m_files=m_allFiles;
  std::map<std::wstring,IconImage> m_fileIcons{{L".txt",{}}};
@@ -44,5 +47,5 @@ out=root/'build/start-snapshot-test'
 out.mkdir(parents=True,exist_ok=True)
 (out/'fixture.cpp').write_text(code,encoding='utf-8')
 exe=out/'fixture.exe'
-subprocess.run([str(root/'toolchain/llvm-mingw/bin/clang++.exe'),'-std=c++23','-O2','-static',str(out/'fixture.cpp'),'-o',str(exe)],check=True)
+subprocess.run([os.environ.get('HALO_CXX') or str(root/'toolchain/llvm-mingw/bin/clang++.exe'),'-std=c++23','-O2','-static',str(out/'fixture.cpp'),'-o',str(exe)],check=True)
 raise SystemExit(subprocess.run([str(exe)]).returncode)

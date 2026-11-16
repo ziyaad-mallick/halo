@@ -135,6 +135,16 @@ inline GlassStyle Glass(halo::settings::Surface const& g) {
     return {t, static_cast<float>(g.blur)};
 }
 
+// Muted text (captions, hints): `dim` on dark glass; on light glass `dim` is 3.6:1, so the soft ink (4.5:1 or better).
+inline D2D1_COLOR_F Muted() { auto const& p = P(); return Dark() ? p.dim : p.textSoft; }
+// A slider: a white fill over the `off` track in both themes, with near-black ink for the glyph that sits on the fill.
+inline D2D1_COLOR_F SliderFill() { return {1, 1, 1, 1}; }
+inline D2D1_COLOR_F SliderOnFill() { return {0.11f, 0.11f, 0.12f, 0.92f}; }
+// A menu raised over Start: a frost over the backdrop (its alpha), then a lighter sheet.
+inline uint8_t MenuVeilAlpha() { return Dark() ? 0xB0 : 0xD8; }
+inline Argb MenuSheet() { return Dark() ? Argb{0x1A, 0xFF, 0xFF, 0xFF} : Argb{0x70, 0xFF, 0xFF, 0xFF}; }
+inline uint8_t MenuShadowAlpha() { return 0x70; }
+
 inline winrt::Windows::UI::Color C(Argb c) { return winrt::Windows::UI::ColorHelper::FromArgb(c.a, c.r, c.g, c.b); }
 inline D2D1_COLOR_F A(D2D1_COLOR_F c, float alpha) { c.a *= alpha; return c; }
 // A wash over glass at `alpha` (as designed for dark): white in dark, half as strong ink in light.

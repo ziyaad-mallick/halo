@@ -39,18 +39,18 @@ using winrt::Windows::Foundation::Numerics::float3;
 namespace halo {
 namespace {
 
-// Logical px.
-constexpr float kMargin = 16, kHeadTop = 20, kHeadH = 28, kCardPad = 12, kIcon = 28;
-constexpr float kAppH = 16, kTitleH = 20, kLineH = 18, kClose = 22, kScrollStep = 64;
+// Logical px; every size is a token (src/tokens.h) or a plain multiple of one.
+constexpr float kMargin = ui::kS4, kGap = ui::kS3, kHeadH = 28, kCardPadX = ui::kS4, kCardPadY = ui::kS3, kIcon = ui::kIconTile;
+constexpr float kTitleH = 20, kLineH = 20, kClose = ui::kS6, kScrollStep = 64, kClearW = 2 * ui::kButton, kEmptyH = 112;
 constexpr int kMaxRows = 30, kMaxBodyLines = 2;
-constexpr float kCalGap = 12, kCalNav = 28, kCalDow = 20, kCalRow = 28, kCalDot = 24;
-constexpr int kHoverMs = 90, kScrollSpringMs = 85;
+constexpr float kCalPad = ui::kS3, kCalNav = ui::kIconTile, kCalDow = ui::kS6, kCalRow = ui::kIconTile;  // the calendar card: padding, month row, weekday letters, a week
+constexpr int kHoverMs = ui::kFastMs, kScrollSpringMs = 85;
 
 winrt::Windows::UI::Color Col(D2D1_COLOR_F c) {
     auto b = [](float v) { return static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
     return winrt::Windows::UI::ColorHelper::FromArgb(b(c.a), b(c.r), b(c.g), b(c.b));
 }
-D2D1_COLOR_F Alpha(D2D1_COLOR_F c, float a) { c.a *= a; return c; }
+D2D1_COLOR_F Cf(theme::Argb a) { return {a.r / 255.0f, a.g / 255.0f, a.b / 255.0f, a.a / 255.0f}; }
 bool In(D2D1_RECT_F const& r, float x, float y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
 D2D1_RECT_F R(float l, float t, float r, float b) { return D2D1::RectF(l, t, r, b); }
 
@@ -76,7 +76,7 @@ struct NotifColumn::Impl {
     bool feedStarted = false, active = false, built = false;
 
     winrt::com_ptr<IDWriteFactory> dw;
-    winrt::com_ptr<IDWriteTextFormat> fHead, fBtn, fApp, fTitle, fBody, fMonth, fDow, fDay, fEmpty, fGlyph;
+    winrt::com_ptr<IDWriteTextFormat> fHead, fBtn, fApp, fTitle, fBody, fMonth, fDow, fDay, fDayB, fEmpty, fEmptyB, fGlyph;
 
     float W = 0, H = 0, s = 1;
 
@@ -86,6 +86,7 @@ struct NotifColumn::Impl {
     wuc::CompositionDrawingSurface headS{nullptr}, calS{nullptr}, listS{nullptr}, closeS{nullptr};
     wuc::ShapeVisual plateV{nullptr};
     wuc::CompositionRoundedRectangleGeometry plateG{nullptr};
+    wuc::CompositionColorBrush plateB{nullptr};
     wuc::CubicBezierEasingFunction ease{nullptr};
     float listSurfaceH = 0;
 
@@ -97,13 +98,14 @@ struct NotifColumn::Impl {
     };
     std::vector<Row> rows;
     float contentH = 0, scroll = 0;
-    float listTop = 0, listH = 0, calTop = 0, calH = 0;
+    float listTop = 0, listH = 0, calTop = 0, calH = 0, headTop = 0;
     D2D1_RECT_F clearR{}, prevR{}, nextR{}, monthR{};
     int calYear = 0, calMonth = 1, todayY = 0, todayM = 1, todayD = 1, firstDow = 0;
 
     enum class Kind { None, Row, Close, Clear, Prev, Next, Month };
-    Kind hover = Kind::None;
-    int hoverRow = -1;
+    Kind hover = Kind::None, pressKind = Kind::None;
+    int hoverRow = -1, pressRow = -1;
+    bool down = false;  // a button is down: the control under it shows its pressed fill
 
     Impl(NotifColumn* a, HINSTANCE i, wuc::Compositor c, wuc::CompositionGraphicsDevice g)
         : api(a), inst(i), comp(std::move(c)), gdev(std::move(g)) {
@@ -212,13 +214,15 @@ struct NotifColumn::Impl {
     void DrawClose();
     void SetToday();
     void ShiftMonth(int d);
+    void Unpress();
+    D2D1_COLOR_F HoverFill(Kind k) const { return down && pressKind == k ? Cf(theme::P().press) : theme::P().fillHover; }
 
     // ---- pointer ----
     struct Hit { Kind kind = Kind::None; int row = -1; };
     D2D1_RECT_F RowRect(int i) const { return R(kMargin * s, rows[i].y, W - kMargin * s, rows[i].y + rows[i].h); }  // content space
     D2D1_RECT_F CloseRect(int i) const {
         auto r = RowRect(i);
-        return R(r.right - (kCardPad - 2 + kClose) * s, r.top + (kCardPad - 4) * s, r.right - (kCardPad - 2) * s, r.top + (kCardPad - 4 + kClose) * s);
+        return R(r.right - (kCardPadX - 2 + kClose) * s, r.top + (kCardPadY - 4) * s, r.right - (kCardPadX - 2) * s, r.top + (kCardPadY - 4 + kClose) * s);
     }
     Hit HitAt(float x, float y) const;
     void SetHover(Hit h);
@@ -232,16 +236,18 @@ wuc::ContainerVisual NotifColumn::Impl::Build(float w, float h, float scale) {
     Release();
     W = w; H = h; s = scale;
     if (!dw) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dw.put()));
-    fHead = Format(ui::kHeading, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fBtn = Format(ui::kCaption, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fHead = Format(ui::kBody, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fBtn = Format(ui::kCaption, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     fApp = Format(ui::kCaption, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     fTitle = Format(ui::kBody, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fBody = Format(13, DWRITE_FONT_WEIGHT_NORMAL, true);
+    fBody = Format(ui::kBody, DWRITE_FONT_WEIGHT_NORMAL, true);
     fMonth = Format(ui::kBody, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fDow = Format(11, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fDay = Format(13, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fEmpty = Format(ui::kBody, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fGlyph = Format(14, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fDow = Format(ui::kCaption, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fDay = Format(ui::kCaption, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fDayB = Format(ui::kCaption, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fEmpty = Format(ui::kCaption, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fEmptyB = Format(ui::kBody, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fGlyph = Format(ui::kBody, DWRITE_FONT_WEIGHT_NORMAL, false, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
     wchar_t first[4] = L"";
     firstDow = 0;
@@ -251,17 +257,18 @@ wuc::ContainerVisual NotifColumn::Impl::Build(float w, float h, float scale) {
     root = comp.CreateContainerVisual();
     root.Size({W, H});
 
-    // Calendar block: a hairline, then month + arrows, weekday initials, the weeks. Height follows the month's rows.
-    const auto grid = start::MakeMonthGrid(calYear, calMonth, calYear == todayY && calMonth == todayM ? todayD : 0, firstDow);
-    calH = (kCalGap + kCalNav + kCalDow + 6 * kCalRow + 4) * s;  // always six rows: the block never changes height
-    (void)grid;
-    calTop = H - (kMargin - 4) * s - calH;
-    listTop = (kHeadTop + kHeadH + 8) * s;
-    listH = std::max(0.0f, calTop - 4 * s - listTop);
+    // Top to bottom: the calendar card (month and arrows, weekday initials, six weeks: it never changes height), then the
+    // heading "Notifications" with Clear all, then the notification cards.
+    calH = (kCalPad + kCalNav + kCalDow + 6 * kCalRow + kCalPad) * s;
+    calTop = kMargin * s;
+    headTop = calTop + calH + kGap * s;
+    listTop = headTop + kHeadH * s + ui::kS2 * s;
+    listH = std::max(0.0f, H - kMargin * s - listTop);
 
     headV = nullptr;
-    headS = Surface(W, (kHeadTop + kHeadH) * s);
-    headV = SurfaceVisual(headS, W, (kHeadTop + kHeadH) * s);
+    headS = Surface(W, kHeadH * s);
+    headV = SurfaceVisual(headS, W, kHeadH * s);
+    headV.Offset({0, headTop, 0});
     root.Children().InsertAtTop(headV);
 
     calS = Surface(W - 2 * kMargin * s, calH);
@@ -278,11 +285,13 @@ wuc::ContainerVisual NotifColumn::Impl::Build(float w, float h, float scale) {
     listClip.Children().InsertAtTop(listHold);
     root.Children().InsertAtTop(listClip);
 
-    // Hover plate (one shape that glides between cards) and the x that appears on the card under the pointer.
+    // Hover plate (one shape that follows the card under the pointer: the palette's hover fill, the card's own radius) and
+    // the x that appears on that card.
     plateG = comp.CreateRoundedRectangleGeometry();
-    plateG.CornerRadius({10 * s, 10 * s});
+    plateG.CornerRadius({ui::kRadiusLarge * s, ui::kRadiusLarge * s});
     auto sprite = comp.CreateSpriteShape(plateG);
-    sprite.FillBrush(comp.CreateColorBrush(Col(theme::P().fillHover)));
+    plateB = comp.CreateColorBrush(Col(theme::P().fillHover));
+    sprite.FillBrush(plateB);
     plateV = comp.CreateShapeVisual();
     plateV.Size({W, listH});
     plateV.Shapes().Append(sprite);
@@ -298,6 +307,8 @@ wuc::ContainerVisual NotifColumn::Impl::Build(float w, float h, float scale) {
     listSurfaceH = 0;
     hover = Kind::None;
     hoverRow = -1;
+    down = false;
+    pressKind = Kind::None;
     scroll = 0;
     DrawHead();
     DrawCal();
@@ -309,9 +320,9 @@ void NotifColumn::Impl::Release() {
     built = false;
     root = nullptr; listClip = nullptr; listHold = nullptr;
     headV = nullptr; calV = nullptr; listV = nullptr; closeV = nullptr; plateV = nullptr; plateG = nullptr;
-    headS = nullptr; calS = nullptr; listS = nullptr; closeS = nullptr;
+    headS = nullptr; calS = nullptr; listS = nullptr; closeS = nullptr; plateB = nullptr;
     rows.clear();
-    fHead = fBtn = fApp = fTitle = fBody = fMonth = fDow = fDay = fEmpty = fGlyph = nullptr;
+    fHead = fBtn = fApp = fTitle = fBody = fMonth = fDow = fDay = fDayB = fEmpty = fEmptyB = fGlyph = nullptr;
 }
 
 void NotifColumn::Impl::SetActive(bool on) {
@@ -351,12 +362,13 @@ void NotifColumn::Impl::DrawHead() {
     auto const& pal = theme::P();
     const bool any = !rows.empty();
     Paint(headS, [&](ID2D1DeviceContext* dc, float ox, float oy) {
-        const float top = kHeadTop * s, h = kHeadH * s;
-        Text(dc, L"Notifications", fHead.get(), R(ox + kMargin * s, oy + top, ox + W - kMargin * s - 80 * s, oy + top + h), pal.text);
-        clearR = R(W - kMargin * s - 64 * s, top, W - kMargin * s, top + h);
+        const float h = kHeadH * s, cw = kClearW * s;
+        Text(dc, L"Notifications", fHead.get(), R(ox + (kMargin + ui::kS1) * s, oy, ox + W - kMargin * s - cw, oy + h), pal.text);
+        clearR = R(W - kMargin * s - cw, headTop, W - kMargin * s, headTop + h);  // column coordinates (the surface sits at headTop)
         if (any) {
-            if (hover == Kind::Clear) Fill(dc, R(ox + clearR.left, oy + clearR.top + 2 * s, ox + clearR.right, oy + clearR.bottom - 2 * s), 10 * s, pal.fillHover);
-            Text(dc, L"Clear", fBtn.get(), R(ox + clearR.left, oy + clearR.top, ox + clearR.right, oy + clearR.bottom), pal.textSoft, DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (hover == Kind::Clear || (down && pressKind == Kind::Clear))
+                Fill(dc, R(ox + clearR.left, oy, ox + clearR.right, oy + h), ui::kRadiusHover * s, HoverFill(Kind::Clear));
+            Text(dc, L"Clear all", fBtn.get(), R(ox + clearR.left, oy, ox + clearR.right, oy + h), pal.textSoft, DWRITE_TEXT_ALIGNMENT_CENTER);
         }
     });
     if (!any) clearR = {};
@@ -370,7 +382,7 @@ void NotifColumn::Impl::DrawClose() {
         dc->CreateSolidColorBrush(pal.fillPress, b.put());
         dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(ox + d / 2, oy + d / 2), d / 2, d / 2), b.get());
         dc->CreateSolidColorBrush(pal.text, b.put());
-        const float a = d * 0.28f, cx = ox + d / 2, cy = oy + d / 2, t = std::max(1.2f, 1.3f * s);
+        const float a = d * 0.28f, cx = ox + d / 2, cy = oy + d / 2, t = std::max(1.0f, ui::kHair * 1.5f * s);
         dc->DrawLine(D2D1::Point2F(cx - a, cy - a), D2D1::Point2F(cx + a, cy + a), b.get(), t);
         dc->DrawLine(D2D1::Point2F(cx - a, cy + a), D2D1::Point2F(cx + a, cy - a), b.get(), t);
     });
@@ -382,9 +394,9 @@ void NotifColumn::Impl::Relayout() {
     (void)pal;
     auto items = feed.Items();
     if (items.size() > kMaxRows) items.resize(kMaxRows);
-    const float cardW = W - 2 * kMargin * s, textX = (kCardPad + kIcon + 10) * s, textW = cardW - textX - kCardPad * s;
+    const float cardW = W - 2 * kMargin * s, textX = (kCardPadX + kIcon + ui::kS3) * s, textW = cardW - textX - kCardPadX * s;
     rows.clear();
-    float y = 4 * s;
+    float y = ui::kS1 * s;
     for (auto& n : items) {
         Row r;
         r.n = n;
@@ -409,9 +421,9 @@ void NotifColumn::Impl::Relayout() {
                 }
             }
         }
-        r.h = std::round((kCardPad + kAppH + 2 + kTitleH + (lines ? 2 + lines * kLineH : 0) + kCardPad) * s);
+        r.h = std::round((kCardPadY + kTitleH + (lines ? ui::kS1 + lines * kLineH : 0) + kCardPadY) * s);  // title (with the age), then up to two lines
         r.y = y;
-        y += r.h + 3 * s;  // the cards of one list sit 3 px apart
+        y += r.h + kGap * s;  // separate cards, 12 px apart
         rows.push_back(std::move(r));
     }
     contentH = rows.empty() ? 0 : y;
@@ -439,39 +451,44 @@ void NotifColumn::Impl::DrawList() {
         plateV.Size({W, h});
     }
     listHold.Offset({0, -scroll, 0});
-    const float cardW = W - 2 * kMargin * s, textX = (kCardPad + kIcon + 10) * s, textW = cardW - textX - kCardPad * s;
+    const float cardW = W - 2 * kMargin * s, textX = (kCardPadX + kIcon + ui::kS3) * s, textW = cardW - textX - kCardPadX * s;
     Paint(listS, [&](ID2D1DeviceContext* dc, float ox, float oy) {
-        if (rows.empty()) {
-            Text(dc, feed.Ready() ? L"No new notifications" : L"Checking…", fEmpty.get(),
-                 R(ox, oy + listH * 0.32f, ox + W, oy + listH * 0.32f + 24 * s), pal.dim, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (rows.empty()) {  // an empty state: one card, a bell, what it means
+            const float l = ox + kMargin * s, t = oy + ui::kS1 * s, ch = kEmptyH * s;
+            Fill(dc, R(l, t, l + cardW, t + ch), ui::kRadiusLarge * s, pal.fill);
+            const bool ready = feed.Ready();
+            const float cx = l + cardW / 2, top = t + ui::kS4 * s;
+            winrt::com_ptr<IDWriteTextFormat> fBell;
+            dw->CreateTextFormat(ui::kFontIcons, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, ui::kIconTile * s, L"en-us", fBell.put());
+            if (fBell) fBell->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            Text(dc, L"\uE7ED", fBell.get(), R(cx - ui::kS6 * s, top, cx + ui::kS6 * s, top + ui::kIconTile * s), theme::Muted(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            Text(dc, ready ? L"No new notifications" : L"Checking…", fEmptyB.get(), R(l, top + (ui::kIconTile + ui::kS2) * s, l + cardW, top + (ui::kIconTile + ui::kS2 + kTitleH) * s), pal.text, DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (ready) Text(dc, L"You're all caught up.", fEmpty.get(), R(l, top + (ui::kIconTile + ui::kS2 + kTitleH) * s, l + cardW, top + (ui::kIconTile + ui::kS2 + kTitleH + ui::kS4) * s), theme::Muted(), DWRITE_TEXT_ALIGNMENT_CENTER);
             return;
         }
-        const auto tn = theme::TonalNow();
         for (size_t ri = 0; ri < rows.size(); ri++) {
             auto const& r = rows[ri];
             const float l = ox + kMargin * s, t = oy + r.y;
-            // Connected list (Pixel): big corners at the ends of the stack, tight ones between cards.
-            const float big = 24 * s, small = 7 * s;
-            FillCorners(dc, R(l, t, l + cardW, t + r.h), ri == 0 ? big : small, ri + 1 == rows.size() ? big : small, tn.tint1);
+            Fill(dc, R(l, t, l + cardW, t + r.h), ui::kRadiusLarge * s, pal.fill);  // a separate radius-20 card
             // icon: the app's own, else a letter tile
-            const float ix = l + kCardPad * s, iy = t + kCardPad * s, isz = kIcon * s;
+            const float ix = l + kCardPadX * s, iy = t + kCardPadY * s, isz = kIcon * s;
             if (auto const* ic = feed.Icon(r.n.appKey); ic && ic->w && ic->h) {
                 winrt::com_ptr<ID2D1Bitmap> bmp;
                 if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(ic->w, ic->h), ic->px.data(), ic->w * 4,
                                                D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)), bmp.put())))
                     dc->DrawBitmap(bmp.get(), R(ix, iy, ix + isz, iy + isz), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             } else {
-                Fill(dc, R(ix, iy, ix + isz, iy + isz), 8 * s, Alpha(pal.accent, 0.9f));
+                Fill(dc, R(ix, iy, ix + isz, iy + isz), ui::kS1 * 1.5f * s, pal.accent);
                 std::wstring letter = r.n.app.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(std::towupper(r.n.app[0])));
                 Text(dc, letter, fTitle.get(), R(ix, iy, ix + isz, iy + isz), pal.onAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
             }
-            const float tx = l + textX;
-            Text(dc, r.n.app + L"  ·  " + Rel(r.n.ft), fApp.get(), R(tx, t + kCardPad * s, tx + textW, t + (kCardPad + kAppH) * s), pal.dim,
-                 DWRITE_TEXT_ALIGNMENT_LEADING, true);
-            const float ty = t + (kCardPad + kAppH + 2) * s;
-            Text(dc, r.n.title.empty() ? r.n.app : r.n.title, fTitle.get(), R(tx, ty, tx + textW, ty + kTitleH * s), pal.text, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+            const float tx = l + textX, ty = t + kCardPadY * s;
+            const std::wstring age = Rel(r.n.ft);  // 14 semibold title, the age as a caption at the right end of the line
+            const float ageW = 40 * s;
+            Text(dc, r.n.title.empty() ? r.n.app : r.n.title, fTitle.get(), R(tx, ty, tx + textW - ageW, ty + kTitleH * s), pal.text, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+            Text(dc, age, fApp.get(), R(tx + textW - ageW, ty, tx + textW, ty + kTitleH * s), theme::Muted(), DWRITE_TEXT_ALIGNMENT_TRAILING);
             if (!r.body.empty())
-                Text(dc, r.body, fBody.get(), R(tx, ty + (kTitleH + 2) * s, tx + textW, t + r.h - kCardPad * s), pal.textSoft);
+                Text(dc, r.body, fBody.get(), R(tx, ty + (kTitleH + ui::kS1) * s, tx + textW, t + r.h - kCardPadY * s), pal.textSoft);
         }
     });
 }
@@ -487,42 +504,41 @@ void NotifColumn::Impl::DrawCal() {
     wchar_t title[64] = L"";
     if (!GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, L"MMMM yyyy", title, 64, nullptr)) wcscpy(title, L"Calendar");
 
-    const float navTop = kCalGap * s, navH = kCalNav * s, dowTop = navTop + navH, dowH = kCalDow * s, rowsTop = dowTop + dowH, rowH = kCalRow * s;
-    const float btn = 28 * s;
-    // hit rects, column-local (the surface sits at x = kMargin * s, y = calTop)
+    const float pad = kCalPad * s, navTop = pad, navH = kCalNav * s, dowTop = navTop + navH, dowH = kCalDow * s, rowsTop = dowTop + dowH, rowH = kCalRow * s;
+    const float btn = kCalNav * s;
+    // hit rects, column coordinates (the surface sits at x = kMargin * s, y = calTop)
     const float x0 = kMargin * s;
-    monthR = R(x0, calTop + navTop, x0 + w - 2 * btn, calTop + navTop + navH);
-    prevR = R(x0 + w - 2 * btn, calTop + navTop, x0 + w - btn, calTop + navTop + navH);
-    nextR = R(x0 + w - btn, calTop + navTop, x0 + w, calTop + navTop + navH);
+    monthR = R(x0 + pad, calTop + navTop, x0 + w - pad - 2 * btn, calTop + navTop + navH);
+    prevR = R(x0 + w - pad - 2 * btn, calTop + navTop, x0 + w - pad - btn, calTop + navTop + navH);
+    nextR = R(x0 + w - pad - btn, calTop + navTop, x0 + w - pad, calTop + navTop + navH);
 
     Paint(calS, [&](ID2D1DeviceContext* dc, float ox, float oy) {
+        Fill(dc, R(ox, oy, ox + w, oy + calH), ui::kRadiusLarge * s, pal.fill);  // the card
         winrt::com_ptr<ID2D1SolidColorBrush> b;
-        dc->CreateSolidColorBrush(pal.line, b.put());
-        dc->FillRectangle(R(ox, oy, ox + w, oy + std::max(1.0f, std::round(s))), b.get());
-        Text(dc, title, fMonth.get(), R(ox, oy + navTop, ox + w - 2 * btn, oy + navTop + navH), pal.text);
+        Text(dc, title, fMonth.get(), R(ox + pad, oy + navTop, ox + w - pad - 2 * btn, oy + navTop + navH), pal.text);
         for (int i = 0; i < 2; i++) {
-            const bool h = (i == 0 && hover == Kind::Prev) || (i == 1 && hover == Kind::Next);
-            const float bx = ox + w - (2 - i) * btn;
-            if (h) Fill(dc, R(bx + 2 * s, oy + navTop + 2 * s, bx + btn - 2 * s, oy + navTop + navH - 2 * s), 10 * s, pal.fillHover);
+            const Kind k = i == 0 ? Kind::Prev : Kind::Next;
+            const float bx = ox + w - pad - (2 - i) * btn;
+            if (hover == k || (down && pressKind == k))
+                Fill(dc, R(bx, oy + navTop, bx + btn, oy + navTop + navH), ui::kRadiusHover * s, HoverFill(k));
             Text(dc, i == 0 ? L"‹" : L"›", fGlyph.get(), R(bx, oy + navTop, bx + btn, oy + navTop + navH), pal.textSoft, DWRITE_TEXT_ALIGNMENT_CENTER);
         }
         static const wchar_t* kDow[7] = {L"S", L"M", L"T", L"W", L"T", L"F", L"S"};
-        const float cw = w / 7;
+        const float cw = (w - 2 * pad) / 7, gx = ox + pad;
         for (int c = 0; c < 7; c++)
-            Text(dc, kDow[(firstDow + c) % 7], fDow.get(), R(ox + c * cw, oy + dowTop, ox + (c + 1) * cw, oy + dowTop + dowH), pal.faint, DWRITE_TEXT_ALIGNMENT_CENTER);
+            Text(dc, kDow[(firstDow + c) % 7], fDow.get(), R(gx + c * cw, oy + dowTop, gx + (c + 1) * cw, oy + dowTop + dowH), theme::Muted(), DWRITE_TEXT_ALIGNMENT_CENTER);
         for (int i = 0; i < grid.rows * 7; i++) {
             if (!grid.day[i]) continue;
             const int r = i / 7, c = i % 7;
-            const D2D1_RECT_F cell = R(ox + c * cw, oy + rowsTop + r * rowH, ox + (c + 1) * cw, oy + rowsTop + (r + 1) * rowH);
+            const D2D1_RECT_F cell = R(gx + c * cw, oy + rowsTop + r * rowH, gx + (c + 1) * cw, oy + rowsTop + (r + 1) * rowH);
             const bool today = i == grid.todayCell;
-            if (today) {
-                const float d = kCalDot * s, cx = (cell.left + cell.right) / 2, cy = (cell.top + cell.bottom) / 2;
-                const auto tn = theme::TonalNow();
-                dc->CreateSolidColorBrush(tn.pc, b.put());
-                dc->FillRoundedRectangle(D2D1::RoundedRect(R(cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2), d * 0.34f, d * 0.34f), b.get());
+            if (today) {  // today: a solid accent circle with white ink
+                const float d = rowH, cx = (cell.left + cell.right) / 2, cy = (cell.top + cell.bottom) / 2;
+                dc->CreateSolidColorBrush(pal.accent, b.put());
+                dc->FillEllipse(D2D1::Ellipse({cx, cy}, d / 2, d / 2), b.get());
             }
             const int dow = (firstDow + c) % 7;
-            Text(dc, std::to_wstring(grid.day[i]), fDay.get(), cell, today ? theme::TonalNow().onpc : (dow == 0 || dow == 6 ? pal.dim : pal.text), DWRITE_TEXT_ALIGNMENT_CENTER);
+            Text(dc, std::to_wstring(grid.day[i]), (today ? fDayB : fDay).get(), cell, today ? pal.onAccent : (dow == 0 || dow == 6 ? theme::Muted() : pal.textSoft), DWRITE_TEXT_ALIGNMENT_CENTER);
         }
     });
 }
@@ -571,6 +587,17 @@ void NotifColumn::Impl::SetHover(Hit h) {
     }
 }
 
+// Mouse-down: the control under the pointer takes the palette's pressed fill at once; Unpress (mouse-up) puts it back.
+void NotifColumn::Impl::Unpress() {
+    if (!built || !down) return;
+    const Kind k = pressKind;
+    down = false;
+    pressKind = Kind::None;
+    if (plateB) plateB.Color(Col(theme::P().fillHover));
+    if (k == Kind::Clear) DrawHead();
+    if (k == Kind::Prev || k == Kind::Next) DrawCal();
+}
+
 void NotifColumn::Impl::ScrollTo(float v) {
     const float maxScroll = std::max(0.0f, contentH - listH);
     scroll = std::clamp(v, 0.0f, maxScroll);
@@ -600,6 +627,36 @@ bool NotifColumn::Contains(float x, float y) const { return m->built && x >= 0 &
 
 void NotifColumn::Move(float x, float y) { m->SetHover(m->HitAt(x, y)); }
 void NotifColumn::Leave() { m->SetHover({}); }
+
+void NotifColumn::Press(float x, float y) {
+    if (!m->built || !Contains(x, y)) return;
+    const auto h = m->HitAt(x, y);
+    if (h.kind == Impl::Kind::None) return;
+    m->down = true;
+    m->pressKind = h.kind;
+    m->pressRow = h.row;
+    switch (h.kind) {
+        case Impl::Kind::Clear: m->DrawHead(); break;
+        case Impl::Kind::Prev:
+        case Impl::Kind::Next: m->DrawCal(); break;
+        case Impl::Kind::Row:
+        case Impl::Kind::Close:
+            if (h.row >= 0 && h.row < static_cast<int>(m->rows.size())) {  // the card's plate goes to the pressed fill, now (even before any hover)
+                auto r = m->RowRect(h.row);
+                m->plateG.StopAnimation(L"Size");
+                m->plateG.StopAnimation(L"Offset");
+                m->plateG.Size({r.right - r.left, r.bottom - r.top});
+                m->plateG.Offset({r.left, r.top});
+                m->plateV.StopAnimation(L"Opacity");
+                m->plateV.Opacity(1.0f);
+                m->plateB.Color(Col(theme::P().press.a ? Cf(theme::P().press) : theme::P().fillHover));
+            }
+            break;
+        default: break;
+    }
+}
+
+void NotifColumn::Unpress() { m->Unpress(); }
 
 bool NotifColumn::Wheel(float x, float y, int delta) {
     if (!Contains(x, y) || m->contentH <= m->listH) return Contains(x, y);
