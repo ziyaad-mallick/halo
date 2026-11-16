@@ -648,6 +648,29 @@ void Launcher::BuildIndex() {
     }).detach();
 }
 
+// Halo runs for days, so the index built at startup goes stale: an app installed since is missing, one removed
+// still listed. This rescans every source on a thread (Start-menu shortcuts first, so they win a name over the
+// Apps folder, as in BuildIndex) and posts the whole result for kMsgAppsFolder to swap in (wParam 1).
+void Launcher::RefreshIndex() {
+    if (GetEnvironmentVariableW(L"HALO_TEST_APPS", nullptr, 0)) return;  // tools/start_preview owns the index
+    const ULONGLONG now = GetTickCount64();
+    if (m_rescanAt && now - m_rescanAt < 10000) return;                 // opening Start twice in a row
+    if (m_rescanning.exchange(true)) return;
+    m_rescanAt = now;
+    std::thread([hwnd = m_hwnd] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        auto* all = new Found;
+        for (auto const& id : {FOLDERID_Programs, FOLDERID_CommonPrograms}) {
+            wchar_t* dir = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &dir))) ScanLinks(dir, *all, 0);
+            CoTaskMemFree(dir);
+        }
+        ScanAppsFolder(*all);
+        if (SUCCEEDED(co)) CoUninitialize();
+        if (!PostMessageW(hwnd, kMsgAppsFolder, 1, reinterpret_cast<LPARAM>(all))) delete all;
+    }).detach();
+}
+
 // Adds the apps whose name is not in the index yet (the first entry of a name wins), keeping it A to Z.
 void Launcher::AddToIndex(Found const& found) {
     for (auto const& [name, path] : found) {
@@ -1942,6 +1965,7 @@ std::wstring Launcher::IconKey(std::wstring const& path) {
 void Launcher::Prefetch() {
     Refresh();
     if (!m_indexed) BuildIndex();
+    else RefreshIndex();
     wchar_t name[256] = {};
     ULONG n = ARRAYSIZE(name);
     if (!GetUserNameExW(kNameDisplay, name, &n) || !name[0]) {
@@ -2688,9 +2712,17 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case kMsgAppsFolder: {
             std::unique_ptr<Found> more(reinterpret_cast<Found*>(l));
             const size_t before = m_index.size();
-            AddToIndex(*more);
-            Log(L"app index: " + std::to_wstring(m_index.size() - before) + L" more from the Apps folder, " +
-                std::to_wstring(m_index.size()) + L" apps");
+            if (w == 1) {  // a full rescan (RefreshIndex): replaces the index, so removed apps go too
+                m_rescanning = false;
+                m_index.clear();
+                AddToIndex(*more);
+                if (m_index.size() != before)
+                    Log(L"app index rescanned: " + std::to_wstring(before) + L" -> " + std::to_wstring(m_index.size()) + L" apps");
+            } else {
+                AddToIndex(*more);
+                Log(L"app index: " + std::to_wstring(m_index.size() - before) + L" more from the Apps folder, " +
+                    std::to_wstring(m_index.size()) + L" apps");
+            }
             if (m_open && Listing()) {  // what is on screen may have changed
                 // New apps slot in among the matches: keep the selected item selected, not the selected row, so
                 // an Enter already on its way launches what the user was looking at.

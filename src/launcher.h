@@ -23,6 +23,7 @@
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Composition.Desktop.h>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -127,6 +128,7 @@ private:
     wuc::CompositionBrush FileBrush(std::wstring const& path, float logicalPx);
     static std::vector<FileEntry> LoadFiles();
     void BuildIndex();  // every app, once (the Apps folder arrives later, on kMsgAppsFolder)
+    void RefreshIndex();  // rescans everything on a thread and swaps the result in: installs and removals since startup
     void AddToIndex(Found const& found);
     void Prefetch();
     void Refresh();
@@ -366,6 +368,8 @@ private:
     int m_avatarPx = 0;
     bool m_avatarTried = false;
     bool m_indexed = false;
+    std::atomic<bool> m_rescanning{false};  // a RefreshIndex thread is out; cleared when its result is swapped in
+    ULONGLONG m_rescanAt = 0;               // GetTickCount64 of the last RefreshIndex
     bool m_dryRun = false;
     float m_iconPx = 44;           // app icon size, logical px
 
