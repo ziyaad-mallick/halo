@@ -132,16 +132,13 @@ D2D1_COLOR_F MutedOf(bool) { return theme::Muted(); }
 constexpr float kPad = ui::kS6;
 constexpr float kLabelH = 16;
 constexpr float kIconSize = ui::kAppIcon;
-constexpr float kIconPad = ui::kS2;     // the hover plate around an app icon
-constexpr float kSearchTop = ui::kS4, kSearchH = ui::kSearchH;
+constexpr float kSearchTop = ui::kS6, kSearchH = ui::kSearchH;
 constexpr float kSearchLeft = ui::kS4 + ui::kIcon + ui::kS2, kSearchRight = ui::kS4;  // the field's text: after the glyph, and its right padding
 constexpr int kCaretBlinkMs = 530;
 constexpr float kMenuDim = 0.45f;  // how far the panel dims behind the open Power menu
-constexpr float kAppRowH = 64;
-constexpr float kFileIcon = 32, kFileCellH = 70, kFileRowPitch = 74;
+constexpr float kAppRowH = start::tk::kAppCellH;  // an app cell: icon and name (the same grid as 2.0)
 constexpr float kResultRowH = 36, kResultIcon = 24;
-constexpr float kBottomH = 56;
-constexpr float kButtonH = ui::kButton;
+constexpr float kBottomH = 64;  // classic's footer: the hairline, then 12, the 36 px buttons and 16
 constexpr float kAvatar = ui::kAvatar;
 constexpr float kMenuW = 240;  // wide enough for "Use Windows taskbar" and its hint
 constexpr float kMenuRowH = ui::kMenuRowH;
@@ -549,10 +546,15 @@ void Launcher::Note(std::wstring const& target) {
 // first kMaxFiles, search looks through all kKeepFiles.
 std::vector<Launcher::FileEntry> Launcher::LoadFiles() {
     std::vector<FileEntry> files;
-    wchar_t* dir = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_Recent, 0, nullptr, &dir))) return files;
-    std::wstring folder = std::wstring(dir) + L"\\";
-    CoTaskMemFree(dir);
+    std::wstring folder;
+    if (wchar_t over[MAX_PATH]; GetEnvironmentVariableW(L"HALO_TEST_RECENT_DIR", over, MAX_PATH)) {  // tools/start_preview: a folder of stand-in shortcuts, never the real Recent
+        folder = std::wstring(over) + L"\\";
+    } else {
+        wchar_t* dir = nullptr;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_Recent, 0, nullptr, &dir))) return files;
+        folder = std::wstring(dir) + L"\\";
+        CoTaskMemFree(dir);
+    }
 
     struct Link {
         std::wstring path;
@@ -601,6 +603,28 @@ void Launcher::BuildIndex() {
     LARGE_INTEGER t0, t1, fq;
     QueryPerformanceCounter(&t0);
     Found found;
+    if (wchar_t over[MAX_PATH]; GetEnvironmentVariableW(L"HALO_TEST_APPS", over, MAX_PATH)) {  // tools/start_preview: stand-in apps, not the Start menu
+        if (HANDLE f = CreateFileW(over, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr); f != INVALID_HANDLE_VALUE) {
+            std::string data(GetFileSize(f, nullptr), '\0');
+            DWORD got = 0;
+            ReadFile(f, data.data(), static_cast<DWORD>(data.size()), &got, nullptr);
+            CloseHandle(f);
+            data.resize(got);
+            size_t at = 0;
+            while (at < data.size()) {
+                size_t end = data.find('\n', at);
+                if (end == std::string::npos) end = data.size();
+                std::wstring line = Utf16(data.substr(at, end - at));
+                while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) line.pop_back();
+                if (auto bar = line.find(L'|'); bar != std::wstring::npos) found.push_back({line.substr(0, bar), line.substr(bar + 1)});
+                at = end + 1;
+            }
+        }
+        m_index.clear();
+        AddToIndex(found);
+        m_indexed = true;
+        return;
+    }
     for (auto const& id : {FOLDERID_Programs, FOLDERID_CommonPrograms}) {
         wchar_t* dir = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &dir))) ScanLinks(dir, found, 0);
@@ -820,13 +844,14 @@ void Launcher::Build() {
         filesTop = m_plan.filesTop;
         dividerY = panelH;  // no footer in the middle card: its body runs to the bottom edge
     } else {
-        appsLabelY = searchBot + 16;
-        appsTop = appsLabelY + kLabelH + 6;
-        filesLabelY = m_showApps ? appsTop + kAppRowH + 14 : searchBot + 16;
-        filesTop = filesLabelY + kLabelH + 6;
-        const float fileRows = maxFiles > kFileCols ? 2.0f : 1.0f;
-        dividerY = std::max(m_showFiles ? filesTop + (fileRows - 1) * kFileRowPitch + kFileCellH + 12
-                                        : m_showApps ? appsTop + kAppRowH + 2 : searchBot + 12,
+        appsLabelY = searchBot + ui::kS6;
+        appsTop = appsLabelY + kLabelH + ui::kS2;
+        filesLabelY = m_showApps ? appsTop + kAppRowH + ui::kS4 : appsLabelY;
+        filesTop = filesLabelY + kLabelH + ui::kS2;
+        const int fileRows = std::max<int>(1, (static_cast<int>(m_files.size()) + 1) / 2);  // 2 columns of 40 px rows
+        const float contentEnd = m_showFiles ? filesTop + fileRows * start::tk::kFileRowH
+                                             : m_showApps ? appsTop + kAppRowH : searchBot;
+        dividerY = std::max(contentEnd + ui::kS4,
                             searchBot + 8 + 4 + kMaxResults * kResultRowH + 4);  // a page of results always fits
         panelH = dividerY + 1 + kBottomH;
     }
@@ -845,20 +870,13 @@ void Launcher::Build() {
     m_appCells.clear();
     m_fileCells.clear();
     for (size_t i = 0; i < m_apps.size(); i++) {
-        float x = kPad + (i % appCols + 0.5f) * colW - iconSz / 2,
-              y = m_h2 ? appsTop + (i / appCols) * start::kAppRowH + start::tk::kAppPadTop
-                       : appsTop + (i / appCols) * kAppRowH + (kAppRowH - kIconSize) / 2;
+        float x = kPad + (i % appCols + 0.5f) * colW - iconSz / 2, y = appsTop + (i / appCols) * kAppRowH + start::tk::kAppPadTop;
         m_appCells.push_back(R(x * s, y * s, (x + iconSz) * s, (y + iconSz) * s));
     }
     const float fileColW = (innerW - start::tk::kPad) / 2;  // HALO 2.0: recent files are a two-column list of rows
-    for (size_t i = 0; i < m_files.size(); i++) {
-        if (m_h2) {
-            float x = kPad + (i % 2) * (fileColW + start::tk::kPad), y = filesTop + (i / 2) * start::tk::kFileRowH;
-            m_fileCells.push_back(R(x * s, y * s, (x + fileColW) * s, (y + start::tk::kFileRowH) * s));
-            continue;
-        }
-        float x = kPad + (i % kFileCols) * colW + 2, y = filesTop + (i / kFileCols) * kFileRowPitch;
-        m_fileCells.push_back(R(x * s, y * s, (x + colW - 4) * s, (y + kFileCellH) * s));
+    for (size_t i = 0; i < m_files.size(); i++) {  // two columns of 40 px rows, in both modes
+        float x = kPad + (i % 2) * (fileColW + start::tk::kPad), y = filesTop + (i / 2) * start::tk::kFileRowH;
+        m_fileCells.push_back(R(x * s, y * s, (x + fileColW) * s, (y + start::tk::kFileRowH) * s));
     }
 
     m_staticHits.clear();
@@ -871,16 +889,13 @@ void Launcher::Build() {
         m_avatarRect = m_nameRect = R(0, 0, 0, 0);
         m_staticHits.push_back({m_lockRect, Kind::Lock, 0});
     } else {
-        // Bottom row: picture, name, and the two buttons from the right.
-        const float bottomY = dividerY + 1, rowMid = (bottomY + kBottomH / 2);
+        // Footer: the picture and name, and Settings and Power from the right as 36 px icon buttons.
+        const float bottomY = dividerY + 1, btn = ui::kButton, gap = ui::kS2, by = bottomY + ui::kS3;
+        const float rowMid = by + btn / 2, powerX = wl - kPad - btn, settingsX = powerX - gap - btn;
         m_avatarRect = R(kPad * s, (rowMid - kAvatar / 2) * s, (kPad + kAvatar) * s, (rowMid + kAvatar / 2) * s);
-        float powerW = 12 + 16 + 6 + txt.Width(L"Power", fButton.get()) / s + 6 + 12 + 12;
-        float settingsW = 12 + 16 + 6 + txt.Width(L"Settings", fButton.get()) / s + 12;
-        float powerX = wl - kPad + 6 - powerW;  // the button's text, not its plate, lines up with the margin
-        float settingsX = powerX - 4 - settingsW;
-        m_powerRect = R(powerX * s, (rowMid - kButtonH / 2) * s, (powerX + powerW) * s, (rowMid + kButtonH / 2) * s);
-        m_settingsRect = R(settingsX * s, (rowMid - kButtonH / 2) * s, (settingsX + settingsW) * s, (rowMid + kButtonH / 2) * s);
-        m_nameRect = R((kPad + kAvatar + 10) * s, (rowMid - 12) * s, (settingsX - 8) * s, (rowMid + 12) * s);
+        m_powerRect = R(powerX * s, by * s, (powerX + btn) * s, (by + btn) * s);
+        m_settingsRect = R(settingsX * s, by * s, (settingsX + btn) * s, (by + btn) * s);
+        m_nameRect = R((kPad + kAvatar + ui::kS3) * s, (rowMid - ui::kS3) * s, (settingsX - ui::kS2) * s, (rowMid + ui::kS3) * s);
     }
     m_staticHits.push_back({m_settingsRect, Kind::Settings, 0});
     m_staticHits.push_back({m_powerRect, Kind::Power, 0});
@@ -1294,11 +1309,9 @@ void Launcher::BuildBody() {
     } else {
         for (size_t i = 0; i < m_apps.size(); i++) {
             auto const& c = m_appCells[i];
-            const float cw = (m_lw - m_gap - 2 * kPad * s) / kH2AppCols;  // HALO 2.0: the whole cell, icon and name, is one target
+            const float cw = (m_lw - m_gap - 2 * kPad * s) / kH2AppCols;  // the whole cell, icon and name, is one target
             const float inset = ui::kS1 / 2 * s, top = c.top - start::tk::kAppPadTop * s;
-            m_hits.push_back({m_h2 ? R((c.left + c.right) / 2 - cw / 2 + inset, top, (c.left + c.right) / 2 + cw / 2 - inset, top + start::kAppRowH * s)
-                                   : R(c.left - kIconPad * s, c.top - kIconPad * s, c.right + kIconPad * s, c.bottom + kIconPad * s),
-                              Kind::App, static_cast<int>(i)});
+            m_hits.push_back({R((c.left + c.right) / 2 - cw / 2 + inset, top, (c.left + c.right) / 2 + cw / 2 - inset, top + kAppRowH * s), Kind::App, static_cast<int>(i)});
             m_appSprites.push_back(sprite(m_host.appIcon(m_apps[i]), c));
             if (m_h2 && m_appSprites.back().v) {
                 m_waveItems.push_back({m_appSprites.back(), (c.left + c.right) / 2, (c.top + c.bottom) / 2, c.bottom - c.top});
@@ -1308,16 +1321,10 @@ void Launcher::BuildBody() {
         for (size_t i = 0; i < m_files.size(); i++) {
             auto const& c = m_fileCells[i];
             m_hits.push_back({c, Kind::File, static_cast<int>(i)});
-            float ix = (c.left + c.right) / 2 - kFileIcon * s / 2, iy = c.top + 8 * s;
-            if (m_h2) {  // a row: the icon at the left end
-                const float ic = start::tk::kFileIcon * s;
-                m_fileSprites.push_back(sprite(FileBrush(m_files[i].path, start::tk::kFileIcon),
-                                               R(c.left + ui::kS2 * s, (c.top + c.bottom) / 2 - ic / 2, c.left + ui::kS2 * s + ic, (c.top + c.bottom) / 2 + ic / 2)));
-                continue;
-            }
-            m_fileSprites.push_back(sprite(FileBrush(m_files[i].path, kFileIcon), R(ix, iy, ix + kFileIcon * s, iy + kFileIcon * s)));
+            const float ic = start::tk::kFileIcon * s;  // a row: the 16 px icon at the left end
+            m_fileSprites.push_back(sprite(FileBrush(m_files[i].path, start::tk::kFileIcon),
+                                           R(c.left + ui::kS2 * s, (c.top + c.bottom) / 2 - ic / 2, c.left + ui::kS2 * s + ic, (c.top + c.bottom) / 2 + ic / 2)));
         }
-
     }
     if (m_query.empty()) m_hits.push_back({m_allAppsRect, Kind::AllApps, 0});
     for (auto const& h : m_staticHits) m_hits.push_back(h);
@@ -1346,12 +1353,14 @@ void Launcher::DrawStatic(ID2D1DeviceContext* dc, float ox, float oy) {
     const float dy = oy - m_divider.top;
     auto at = [&](D2D1_RECT_F r) { return R(r.left + ox, r.top + dy, r.right + ox, r.bottom + dy); };
 
-    auto fRow = txt.Format(L"Segoe UI Variable Text", (m_h2 ? start::tk::kText : 13) * s, DWRITE_FONT_WEIGHT_NORMAL);
-    auto fName = txt.Format(L"Segoe UI Variable Text", 14 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    auto fGlyph = txt.Format(L"Segoe Fluent Icons", 16 * s, DWRITE_FONT_WEIGHT_NORMAL);
-    auto fChevron = txt.Format(L"Segoe Fluent Icons", 10 * s, DWRITE_FONT_WEIGHT_NORMAL);
+    auto fName = txt.Format(ui::kFontText, ui::kBody * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    auto fGlyph = txt.Format(ui::kFontIcons, ui::kIcon * s, DWRITE_FONT_WEIGHT_NORMAL);
 
-    dc->FillRectangle(at(m_divider), line.get());
+    {
+        auto d = at(m_divider);
+        d.bottom = d.top + std::max(1.0f, std::round(ui::kHair * s));  // a hairline
+        dc->FillRectangle(d, line.get());
+    }
 
     auto circle = [&](D2D1_RECT_F r) {
         float rad = (r.right - r.left) / 2;
@@ -1377,28 +1386,19 @@ void Launcher::DrawStatic(ID2D1DeviceContext* dc, float ox, float oy) {
         winrt::com_ptr<ID2D1SolidColorBrush> fill;
         dc->CreateSolidColorBrush(pal.accent, fill.put());
         dc->FillEllipse(circle(av), fill.get());
-        auto fInitial = txt.Format(L"Segoe UI Variable Text", 15 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        auto fInitial = txt.Format(ui::kFontText, ui::kBody * s, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         std::wstring initial = m_user.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(std::towupper(m_user[0])));
         winrt::com_ptr<ID2D1SolidColorBrush> onAccent;
         dc->CreateSolidColorBrush(pal.onAccent, onAccent.put());
         txt.Draw(dc, initial, fInitial.get(), av, onAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     // A hairline ring so a dark picture still has an edge on dark glass.
-    dc->DrawEllipse(circle(av), line.get(), 1.0f);
+    dc->DrawEllipse(circle(av), line.get(), std::max(1.0f, std::round(ui::kHair * s)));
     txt.Draw(dc, m_user, fName.get(), at(m_nameRect), white.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
 
-    // Buttons: glyph, label (Power also a chevron).
-    auto button = [&](D2D1_RECT_F plate, wchar_t glyph, wchar_t const* label, bool chevron) {
-        auto r = at(plate);
-        txt.Draw(dc, std::wstring(1, glyph), fGlyph.get(), R(r.left + 12 * s, r.top, r.left + 28 * s, r.bottom), white.get(),
-                 DWRITE_TEXT_ALIGNMENT_CENTER);
-        txt.Draw(dc, label, fRow.get(), R(r.left + 34 * s, r.top, r.right, r.bottom), white.get());
-        if (chevron)
-            txt.Draw(dc, L"", fChevron.get(), R(r.right - 24 * s, r.top, r.right - 12 * s, r.bottom), dim.get(),
-                     DWRITE_TEXT_ALIGNMENT_CENTER);
-    };
-    button(m_settingsRect, L'', L"Settings", false);
-    button(m_powerRect, L'', L"Power", true);
+    // Settings and Power: 36 px icon buttons (their hover and pressed plates are the panel's one plate).
+    for (auto const& [rect, g] : {std::pair{m_settingsRect, L"\uE713"}, std::pair{m_powerRect, L"\uE7E8"}})
+        txt.Draw(dc, g, fGlyph.get(), at(rect), white.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
 // The search bar: a round-ended field with a magnifier, the typed text (or the placeholder), scrolled to keep the end in view.
@@ -1525,7 +1525,7 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
     if (m_showFiles && m_files.empty())
         txt.Draw(dc, L"No recent files", fRow.get(),
                  at(R(m_filesLabel.left, m_filesLabel.bottom + 6 * s, m_filesLabel.right, m_filesLabel.bottom + 34 * s)), dim.get());
-    if (m_h2) {
+    {
         namespace tk = start::tk;
         // App names under their icons, in the six-column grid (empty slots stay empty; the grid keeps its height).
         auto fApp = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_NORMAL);
@@ -1547,13 +1547,6 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
             txt.Draw(dc, m_files[i].name, fFile.get(), R(nameL, r.top, capR - capW, r.bottom), white.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
             if (capW > 0) txt.Draw(dc, when, fApp.get(), R(capR - capW, r.top, capR, r.bottom), dim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
-        return;
-    }
-    // File names under their icons: one line, ellipsized.
-    for (size_t i = 0; i < m_files.size(); i++) {
-        auto const& c = m_fileCells[i];
-        txt.Draw(dc, m_files[i].name, fName.get(), at(R(c.left + 4 * s, c.top + 44 * s, c.right - 4 * s, c.top + 64 * s)), soft.get(),
-                 DWRITE_TEXT_ALIGNMENT_CENTER, true);
     }
 }
 
@@ -1957,6 +1950,11 @@ void Launcher::Prefetch() {
         GetUserNameW(name, reinterpret_cast<LPDWORD>(&n));
     }
     m_user = name[0] ? name : L"User";
+    if (wchar_t over[64]; GetEnvironmentVariableW(L"HALO_TEST_USER", over, 64)) {  // tools/start_preview: a stand-in name, and no account picture
+        m_user = over;
+        m_avatarTried = true;
+        m_avatar.clear();
+    }
     if (!m_avatarTried) {
         m_avatarTried = true;
         std::wstring pic = AccountPicture(96);
@@ -2626,7 +2624,7 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
             if (w == kServicesTimer) {
                 KillTimer(m_hwnd, kServicesTimer);
                 if (m_open && m_h2 && m_notifCol) m_notifCol->SetActive(true);  // reads the notifications and keeps them current while Start is up
-                if (m_open && !m_servicesOn) StartServices();
+                if (m_open && !m_servicesOn && !EnvIs(L"HALO_TEST_NOSERVICES")) StartServices();  // (the preview shows stand-in state, never the machine's)
             }
             else if (w == kRefreshTimer) {
                 KillTimer(m_hwnd, kRefreshTimer);
