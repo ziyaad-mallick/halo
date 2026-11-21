@@ -588,8 +588,7 @@ Dock::Target Dock::HitTarget(float x, float y) const {
     std::vector<Target> targets;
     if (m_cluster) {
         const float cl = pillLeft + m_m.padding;
-        if (m_h2) spans.push_back({cl, cl + m_clusterWidth});
-        else spans.push_back({cl + m_cluster->StartX(), cl + m_cluster->StartX() + m_cluster->StartWidth()});
+        spans.push_back({cl, cl + m_clusterWidth});  // time, Wi-Fi, battery and the Start logo all open Start
         targets.push_back({Kind::Start, -1});
     }
     float left = (m_m.centerX - CapsuleExtent() / 2) + m_shift - total / 2;
