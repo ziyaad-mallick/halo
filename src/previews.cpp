@@ -1,5 +1,6 @@
 #include "theme.h"
 #include "previews.h"
+#include "tokens.h"
 
 #include <windows.ui.composition.interop.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -32,9 +33,10 @@ __CRT_UUID_DECL(ICompositionDrawingSurfaceInterop, 0xFD04E6E3, 0xFE0C, 0x4C3C, 0
 namespace halo {
 namespace {
 
-constexpr float kPadOuter = 10, kGap = 8, kBoxW = 180, kBoxH = 112, kCardPad = 8, kTitleH = 20, kRise = 12;
+// Corners concentric: the hover plate (kRadiusSmall) sits kPadOuter inside the panel (kRadiusLarge).
+constexpr float kPadOuter = ui::kRadiusLarge - ui::kRadiusSmall, kGap = ui::kS2, kBoxW = 180, kBoxH = 112, kCardPad = ui::kS2, kTitleH = 20, kRise = 12;
 constexpr float kCloseSize = 18;
-constexpr int kInMs = 180, kOutMs = 120;
+constexpr int kInMs = ui::kPanelEnterMs, kOutMs = ui::kPanelExitMs;
 constexpr UINT_PTR kFadeTimer = 1, kRefreshTimer = 2;
 constexpr int kMaxCards = 8;
 
@@ -151,7 +153,7 @@ bool Previews::Show(std::vector<HWND> const& windows, int centerX, int pillTop, 
     m_strip = m_comp.CreateContainerVisual();
     m_strip.Size({m_w, m_h});
     auto clip = m_comp.CreateRoundedRectangleGeometry();
-    clip.CornerRadius({20 * s, 20 * s});
+    clip.CornerRadius({ui::kRadiusLarge * s, ui::kRadiusLarge * s});
     clip.Size({m_w, m_h});
     m_strip.Clip(m_comp.CreateGeometricClip(clip));
     m_root.Children().InsertAtTop(m_strip);
@@ -161,7 +163,7 @@ bool Previews::Show(std::vector<HWND> const& windows, int centerX, int pillTop, 
         m_strip.Children().InsertAtTop(glass);
     }
     m_plateShape = m_comp.CreateRoundedRectangleGeometry();
-    m_plateShape.CornerRadius({12 * s, 12 * s});
+    m_plateShape.CornerRadius({ui::kRadiusSmall * s, ui::kRadiusSmall * s});
     m_plateShape.Size({cardW, cardH});
     auto sprite = m_comp.CreateSpriteShape(m_plateShape);
     sprite.FillBrush(m_comp.CreateColorBrush(winrt::Windows::UI::Color{static_cast<uint8_t>(halo::theme::P().line.a*255+0.5f),static_cast<uint8_t>(halo::theme::P().line.r*255+0.5f),static_cast<uint8_t>(halo::theme::P().line.g*255+0.5f),static_cast<uint8_t>(halo::theme::P().line.b*255+0.5f)}));
@@ -185,8 +187,8 @@ bool Previews::Show(std::vector<HWND> const& windows, int centerX, int pillTop, 
         try {
             dc->Clear(D2D1::ColorF(0, 0.0f));
             winrt::com_ptr<IDWriteTextFormat> fmt;
-            m_dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                                       DWRITE_FONT_STRETCH_NORMAL, 12.0f * s, L"en-us", fmt.put());
+            m_dwrite->CreateTextFormat(ui::kFontText, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                       DWRITE_FONT_STRETCH_NORMAL, ui::kCaption * s, L"en-us", fmt.put());
             fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
             fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             winrt::com_ptr<IDWriteInlineObject> sign;
@@ -337,7 +339,7 @@ void Previews::SetHover(int index) {
     auto anim = [&](wuc::CompositionObject const& o, float to) {
         auto a = m_comp.CreateScalarKeyFrameAnimation();
         a.InsertKeyFrame(1.0f, to, m_easeOut);
-        a.Duration(std::chrono::milliseconds(120));
+        a.Duration(std::chrono::milliseconds(ui::kHoverMs));
         o.StartAnimation(L"Opacity", a);
     };
     if (index < 0) {

@@ -1,5 +1,6 @@
 #include "menu.h"
 #include "theme.h"
+#include "tokens.h"
 
 #include <windows.ui.composition.interop.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -34,9 +35,12 @@ namespace halo {
 namespace {
 
 // Layout, logical px.
-constexpr float kRadius = 14, kPad = 6, kRowH = 28, kSepH = 9, kTextPad = 12, kHoverRadius = 8, kGap = 8;
+// On the shared scales (tokens.h), so the dock menu matches Start's Power menu: 32 px rows, 14 px text, the one
+// hover plate, and corners concentric with it (plate radius + inset = outer radius).
+constexpr float kHoverRadius = ui::kRadiusHover, kPad = ui::kS2, kRadius = kHoverRadius + kPad;
+constexpr float kRowH = ui::kMenuRowH, kSepH = 2 * ui::kS1 + ui::kHair, kTextPad = ui::kS3, kGap = ui::kS2;
 constexpr float kMinW = 190, kMaxW = 340, kRise = 6;
-constexpr int kInMs = 120, kOutMs = 90;
+constexpr int kInMs = ui::kPanelEnterMs, kOutMs = ui::kPanelExitMs;
 
 Menu* g_menu = nullptr;  // WinEvent callbacks carry no context
 
@@ -116,8 +120,8 @@ void Menu::Show(std::vector<MenuEntry> entries, int centerX, int pillTop, RECT c
 
     // Measure: the widest label sets the width, within bounds.
     winrt::com_ptr<IDWriteTextFormat> fmt;
-    winrt::check_hresult(m_dwrite->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-                                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f * s,
+    winrt::check_hresult(m_dwrite->CreateTextFormat(ui::kFontText, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, ui::kBody * s,
                                                     L"en-us", fmt.put()));
     fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
