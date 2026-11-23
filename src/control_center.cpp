@@ -71,6 +71,8 @@ constexpr UINT kSettleMs = 240;
 // (plus kLeaveSlack px around it) closes it. Then the ring that springs out of a toggle (from kPulseFrom to
 // kPulseTo of its size) and how far an arrow key moves a slider.
 constexpr UINT kLeaveTickMs = 50, kLeaveMs = 200;
+constexpr float kPageDrift = 24;               // logical px a page drifts as it turns
+constexpr int kPageInMs = 240, kPageOutMs = 140;  // the new page eases in; the old one leaves faster
 constexpr float kLeaveSlack = 18, kPulseFrom = 0.9f, kPulseTo = 1.5f, kSliderStep = 0.05f;
 constexpr wchar_t kPanelClass[] = L"HaloControlCenter", kHotClass[] = L"HaloControlCenterTimers";
 
@@ -211,6 +213,7 @@ struct ControlCenter::Impl {
     size_t outOffset = 0, outVisible = 0;
     size_t listOffset = 0, listVisible = 0;
     Expand expand = Expand::None;
+    int lastPage = 0;  // the page last drawn (0 home, 1 Wi-Fi, 2 Bluetooth, 3 outputs): a change turns the page
     float volume = 0;
     bool muted = false, micMuted = false, dnd = false, wifiOn = false, btOn = false, dark = false, energy = false, night = false;
     bool hotspotAvail = false, hotspotOn = false, savedWifi = true, savedBt = true, btAsked = false, btDone = false;  // btDone: the paired-device read has answered
@@ -293,6 +296,8 @@ struct ControlCenter::Impl {
     float MaxPx() const { return std::ceil(MaxH() * s); }
     float TopPx() const { return std::lround(motion::kPad * s) + MaxPx() - shownPx; }  // the pill's y in the window
     void Resize(float hPx, bool animate);
+    void PageTurn(int dir);
+    int Page() const { return outsOpen ? 3 : expand == Expand::Wifi ? 1 : expand == Expand::Bluetooth ? 2 : 0; }
     float MaxH() const { return std::min(kMaxH, std::max(200.0f, (mon.bottom - mon.top) / s - 2 * kMargin)); }
     bool Dense() const { return (mon.bottom - mon.top) / s < 636.0f; }
     SIZE WindowPx() const;
@@ -675,6 +680,7 @@ void ControlCenter::Impl::Park() {
     outsOpen = false;
     powerOpen = false;
     expand = Expand::None;
+    lastPage = 0;
     hover = pressed = {};
     tracking = false;
     if (hv) { hv.StopAnimation(L"Opacity"); hv.Opacity(0); }
@@ -702,6 +708,7 @@ void ControlCenter::Impl::Teardown() {
     outsOpen = false;
     powerOpen = false;
     expand = Expand::None;
+    lastPage = 0;
     hover = pressed = {};
     tracking = false;
     hvShown = false;
@@ -1481,6 +1488,48 @@ void ControlCenter::Impl::Resize(float hPx, bool animate) {
     }
 }
 
+// A page change (home <-> Wi-Fi / Bluetooth / outputs): the old drawing keeps its surface on a sprite that fades
+// and drifts out, while the new page fades and drifts in from the other side. Compositor-only, so nothing on the
+// UI thread waits on it; reduce_motion keeps the crossfade and drops the drift. The old sprite removes itself.
+void ControlCenter::Impl::PageTurn(int dir) {
+    if (!content || !surf || shownPx <= 0) return;
+    using namespace std::chrono;
+    const float wPx = std::ceil(kW * s), drift = settings::Get().reduceMotion ? 0.0f : kPageDrift * s * settings::Amount(cfg());
+    auto old = comp.CreateSpriteVisual();
+    old.Size(content.Size());
+    old.Brush(content.Brush());
+    old.Clip(comp.CreateInsetClip(0, 0, 0, MaxPx() - shownPx));  // only what was on screen
+    inner.Children().InsertBelow(old, content);
+    surf = gdev.CreateDrawingSurface({wPx, MaxPx()}, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                     winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+    auto sb = comp.CreateSurfaceBrush(surf);
+    sb.Stretch(wuc::CompositionStretch::None);
+    sb.HorizontalAlignmentRatio(0);
+    sb.VerticalAlignmentRatio(0);
+    content.Brush(sb);
+    lower.Brush(sb);
+
+    auto easeOut = comp.CreateCubicBezierEasingFunction({0.2f, 0.0f}, {0.0f, 1.0f});
+    auto easeIn = comp.CreateCubicBezierEasingFunction({0.4f, 0.0f}, {1.0f, 1.0f});
+    auto scalar = [&](wuc::CompositionObject const& o, wchar_t const* prop, float from, float to, wuc::CompositionEasingFunction const& e, milliseconds d) {
+        auto a = comp.CreateScalarKeyFrameAnimation();
+        a.InsertKeyFrame(0.0f, from);
+        a.InsertKeyFrame(1.0f, to, e);
+        a.Duration(d);
+        o.StartAnimation(prop, a);
+    };
+    auto batch = comp.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    scalar(old, L"Opacity", 1.0f, 0.0f, easeIn, Fast(kPageOutMs));
+    if (drift > 0) scalar(old, L"Offset.X", 0.0f, -dir * drift, easeIn, Fast(kPageOutMs));
+    batch.End();
+    batch.Completed([kids = inner.Children(), old](auto&&, auto&&) { try { kids.Remove(old); } catch (...) {} });
+
+    for (auto const& v : {content, lower}) {
+        scalar(v, L"Opacity", 0.0f, 1.0f, easeOut, Fast(kPageInMs));
+    }
+    if (drift > 0) scalar(content, L"Offset.X", dir * drift, 0.0f, easeOut, Fast(kPageInMs));
+}
+
 void ControlCenter::Impl::Settle() {
     if (!settling) return;
     settling = false;
@@ -1500,6 +1549,10 @@ void ControlCenter::Impl::Render() {
     for (auto const& it : items)
         for (auto const& b : before)
             if (Same(b, it) && b.r.top == it.r.top && b.r.bottom == it.r.bottom) split = std::max(split, it.r.bottom);
+    if (const int page = Page(); page != lastPage) {
+        PageTurn(page == 0 ? -1 : 1);  // into a details page moves left, back home moves right
+        lastPage = page;
+    }
     ApplySize();
     auto interop = surf.as<ICompositionDrawingSurfaceInterop>();
     winrt::com_ptr<ID2D1DeviceContext> dc;
@@ -1528,9 +1581,10 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
         br->SetColor(c);
         dc->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), br.get());
     };
-    // A tile: one flat fill on the glass, the same in both themes. No border and no shading: the glass is the only
-    // surface with an edge, so tiles read as parts of one panel instead of boxes in a box.
-    auto tile = [&](D2D1_RECT_F r) { box(r, kRadiusLarge, pal.fill); };
+    // A tile: one flat fill on the glass, plus the contrast setting's hairline edge (none at "soft"), so a tile still
+    // reads as a box over a bright window behind the glass.
+    auto edge = [&](D2D1_RECT_F r, float rad) { theme::TileEdge(dc, D2D1::RoundedRect(r, rad, rad), 1.0f / s); };
+    auto tile = [&](D2D1_RECT_F r) { box(r, kRadiusLarge, pal.fill); edge(r, kRadiusLarge); };
     auto txt = [&](std::wstring const& t, IDWriteTextFormat* f, D2D1_RECT_F r, D2D1_COLOR_F c) {
         br->SetColor(c);
         dc->DrawText(t.c_str(), static_cast<UINT32>(t.size()), f, r, br.get());
@@ -1540,6 +1594,7 @@ void ControlCenter::Impl::Paint(ID2D1DeviceContext* dc, float tx, float ty, Item
     auto toggle = [&](D2D1_RECT_F r, float rad, D2D1_COLOR_F idle, bool on, bool avail, wchar_t g, bool darkMark) {
         const float a = avail ? 1.0f : 0.4f;
         box(r, rad, theme::A(on ? kAccent : idle, a));
+        if (!on && avail) edge(r, rad);
         const D2D1_COLOR_F ink = theme::A(on ? kOnAccent : kText, a);
         if (darkMark) {
             const float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, k = std::min(r.right - r.left, r.bottom - r.top) / 2 * 0.36f;

@@ -47,6 +47,7 @@ struct Palette {
     D2D1_COLOR_F sliderFill;  // the filled part of a thick slider
     D2D1_COLOR_F iconPlate;   // the plate behind a transparent app logo
     D2D1_COLOR_F wash;        // a subtle wash over glass: scale its alpha with A() / Wash()
+    D2D1_COLOR_F tileEdge;    // a tile's hairline edge; set by Refresh() from the contrast setting (none at "soft")
 };
 
 // The glass a surface builds: the palette's tint scaled by the surface's opacity (66 % = as designed, so a
@@ -112,6 +113,33 @@ inline void Refresh() {
     Palette p = detail::Base(dark);
     if (cfg.accent != 0x14A394)  // the default keeps each theme's own teal
         p.accent = {((cfg.accent >> 16) & 0xFF) / 255.0f, ((cfg.accent >> 8) & 0xFF) / 255.0f, (cfg.accent & 0xFF) / 255.0f, 1.0f};
+    // Contrast: 0 soft (flat tiles, no edge: the original look), 1 clear (default: firmer tiles with a hairline edge,
+    // so boxes read over a bright window), 2 high (stronger fills, edges, separators and secondary text).
+    const int k = std::clamp(cfg.contrast, 0, 2), g = std::clamp(cfg.glass, 0, 2);
+    constexpr float kFillDark[] = {0.065f, 0.09f, 0.14f}, kFillLight[] = {0.72f, 0.80f, 0.92f}, kEdge[] = {0.0f, 0.09f, 0.20f};
+    if (dark) {
+        p.fill.a = kFillDark[k];
+        p.fillHover.a = kFillDark[k] + 0.045f;
+        p.tileEdge = {1, 1, 1, kEdge[k]};
+    } else {
+        p.fill.a = kFillLight[k];
+        p.fillHover.a = std::min(1.0f, kFillLight[k] + 0.18f);
+        p.tileEdge = {0, 0, 0, kEdge[k] * 0.75f};
+    }
+    if (k == 2) {
+        p.line.a = std::min(1.0f, p.line.a * 1.8f);
+        p.dim.a = std::max(p.dim.a, dark ? 0.84f : 0.72f);
+        p.textSoft.a = std::max(p.textSoft.a, 0.92f);
+        p.faint.a = std::min(1.0f, p.faint.a * 1.4f);
+        p.muted = dark ? p.dim : p.textSoft;
+        p.edge.a = std::max<uint8_t>(p.edge.a, 0x40);
+    }
+    // Glass: 0 clear (more of the desktop shows through, a brighter rim), 1 frosted (as designed), 2 solid (nearly
+    // opaque and grain-free: the most legible, and the calmest over busy wallpapers).
+    constexpr float kTint[] = {0.82f, 1.0f, 1.25f};
+    p.tint.a = static_cast<uint8_t>(std::min(0xF4L, std::lround(p.tint.a * kTint[g])));
+    if (g == 0) p.rimTop.a = static_cast<uint8_t>(std::min(255L, std::lround(p.rimTop.a * 1.4)));
+    if (g == 2) p.noise = 0;
     detail::Cur() = p;
     detail::g_dark = dark;
     detail::g_have = true;
@@ -133,6 +161,20 @@ inline GlassStyle Glass(halo::settings::Surface const& g) {
     t.a = static_cast<uint8_t>(std::min(255L, std::lround(p.tint.a * g.opacity / 66.0)));
     if (g.hasTint) { t.r = (g.tint >> 16) & 0xFF; t.g = (g.tint >> 8) & 0xFF; t.b = g.tint & 0xFF; }
     return {t, static_cast<float>(g.blur)};
+}
+
+// A tile's edge: a hairline just inside the rounded rect `rr`, `hair` thick in the target's units (1 device px:
+// 1 / scale when the target draws in logical px). Nothing at "soft" contrast.
+inline void TileEdge(ID2D1RenderTarget* rt, D2D1_ROUNDED_RECT rr, float hair) {
+    const D2D1_COLOR_F c = P().tileEdge;
+    if (c.a <= 0) return;
+    winrt::com_ptr<ID2D1SolidColorBrush> b;
+    if (FAILED(rt->CreateSolidColorBrush(c, b.put()))) return;
+    const float h = hair / 2;
+    rr.rect = {rr.rect.left + h, rr.rect.top + h, rr.rect.right - h, rr.rect.bottom - h};
+    rr.radiusX = std::max(0.0f, rr.radiusX - h);
+    rr.radiusY = std::max(0.0f, rr.radiusY - h);
+    rt->DrawRoundedRectangle(rr, b.get(), hair);
 }
 
 // Muted text (captions, hints): `dim` on dark glass; on light glass `dim` is 3.6:1, so the soft ink (4.5:1 or better).

@@ -175,6 +175,11 @@ struct NotifColumn::Impl {
         dc->CreateSolidColorBrush(c, b.put());
         dc->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), b.get());
     }
+    // A card: the resting fill and the contrast setting's hairline edge (1 device px: this file draws in device px).
+    void Card(ID2D1DeviceContext* dc, D2D1_RECT_F r, float radius) {
+        Fill(dc, r, radius, theme::P().fill);
+        theme::TileEdge(dc, D2D1::RoundedRect(r, radius, radius), 1.0f);
+    }
     void FillCorners(ID2D1DeviceContext* dc, D2D1_RECT_F r, float rt, float rb, D2D1_COLOR_F col) {
         winrt::com_ptr<ID2D1Factory> f;
         dc->GetFactory(f.put());
@@ -477,7 +482,7 @@ void NotifColumn::Impl::DrawList() {
     Paint(listS, [&](ID2D1DeviceContext* dc, float ox, float oy) {
         if (rows.empty()) {  // an empty state: one card, a bell, what it means
             const float l = ox + kMargin * s, t = oy + ui::kS1 * s, ch = kEmptyH * s;
-            Fill(dc, R(l, t, l + cardW, t + ch), ui::kRadiusLarge * s, pal.fill);
+            Card(dc, R(l, t, l + cardW, t + ch), ui::kRadiusLarge * s);
             const bool ready = feed.Ready();
             const float cx = l + cardW / 2, top = t + ui::kS4 * s;
             winrt::com_ptr<IDWriteTextFormat> fBell;
@@ -491,7 +496,7 @@ void NotifColumn::Impl::DrawList() {
         for (size_t ri = 0; ri < rows.size(); ri++) {
             auto const& r = rows[ri];
             const float l = ox + kMargin * s, t = oy + r.y;
-            Fill(dc, R(l, t, l + cardW, t + r.h), ui::kRadiusLarge * s, pal.fill);  // a separate radius-20 card
+            Card(dc, R(l, t, l + cardW, t + r.h), ui::kRadiusLarge * s);  // a separate radius-20 card
             // icon: the app's own, else a letter tile
             const float ix = l + kCardPadX * s, iy = t + kCardPadY * s, isz = kIcon * s;
             if (auto const* ic = feed.Icon(r.n.appKey); ic && ic->w && ic->h) {
@@ -535,7 +540,7 @@ void NotifColumn::Impl::DrawCal() {
     nextR = R(x0 + w - pad - btn, calTop + navTop, x0 + w - pad, calTop + navTop + navH);
 
     Paint(calS, [&](ID2D1DeviceContext* dc, float ox, float oy) {
-        Fill(dc, R(ox, oy, ox + w, oy + calH), ui::kRadiusLarge * s, pal.fill);  // the card
+        Card(dc, R(ox, oy, ox + w, oy + calH), ui::kRadiusLarge * s);  // the card
         winrt::com_ptr<ID2D1SolidColorBrush> b;
         Text(dc, title, fMonth.get(), R(ox + pad, oy + navTop, ox + w - pad - 2 * btn, oy + navTop + navH), pal.text);
         for (int i = 0; i < 2; i++) {

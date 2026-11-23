@@ -3073,6 +3073,7 @@ void Launcher::DrawWidgets(ID2D1DeviceContext* dc, float ox, float dy) {
         for (int i = 0; i < 3; i++) {
             auto card = at(R(kPad * s + i * (cw + gap), wy, kPad * s + i * (cw + gap) + cw, wy + m_plan.widgetsH * s));
             dc->FillRoundedRectangle(D2D1::RoundedRect(card, tk::kRCard * s, tk::kRCard * s), c.fill.get());
+            theme::TileEdge(dc, D2D1::RoundedRect(card, tk::kRCard * s, tk::kRCard * s), 1.0f);
             const float x0 = card.left + tk::kWidgetPad * s, x1 = card.right - tk::kWidgetPad * s, y0 = card.top + tk::kWidgetPad * s;
             txt.Draw(dc, caps[i], fCap.get(), R(x0, y0, x1, y0 + start::kLabelH * s), c.muted.get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
             txt.Draw(dc, vals[i], fVal.get(), R(x0, y0 + (start::kLabelH + ui::kS1 / 2) * s, x1, y0 + (start::kLabelH + ui::kS1 / 2 + 24) * s), c.ink.get(),
@@ -3610,6 +3611,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
     // semibold name and the state under it. A control that is not there is dimmed.
     auto tile = [&](D2D1_RECT_F r, wchar_t g, bool on, bool avail, std::wstring const& name, std::wstring const& state) {
         pill(r, tk::kRCard * s, c.fill.get());
+        theme::TileEdge(dc, D2D1::RoundedRect(r, tk::kRCard * s, tk::kRCard * s), 1.0f);
         const float a = avail ? 1.0f : 0.45f, bd = ui::kRound * s, cx = r.left + ui::kPillH * s / 2, cy = Mid(r.top, r.bottom);
         c.ink->SetOpacity(a);
         c.muted->SetOpacity(a);
@@ -3634,6 +3636,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
     // A small toggle: a 44 px round-ended button, filled with the solid accent when on.
     auto mini = [&](D2D1_RECT_F r, wchar_t g, bool on, bool avail) {
         pill(r, (r.bottom - r.top) / 2, on ? c.accent.get() : c.fill.get());
+        if (!on && avail) theme::TileEdge(dc, D2D1::RoundedRect(r, (r.bottom - r.top) / 2, (r.bottom - r.top) / 2), 1.0f);
         auto* ink = on ? c.onAccent.get() : c.ink.get();
         ink->SetOpacity(avail ? 1.0f : 0.45f);
         glyph(g, r, ink, fIcon.get());
@@ -3754,6 +3757,7 @@ void Launcher::DrawRight(ID2D1DeviceContext* dc, float ox, float oy) {
         const float x0 = m_lw + start::kRightPad * s, x1 = m_w - start::kRightPad * s;
         auto r = at(R(x0, m_rplan.mediaY * s, x1, (m_rplan.mediaY + m_rplan.mediaH) * s));
         dc->FillRoundedRectangle(D2D1::RoundedRect(r, tk::kRCard * s, tk::kRCard * s), c.fill.get());
+        theme::TileEdge(dc, D2D1::RoundedRect(r, tk::kRCard * s, tk::kRCard * s), 1.0f);
         auto const& ms = m_media.State();
         const float artSz = tk::kMediaArt * s;
         D2D1_RECT_F ar = R(r.left + ui::kS3 * s, Mid(r.top, r.bottom) - artSz / 2, r.left + ui::kS3 * s + artSz, Mid(r.top, r.bottom) + artSz / 2);
