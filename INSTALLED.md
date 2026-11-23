@@ -5,3 +5,4 @@ The file that counts is the one in the primary checkout (all worktrees share it)
 
 date | branch | commit | md5 | rollback dir
 2026-11-22 11:04 | fix/dock-cluster-on-fixes | dc2a2bf | C30DC3C2 | app-backup-20261122-dockfix
+2026-11-23 11:29 | polish/menu-previews-tokens | 197ade0 | 649BBB5C | app-backup-20261123-1129
