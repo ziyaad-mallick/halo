@@ -185,7 +185,12 @@ struct Feed::Impl {
 };
 
 Snapshot Feed::Impl::Query(std::set<std::wstring>& iconDone) {
-    if (_wgetenv(L"HALO_NOTIF_DEMO")) return DemoSnapshot();
+    if (_wgetenv(L"HALO_NOTIF_EMPTY")) { Snapshot s; s.ok = true; return s; }  // an empty list that has been read
+    if (auto const* demo = _wgetenv(L"HALO_NOTIF_DEMO")) {
+        auto s = DemoSnapshot();
+        if (demo[0] == L'3' && s.items.size() > 3) s.items.resize(3);  // HALO_NOTIF_DEMO=3: the first three
+        return s;
+    }
     Snapshot snap;
     try {
         auto l = wun::Management::UserNotificationListener::Current();

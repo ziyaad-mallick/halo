@@ -7,10 +7,23 @@ Center in the same style. Animations run on the compositor, so the dock costs
 next to nothing when idle.
 
 > **Status:** early. It has been the author's daily login shell since
-> 2026-10-18, on one machine. Builds are unsigned and there is no installer
-> package yet, so you build it from source (about a minute). Taking the
-> Windows taskbar back is always one hotkey away (see
+> 2026-10-18, on one machine. Builds are unsigned, so Windows SmartScreen will
+> warn on first run; install from the release zip (one PowerShell line, below)
+> or build from source (about a minute). Taking the Windows taskbar back is
+> always one hotkey away (see
 > [Going back to the Windows taskbar](#going-back-to-the-windows-taskbar)).
+
+## Why Halo
+
+- **Native, not a web app.** C++/WinRT on the same compositor Windows itself uses: no Electron, no .NET
+  runtime, no Rainmeter skin. Three small static exes.
+- **Smooth because the compositor does the work.** Magnification, the reveal spring and the bounce run as
+  composition animations, which is why the dock stays light (numbers below).
+- **More than a dock.** A Start panel and a Control Center in the same glass style replace the taskbar
+  rather than sitting on top of it.
+- **Hard to get stuck with.** A separate guardian process gives the Windows taskbar back on exit, on a
+  crash loop, or on Win+Alt+T.
+- **Free and open source** (MIT). Read the code, build it yourself.
 
 ## What you get
 
@@ -29,10 +42,11 @@ next to nothing when idle.
 - **Safety net**: `guardian.exe` hides the taskbar only once the dock is up, and gives it back on exit,
   on a crash loop (3 crashes in 2 minutes), and on request
 
-Measured on a Core Ultra 7 258V (2026-10-18, process counters over 30 s idle, two runs):
-**0–16 ms CPU, 29.9–35.2 MB private memory**; the guardian uses 1.4 MB.
+Measured on a Core Ultra 7 258V (2026-11-18, v2.1.0, process counters over 30 s while the machine was
+in normal use, two runs): **47–109 ms CPU per 30 s (under 0.4 % of one core), 35.5–37.2 MB private
+memory**; the guardian uses 1.2 MB and no measurable CPU.
 
-## Install or update (no compiler, 1 MB)
+## Install or update (no compiler, 1.3 MB)
 
 Run this in **PowerShell**. The same command installs Halo the first time and updates it over the old
 version later (your settings are kept; the previous `halo.exe` stays as `halo.previous.exe`):

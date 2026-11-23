@@ -43,6 +43,10 @@ struct Palette {
     Argb veil;                // full-screen dim behind the launcher
     D2D1_COLOR_F labelBg, labelRim, labelText;
     Argb hover, press;        // the highlight that glides between controls, and its stronger pressed state
+    D2D1_COLOR_F muted;       // secondary text: `dim` on dark glass, `textSoft` on light (dim reads 3.6:1 there)
+    D2D1_COLOR_F sliderFill;  // the filled part of a thick slider
+    D2D1_COLOR_F iconPlate;   // the plate behind a transparent app logo
+    D2D1_COLOR_F wash;        // a subtle wash over glass: scale its alpha with A() / Wash()
 };
 
 // The glass a surface builds: the palette's tint scaled by the surface's opacity (66 % = as designed, so a
@@ -70,6 +74,7 @@ inline const Palette& Base(bool dark) {
         {0x24, 0x00, 0x00, 0x00}, {0xB0, 0x1D, 0x1D, 0x1F}, {0x38, 0xF2, 0xF2, 0xF5},
         {1, 1, 1, 0.86f}, {0, 0, 0, 0.10f}, {0.11f, 0.11f, 0.12f, 0.92f},
         {0x12, 0x00, 0x00, 0x00}, {0x24, 0x00, 0x00, 0x00},
+        {0.11f, 0.11f, 0.12f, 0.80f}, {1, 1, 1, 1.0f}, {1, 1, 1, 0.85f}, {0, 0, 0, 0.5f},
     };
     static const Palette darkP{
         40.0f, {0xC8, 0x0B, 0x0B, 0x0D}, 0.02f,  // near-black neutral glass: #0B0B0D at 78%
@@ -83,6 +88,7 @@ inline const Palette& Base(bool dark) {
         {0x33, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF}, {0xB0, 0x0E, 0x0E, 0x10},
         {0x0E / 255.0f, 0x0E / 255.0f, 0x10 / 255.0f, 0.90f}, {1, 1, 1, 0.16f}, {1, 1, 1, 0.95f},
         {0x22, 0xFF, 0xFF, 0xFF}, {0x38, 0xFF, 0xFF, 0xFF},
+        {1, 1, 1, 0.72f}, {1, 1, 1, 0.94f}, {1, 1, 1, 0.10f}, {1, 1, 1, 1.0f},
     };
     return dark ? darkP : light;
 }
@@ -129,8 +135,20 @@ inline GlassStyle Glass(halo::settings::Surface const& g) {
     return {t, static_cast<float>(g.blur)};
 }
 
+// Muted text (captions, hints): `dim` on dark glass; on light glass `dim` is 3.6:1, so the soft ink (4.5:1 or better).
+inline D2D1_COLOR_F Muted() { auto const& p = P(); return Dark() ? p.dim : p.textSoft; }
+// A slider: a white fill over the `off` track in both themes, with near-black ink for the glyph that sits on the fill.
+inline D2D1_COLOR_F SliderFill() { return {1, 1, 1, 1}; }
+inline D2D1_COLOR_F SliderOnFill() { return {0.11f, 0.11f, 0.12f, 0.92f}; }
+// A menu raised over Start: a frost over the backdrop (its alpha), then a lighter sheet.
+inline uint8_t MenuVeilAlpha() { return Dark() ? 0xB0 : 0xD8; }
+inline Argb MenuSheet() { return Dark() ? Argb{0x1A, 0xFF, 0xFF, 0xFF} : Argb{0x70, 0xFF, 0xFF, 0xFF}; }
+inline uint8_t MenuShadowAlpha() { return 0x70; }
+
 inline winrt::Windows::UI::Color C(Argb c) { return winrt::Windows::UI::ColorHelper::FromArgb(c.a, c.r, c.g, c.b); }
 inline D2D1_COLOR_F A(D2D1_COLOR_F c, float alpha) { c.a *= alpha; return c; }
+// A wash over glass at `alpha` (as designed for dark): white in dark, half as strong ink in light.
+inline D2D1_COLOR_F Wash(float alpha) { return A(P().wash, alpha); }
 
 
 // A tonal palette from the accent: tinted surfaces instead of neutral grey. `tint1` / `tint2` are the accent at low

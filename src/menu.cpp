@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdio>
 
+#include "crash.h"
+
 struct ICompositorDesktopInterop : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE CreateDesktopWindowTarget(HWND hwnd, BOOL isTopmost, void** target) = 0;
     virtual HRESULT STDMETHODCALLTYPE EnsureOnThread(DWORD threadId) = 0;
@@ -57,7 +59,13 @@ void CALLBACK MenuForegroundProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DW
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == GetCurrentProcessId()) return;
     Log(L"foreground moved, closing");
-    g_menu->Close();
+    // A WinEvent hook runs on our message loop: a throw out of Close() would unwind through user32.
+    try {
+        g_menu->Close();
+    } catch (...) {
+        Log(L"foreground hook: Close threw");
+        halo::crash::Handled("Menu::ForegroundProc");
+    }
 }
 
 Menu::Menu(HINSTANCE inst, wuc::Compositor const& comp, wuc::CompositionGraphicsDevice const& gdev, MenuHost host)
@@ -315,7 +323,22 @@ void Menu::TestActivate(int row) { Choose(row); }
 LRESULT CALLBACK Menu::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));
     auto* self = reinterpret_cast<Menu*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-    if (self && self->m_hwnd) return self->OnMessage(m, w, l);  // not during CreateWindowEx
+    if (self && self->m_hwnd) {  // not during CreateWindowEx
+        // A throw out of a handler (a rejected animation, a lost device, a host callback) would unwind through user32
+        // into std::terminate. Log it, record it in crash.log and carry on: the next event retries.
+        try {
+            return self->OnMessage(m, w, l);
+        } catch (winrt::hresult_error const& e) {
+            Log(L"message " + std::to_wstring(m) + L" threw hr=" + std::to_wstring(static_cast<int>(e.code())) + L" " + e.message().c_str());
+            halo::crash::Handled("Menu::WndProc");
+        } catch (std::exception const&) {
+            Log(L"message " + std::to_wstring(m) + L" threw std::exception");
+            halo::crash::Handled("Menu::WndProc");
+        } catch (...) {
+            Log(L"message " + std::to_wstring(m) + L" threw an unknown exception");
+            halo::crash::Handled("Menu::WndProc");
+        }
+    }
     return DefWindowProcW(h, m, w, l);
 }
 

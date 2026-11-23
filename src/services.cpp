@@ -1,6 +1,7 @@
 #include "services.h"
 #include "shell_launch.h"
 
+#include <devicetopology.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <propsys.h>
 #include <shellapi.h>
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace halo::svc {
 namespace {
@@ -90,6 +92,75 @@ void Log(std::wstring const& msg) {
     fputws(line.c_str(), stderr);
     fflush(stderr);
 }
+
+namespace {
+// Turns a burst of "something changed" pokes into at most one PostMessage per kMinGapMs: the first poke posts at
+// once, the rest of a burst is folded into one trailing post. Instances are leaked on purpose (a threadpool timer
+// may fire during process exit).
+class Coalescer {
+public:
+    static constexpr ULONGLONG kMinGapMs = 100;
+    void SetTarget(HWND h, UINT m) {
+        std::lock_guard lock(m_mutex);
+        m_hwnd = h;
+        m_msg = m;
+    }
+    void Poke() {
+        std::lock_guard lock(m_mutex);
+        if (!m_hwnd || m_armed) return;
+        const ULONGLONG now = GetTickCount64();
+        if (now - m_last >= kMinGapMs) {
+            m_last = now;
+            PostMessageW(m_hwnd, m_msg, 0, 0);
+            return;
+        }
+        if (!m_timer) m_timer = CreateThreadpoolTimer(&Coalescer::OnTimer, this, nullptr);
+        if (!m_timer) { PostMessageW(m_hwnd, m_msg, 0, 0); return; }
+        ULARGE_INTEGER due;
+        due.QuadPart = static_cast<ULONGLONG>(-static_cast<LONGLONG>((kMinGapMs - (now - m_last)) * 10000));
+        FILETIME ft{due.LowPart, due.HighPart};
+        m_armed = true;
+        SetThreadpoolTimer(m_timer, &ft, 0, 0);
+    }
+    // For a user-initiated transition (a refresh began, a connect went pending): no folding.
+    void PostNow() {
+        std::lock_guard lock(m_mutex);
+        if (!m_hwnd) return;
+        m_last = GetTickCount64();
+        PostMessageW(m_hwnd, m_msg, 0, 0);
+    }
+private:
+    static VOID CALLBACK OnTimer(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_TIMER) {
+        auto* self = static_cast<Coalescer*>(ctx);
+        std::lock_guard lock(self->m_mutex);
+        self->m_armed = false;
+        if (!self->m_hwnd) return;
+        self->m_last = GetTickCount64();
+        PostMessageW(self->m_hwnd, self->m_msg, 0, 0);
+    }
+    std::mutex m_mutex;
+    HWND m_hwnd{};
+    UINT m_msg{};
+    bool m_armed = false;
+    ULONGLONG m_last = 0;
+    PTP_TIMER m_timer = nullptr;
+};
+
+// Runs `fn` on a detached worker with COM in the MTA.
+template <typename F>
+bool RunOffThread(F fn) {
+    try {
+        std::thread([fn = std::move(fn)]() mutable {
+            const bool co = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+            try { fn(); } catch (...) {}
+            if (co) CoUninitialize();
+        }).detach();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+}  // namespace
 
 // ---- Audio ----------------------------------------------------------------------------
 bool AudioEndpoint::Bind(EDataFlow flow, HWND notify, UINT msg) {
@@ -184,16 +255,223 @@ std::vector<Device> OutputDevices() {
     return out;
 }
 
-bool SetDefaultOutput(std::wstring const& id) {
-    if (DryRun()) { Log(L"DRYRUN default output -> " + id); return true; }
+// ---- Output devices: cache, change notifications, async default switch ------------------------------------
+namespace {
+// The blocking part: IPolicyConfig for all three roles, else the Sound settings page. Worker threads only.
+AudioOpResult SetDefaultNow(std::wstring const& id) {
+    if (DryRun()) { Log(L"DRYRUN default output -> " + id); return AudioOpResult::Succeeded; }
     winrt::com_ptr<IPolicyConfig> pc;
     if (SUCCEEDED(CoCreateInstance(kClsidPolicyConfig, nullptr, CLSCTX_ALL, kIidPolicyConfig, pc.put_void()))) {
         bool ok = true;
         for (ERole r : {eConsole, eMultimedia, eCommunications}) ok &= SUCCEEDED(pc->SetDefaultEndpoint(id.c_str(), r));
-        if (ok) return true;
+        if (ok) return AudioOpResult::Succeeded;
     }
-    ShellExecuteW(nullptr, L"open", L"ms-settings:sound", nullptr, nullptr, SW_SHOWNORMAL);
-    return false;
+    HINSTANCE h = ShellExecuteW(nullptr, L"open", L"ms-settings:sound", nullptr, nullptr, SW_SHOWNORMAL);
+    return reinterpret_cast<INT_PTR>(h) > 32 ? AudioOpResult::FellBackToSettings : AudioOpResult::Failed;
+}
+
+// Every render endpoint in any state, with its container id (the key that ties a Bluetooth device to its endpoints).
+struct EpInfo {
+    std::wstring id, name, container;  // container: lower-case, no braces (see NormId)
+    DWORD state = 0;
+    bool isDefault = false;
+    bool operator==(EpInfo const&) const = default;
+};
+
+std::wstring NormId(std::wstring const& s) {
+    std::wstring out;
+    for (wchar_t c : s) if (c != L'{' && c != L'}') out.push_back(static_cast<wchar_t>(towlower(c)));
+    return out;
+}
+
+// PKEY_Device_ContainerId {8C7ED206-3F8A-4827-B3AB-AE9E1FAEFC6C}, 2: groups every endpoint and node of one physical device.
+constexpr PROPERTYKEY kPkeyContainerId = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
+
+std::vector<EpInfo> AllRenderEndpoints() {
+    std::vector<EpInfo> out;
+    winrt::com_ptr<IMMDeviceEnumerator> en;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), en.put_void())))
+        return out;
+    std::wstring defId;
+    winrt::com_ptr<IMMDevice> def;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, def.put()))) {
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(def->GetId(&id)) && id) { defId = id; CoTaskMemFree(id); }
+    }
+    winrt::com_ptr<IMMDeviceCollection> col;
+    UINT n = 0;
+    if (FAILED(en->EnumAudioEndpoints(eRender, DEVICE_STATEMASK_ALL, col.put())) || FAILED(col->GetCount(&n))) return out;
+    for (UINT i = 0; i < n; i++) {
+        winrt::com_ptr<IMMDevice> dev;
+        LPWSTR id = nullptr;
+        if (FAILED(col->Item(i, dev.put())) || FAILED(dev->GetId(&id)) || !id) continue;
+        EpInfo ep;
+        ep.id = id;
+        CoTaskMemFree(id);
+        ep.isDefault = ep.id == defId;
+        dev->GetState(&ep.state);
+        winrt::com_ptr<IPropertyStore> props;
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, props.put()))) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) ep.name = pv.pwszVal;
+            PropVariantClear(&pv);
+            PropVariantInit(&pv);
+            if (SUCCEEDED(props->GetValue(kPkeyContainerId, &pv)) && pv.vt == VT_CLSID && pv.puuid) {
+                wchar_t g[48] = {};
+                StringFromGUID2(*pv.puuid, g, 48);
+                ep.container = NormId(g);
+            }
+            PropVariantClear(&pv);
+        }
+        out.push_back(std::move(ep));
+    }
+    return out;
+}
+
+// The stereo (A2DP) endpoint is the one to make default; the hands-free (telephony) one is a worse choice. Names are
+// all there is to tell them apart, so this is a heuristic: UNVERIFIED on the owner's earphones.
+bool LooksHandsFree(std::wstring const& name) {
+    std::wstring n = NormId(name);
+    return n.find(L"hands-free") != std::wstring::npos || n.find(L"hands free") != std::wstring::npos ||
+           n.find(L"handsfree") != std::wstring::npos || n.find(L"freisprech") != std::wstring::npos;
+}
+EpInfo const* BestEndpoint(std::vector<EpInfo const*> const& eps, bool activeOnly) {
+    EpInfo const* best = nullptr;
+    for (auto const* ep : eps) {
+        if (activeOnly && ep->state != DEVICE_STATE_ACTIVE) continue;
+        if (!best || (LooksHandsFree(best->name) && !LooksHandsFree(ep->name))) best = ep;
+    }
+    return best;
+}
+
+struct OutHub {
+    std::mutex m;
+    std::vector<Device> list;
+    std::vector<EpInfo> all;  // every render endpoint in any state
+    ULONGLONG updated = 0;
+    bool busy = false, dirty = false, subscribed = false;
+    std::atomic<int> listeners{0};  // bit 0: the output page, bit 1: the Bluetooth page. Endpoint changes re-enumerate only while one is set
+    Coalescer post;
+    winrt::com_ptr<IMMDeviceEnumerator> en;
+    winrt::com_ptr<IMMNotificationClient> nc;
+};
+OutHub& Out() {
+    static OutHub* h = new OutHub;
+    return *h;
+}
+
+void OutputsKick();
+void OutputsNote();
+void BtNoteAudioChanged();  // defined with the Bluetooth hub: the audio facts of a row changed
+
+// Endpoint changes only mark the cache dirty; the callback itself never calls back into the enumerator.
+struct OutChanged : winrt::implements<OutChanged, IMMNotificationClient> {
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { OutputsNote(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { OutputsNote(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { OutputsNote(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow f, ERole, LPCWSTR) override {
+        if (f == eRender) OutputsNote();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+};
+
+bool SameOutputs(std::vector<Device> const& a, std::vector<Device> const& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].id != b[i].id || a[i].name != b[i].name || a[i].isDefault != b[i].isDefault) return false;
+    return true;
+}
+
+void OutputsWorker() {
+    auto& h = Out();
+    {   // subscribe once, on first use, from a worker: the notification client stays for the life of the process
+        std::lock_guard lock(h.m);
+        if (!h.subscribed) {
+            h.subscribed = true;
+            if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
+                                           __uuidof(IMMDeviceEnumerator), h.en.put_void()))) {
+                h.nc = winrt::make<OutChanged>();
+                if (FAILED(h.en->RegisterEndpointNotificationCallback(h.nc.get()))) h.nc = nullptr;
+            }
+        }
+    }
+    for (;;) {
+        { std::lock_guard lock(h.m); h.dirty = false; }
+        auto devices = OutputDevices();
+        auto all = AllRenderEndpoints();
+        bool changed, allChanged;
+        {
+            std::lock_guard lock(h.m);
+            changed = !h.updated || !SameOutputs(h.list, devices);
+            allChanged = h.all != all;
+            h.list = std::move(devices);
+            h.all = std::move(all);
+            h.updated = GetTickCount64();
+            if (!h.dirty) { h.busy = false; break; }
+        }
+        if (changed) h.post.Poke();
+        if (allChanged) BtNoteAudioChanged();
+    }
+    BtNoteAudioChanged();
+    h.post.PostNow();  // the last enumeration also clears the refreshing flag, so always tell the page
+}
+
+void OutputsKick() {
+    auto& h = Out();
+    {
+        std::lock_guard lock(h.m);
+        if (h.busy) { h.dirty = true; return; }
+        h.busy = true;
+    }
+    if (!RunOffThread(OutputsWorker)) {
+        std::lock_guard lock(h.m);
+        h.busy = false;
+    }
+}
+void OutputsNote() {
+    if (Out().listeners.load()) OutputsKick();
+}
+}  // namespace
+
+std::vector<Device> OutputDevicesCached() {
+    auto& h = Out();
+    std::lock_guard lock(h.m);
+    return h.list;
+}
+void OutputsRefresh(HWND notify, UINT msg) {
+    auto& h = Out();
+    h.listeners |= 1;
+    h.post.SetTarget(notify, msg);
+    h.post.PostNow();  // the page re-reads the cache straight away
+    OutputsKick();
+}
+void OutputsStop() {
+    Out().listeners &= ~1;
+    Out().post.SetTarget(nullptr, 0);
+}
+ListInfo OutputsInfo() {
+    auto& h = Out();
+    std::lock_guard lock(h.m);
+    return {h.updated != 0, h.busy, h.updated};
+}
+
+void SetDefaultAudioOutput(std::wstring const& endpointId, HWND notify, UINT msg, std::function<void(AudioOpResult)> done) {
+    auto job = [id = endpointId, notify, msg, done] {
+        const AudioOpResult r = SetDefaultNow(id);
+        if (done) done(r);
+        OutputsKick();
+        if (notify) PostMessageW(notify, msg, 0, 0);
+    };
+    if (!RunOffThread(job)) {
+        if (done) done(AudioOpResult::Failed);
+    }
+}
+
+bool SetDefaultOutput(std::wstring const& id) {
+    SetDefaultAudioOutput(id, nullptr, 0);
+    return true;
 }
 
 // ---- Power ----------------------------------------------------------------------------
@@ -444,16 +722,45 @@ void Set(int percent) {
 // ---- Radios ---------------------------------------------------------------------------------
 namespace wdr = winrt::Windows::Devices::Radios;
 
+namespace {
+// The radios found last time, kept for the life of the process: a Start() after the first one has them at once
+// (the old code re-ran GetRadiosAsync on every Start-panel open, and the tiles ignored clicks until it returned).
+std::mutex g_radioCacheMutex;
+std::vector<wdr::Radio> g_radioCache;
+bool g_radioCacheValid = false;
+std::atomic<bool> g_radioAccessGranted{false};
+
+// An unplugged USB adapter leaves a closed Radio whose State() throws.
+bool RadioIsDead(wdr::Radio const& r) {
+    try { (void)r.State(); return false; } catch (...) { return true; }
+}
+}  // namespace
+
 void Radios::Start(HWND notify, UINT msg) {
     Stop();
     m_notify = notify;
     m_msg = msg;
-    m_loading = true;
-    Find(notify, msg, m_gen, *m_gen);
+    {
+        std::lock_guard lock(g_radioCacheMutex);
+        if (g_radioCacheValid) Adopt(g_radioCache, notify, msg);
+    }
+    m_loading = !m_wifi && !m_bt;
+    Find(notify, msg, m_gen, *m_gen);  // always re-check in the background: an adapter may have come or gone
+    try {
+        // The tile's SSID follows the network, not only the radio. The read happens off-thread; the UI gets a message.
+        namespace wncs = winrt::Windows::Networking::Connectivity;
+        auto token = wncs::NetworkInformation::NetworkStatusChanged(
+            [notify, msg](winrt::Windows::Foundation::IInspectable const&) { SsidRefresh(notify, msg); });
+        m_netUnsub = [token] {
+            try { wncs::NetworkInformation::NetworkStatusChanged(token); } catch (...) {}
+        };
+    } catch (...) {}
+    SsidRefresh(notify, msg);
 }
 
 void Radios::Stop() {
     ++*m_gen;
+    if (m_netUnsub) { m_netUnsub(); m_netUnsub = nullptr; }
     m_wifiRev.revoke();
     m_btRev.revoke();
     m_wifi = nullptr;
@@ -461,38 +768,91 @@ void Radios::Stop() {
     m_loading = m_failed = false;
 }
 
+void Radios::Adopt(std::vector<wdr::Radio> const& radios, HWND notify, UINT msg) {
+    auto handler = [notify, msg](auto&&, auto&&) { PostMessageW(notify, msg, 0, 0); };
+    for (auto const& r : radios) {
+        try {
+            if (r.Kind() == wdr::RadioKind::WiFi && (!m_wifi || RadioIsDead(m_wifi))) {
+                m_wifiRev.revoke();
+                m_wifi = r;
+                m_wifiRev = r.StateChanged(winrt::auto_revoke, handler);
+            }
+            if (r.Kind() == wdr::RadioKind::Bluetooth && (!m_bt || RadioIsDead(m_bt))) {
+                m_btRev.revoke();
+                m_bt = r;
+                m_btRev = r.StateChanged(winrt::auto_revoke, handler);
+            }
+        } catch (...) {}
+    }
+}
+
 winrt::fire_and_forget Radios::Find(HWND notify, UINT msg, std::shared_ptr<unsigned> live, unsigned gen) {
+    winrt::apartment_context ui;  // the thread that owns this object
+    std::vector<wdr::Radio> found;
+    bool failed = false;
     try {
-        auto radios = co_await wdr::Radio::GetRadiosAsync();  // resumes on the UI thread
-        if (gen != *live) co_return;
-        for (auto const& r : radios) {
-            auto handler = [notify, msg](auto&&, auto&&) { PostMessageW(notify, msg, 0, 0); };
-            if (r.Kind() == wdr::RadioKind::WiFi && !m_wifi) { m_wifi = r; m_wifiRev = r.StateChanged(winrt::auto_revoke, handler); }
-            if (r.Kind() == wdr::RadioKind::Bluetooth && !m_bt) { m_bt = r; m_btRev = r.StateChanged(winrt::auto_revoke, handler); }
-        }
+        co_await winrt::resume_background();
+        auto radios = co_await wdr::Radio::GetRadiosAsync();
+        for (auto const& r : radios) found.push_back(r);
     } catch (...) {
-        if (gen != *live) co_return;
-        m_failed = true;
+        failed = true;
+    }
+    co_await ui;
+    if (gen != *live) co_return;
+    if (failed) {
+        if (!m_wifi && !m_bt) m_failed = true;
+    } else {
+        {
+            std::lock_guard lock(g_radioCacheMutex);
+            g_radioCache = found;
+            g_radioCacheValid = true;
+        }
+        Adopt(found, notify, msg);
     }
     m_loading = false;
     PostMessageW(notify, msg, 0, 0);
 }
 
-// An unplugged USB adapter leaves a closed Radio whose State() throws.
 static bool RadioIsOn(wdr::Radio const& r) {
     try { return r && r.State() == wdr::RadioState::On; } catch (...) { return false; }
 }
-bool Radios::WifiOn() const { return RadioIsOn(m_wifi); }
-bool Radios::BluetoothOn() const { return RadioIsOn(m_bt); }
+bool Radios::WifiOn() const {
+    const int want = m_wifiOp->want.load();
+    return want >= 0 ? want == 1 : RadioIsOn(m_wifi);
+}
+bool Radios::BluetoothOn() const {
+    const int want = m_btOp->want.load();
+    return want >= 0 ? want == 1 : RadioIsOn(m_bt);
+}
 
-winrt::fire_and_forget Radios::Set(wdr::Radio radio, bool on, HWND notify, UINT msg) {
+// Everything slow (the access request, SetStateAsync) runs on a pool thread; the caller only records the request.
+// Requests that arrive while one is running replace the pending target; the running worker applies the latest.
+winrt::fire_and_forget Radios::Set(wdr::Radio radio, std::shared_ptr<Op> op, bool on, HWND notify, UINT msg) {
     if (!radio) co_return;
     if (DryRun()) { Log(std::wstring(L"DRYRUN radio ") + (radio.Kind() == wdr::RadioKind::WiFi ? L"wifi" : L"bluetooth") +
                         (on ? L" -> on" : L" -> off")); co_return; }
-    try {
-        if (co_await wdr::Radio::RequestAccessAsync() == wdr::RadioAccessStatus::Allowed)
-            co_await radio.SetStateAsync(on ? wdr::RadioState::On : wdr::RadioState::Off);
-    } catch (...) {}
+    op->want = on ? 1 : 0;
+    if (op->busy.exchange(true)) co_return;  // the running worker picks up the new target
+    co_await winrt::resume_background();
+    for (;;) {
+        try {
+            for (;;) {
+                const int w = op->want.load();
+                if (w < 0) break;
+                if (!g_radioAccessGranted.load()) {
+                    if (co_await wdr::Radio::RequestAccessAsync() == wdr::RadioAccessStatus::Allowed) g_radioAccessGranted = true;
+                }
+                if (g_radioAccessGranted.load())
+                    co_await radio.SetStateAsync(w == 1 ? wdr::RadioState::On : wdr::RadioState::Off);
+                int expected = w;
+                if (op->want.compare_exchange_strong(expected, -1)) break;
+            }
+        } catch (...) {
+            op->want = -1;
+        }
+        op->busy = false;
+        if (op->want.load() < 0 || op->busy.exchange(true)) break;  // a request slipped in while we were finishing
+    }
     PostMessageW(notify, msg, 0, 0);  // the tile was flipped optimistically: if nothing changed, this puts the truth back
 }
 
@@ -515,6 +875,44 @@ std::wstring ConnectedSsid() {
     return {};
 }
 
+namespace {
+std::mutex g_ssidMutex;
+std::wstring g_ssid;
+bool g_ssidKnown = false, g_ssidBusy = false, g_ssidDirty = false;
+}  // namespace
+
+std::wstring CachedSsid() {
+    std::lock_guard lock(g_ssidMutex);
+    return g_ssid;
+}
+
+// One off-thread ConnectedSsid() read at a time; a request that arrives during a read triggers one more read after it.
+void SsidRefresh(HWND notify, UINT msg) {
+    {
+        std::lock_guard lock(g_ssidMutex);
+        if (g_ssidBusy) { g_ssidDirty = true; return; }
+        g_ssidBusy = true;
+    }
+    if (!RunOffThread([notify, msg] {
+            bool changed = false;
+            for (;;) {
+                auto ssid = ConnectedSsid();
+                {
+                    std::lock_guard lock(g_ssidMutex);
+                    changed |= !g_ssidKnown || ssid != g_ssid;
+                    g_ssid = std::move(ssid);
+                    g_ssidKnown = true;
+                    if (!g_ssidDirty) { g_ssidBusy = false; break; }
+                    g_ssidDirty = false;
+                }
+            }
+            if (changed && notify) PostMessageW(notify, msg, 0, 0);
+        })) {
+        std::lock_guard lock(g_ssidMutex);
+        g_ssidBusy = false;
+    }
+}
+
 // ---- Quick toggles ------------------------------------------------------------------------
 namespace {
 constexpr wchar_t kThemeKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
@@ -535,8 +933,13 @@ void SetDarkMode(bool on) {
     RegSetValueExW(k, L"SystemUsesLightTheme", 0, REG_DWORD, reinterpret_cast<BYTE const*>(&v), sizeof(v));
     RegCloseKey(k);
     Log(std::wstring(L"dark mode -> ") + (on ? L"on" : L"off") + L" (AppsUseLightTheme=" + std::to_wstring(v) + L")");
-    DWORD_PTR r;
-    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"ImmersiveColorSet"), SMTO_ABORTIFHUNG, 200, &r);
+    // The broadcast waits for every top-level window to answer (up to 200 ms each): never on the caller's thread.
+    try {
+        std::thread([] {
+            DWORD_PTR r;
+            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"ImmersiveColorSet"), SMTO_ABORTIFHUNG, 200, &r);
+        }).detach();
+    } catch (...) {}
 }
 
 // Night light lives in a CloudStore blob (undocumented). Observed on this build by toggling the real
@@ -636,6 +1039,7 @@ bool ReadHotspot() {
 
 static winrt::fire_and_forget HotspotSet(bool on) {
     try {
+        co_await winrt::resume_background();  // the tethering manager lookup is a synchronous RPC: not on the caller's thread
         auto mgr = wno::NetworkOperatorTetheringManager::CreateFromConnectionProfile(wnc::NetworkInformation::GetInternetConnectionProfile());
         if (on) co_await mgr.StartTetheringAsync(); else co_await mgr.StopTetheringAsync();
     } catch (...) {}
@@ -731,17 +1135,23 @@ bool WlanProfileConnected(GUID const& interfaceId, std::wstring const& profileNa
            profileName == attributes->strProfileName;
 }
 
+void ClearWifiPendingLocked() {
+    for (auto& net : g_wifiNets) net.pending = false;
+}
+
+// Polls the OS until the profile is the connected one: every 300 ms for ~10 s (the old 1 s step added up to a
+// second of latency to "Connected").
 void WifiConnectionReadback(unsigned gen, HWND notify, UINT msg, std::wstring profileName, GUID interfaceId) {
     try {
-        for (int attempt = 0; attempt < 10 && gen == g_wifiGen.load(); ++attempt) {
-            Sleep(1000);
+        for (int attempt = 0; attempt < 34 && gen == g_wifiGen.load(); ++attempt) {
+            Sleep(300);
             if (gen != g_wifiGen.load()) return;
             DWORD error = ERROR_SUCCESS;
             if (!WlanProfileConnected(interfaceId, profileName, error)) {
                 if (error == ERROR_ACCESS_DENIED) {
                     {
                         std::lock_guard lock(g_wifiMutex);
-                        if (gen == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::AccessDenied, error};
+                        if (gen == g_wifiGen.load()) { g_wifiStatus = {DiscoveryPhase::AccessDenied, error}; ClearWifiPendingLocked(); }
                     }
                     if (notify) PostMessageW(notify, msg, 0, 0);
                     return;
@@ -753,8 +1163,13 @@ void WifiConnectionReadback(unsigned gen, HWND notify, UINT msg, std::wstring pr
                 if (gen != g_wifiGen.load()) return;
                 for (auto& net : g_wifiNets)
                     net.connected = net.interfaceId == interfaceId && net.profileName == profileName;
+                std::stable_sort(g_wifiNets.begin(), g_wifiNets.end(), [](WifiNet const& a, WifiNet const& b) {
+                    return a.connected > b.connected;
+                });
+                ClearWifiPendingLocked();
                 g_wifiStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
             }
+            SsidRefresh(notify, msg);  // the tile's SSID text
             if (notify) PostMessageW(notify, msg, 0, 0);
             return;
         }
@@ -762,11 +1177,12 @@ void WifiConnectionReadback(unsigned gen, HWND notify, UINT msg, std::wstring pr
             std::lock_guard lock(g_wifiMutex);
             if (gen != g_wifiGen.load()) return;
             g_wifiStatus = {DiscoveryPhase::Failed, ERROR_TIMEOUT};
+            ClearWifiPendingLocked();
         }
         if (notify) PostMessageW(notify, msg, 0, 0);
     } catch (...) {
         std::lock_guard lock(g_wifiMutex);
-        if (gen == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
+        if (gen == g_wifiGen.load()) { g_wifiStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE}; ClearWifiPendingLocked(); }
         if (notify) PostMessageW(notify, msg, 0, 0);
     }
 }
@@ -787,6 +1203,85 @@ std::wstring SsidText(DOT11_SSID const& ssid) {
     return out;
 }
 
+std::atomic<ULONGLONG> g_wifiStamp{0};  // GetTickCount64() of the last applied list; 0 = never
+
+std::wstring WifiKey(WifiNet const& n) {
+    wchar_t guid[48] = {};
+    StringFromGUID2(n.interfaceId, guid, 48);
+    return n.ssid + L'\x1f' + guid;
+}
+
+int CompareNoCase(std::wstring const& a, std::wstring const& b) {
+    return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) - CSTR_EQUAL;
+}
+
+// One row per SSID and adapter (Windows lists an SSID once per security type), a stable key on every row, the
+// pending flag of an in-flight connect carried over, and a stable order: connected first, then by name, then key.
+// A refresh therefore never reorders rows that did not change.
+void NormalizeWifi(std::vector<WifiNet>& nets) {
+    std::vector<std::wstring> pendingKeys;
+    {
+        std::lock_guard lock(g_wifiMutex);
+        for (auto const& n : g_wifiNets) if (n.pending) pendingKeys.push_back(n.id);
+    }
+    std::vector<WifiNet> out;
+    std::unordered_map<std::wstring, size_t> index;
+    for (auto& n : nets) {
+        n.id = WifiKey(n);
+        auto it = index.find(n.id);
+        if (it == index.end()) {
+            index[n.id] = out.size();
+            out.push_back(std::move(n));
+            continue;
+        }
+        auto& kept = out[it->second];
+        kept.connected = kept.connected || n.connected;
+        kept.bars = std::max(kept.bars, n.bars);
+        if (kept.profileName.empty()) kept.profileName = n.profileName;
+        kept.secure = kept.secure && n.secure;
+    }
+    for (auto& n : out)
+        n.pending = std::find(pendingKeys.begin(), pendingKeys.end(), n.id) != pendingKeys.end();
+    std::stable_sort(out.begin(), out.end(), [](WifiNet const& a, WifiNet const& b) {
+        if (a.connected != b.connected) return a.connected > b.connected;
+        if (int c = CompareNoCase(a.ssid, b.ssid)) return c < 0;
+        return a.id < b.id;
+    });
+    nets = std::move(out);
+}
+
+// Appends the OS's current (cached or fresh) list for one adapter.
+DWORD ReadWifiList(HANDLE wlan, GUID const& iface, std::vector<WifiNet>& nets) {
+    WlanMemory available;
+    auto status = WlanGetAvailableNetworkList(wlan, &iface, 0, nullptr,
+                                              reinterpret_cast<PWLAN_AVAILABLE_NETWORK_LIST*>(&available.value));
+    if (status != ERROR_SUCCESS) return status;
+    auto networks = available.as<WLAN_AVAILABLE_NETWORK_LIST>();
+    for (DWORD j = 0; networks && j < networks->dwNumberOfItems; ++j) {
+        auto const& item = networks->Network[j];
+        auto ssid = SsidText(item.dot11Ssid);
+        if (ssid.empty()) continue;
+        std::wstring profile = item.strProfileName;
+        nets.push_back({std::move(ssid), radio_policy::SignalBars(item.wlanSignalQuality),
+                        item.bSecurityEnabled != FALSE,
+                        (item.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) != 0,
+                        std::move(profile), iface});
+    }
+    return ERROR_SUCCESS;
+}
+
+// Rows from the OS's cached scan, published while the real scan is still running (status stays Loading).
+void PublishWifiPartial(unsigned gen, HWND notify, UINT msg, std::vector<WifiNet> nets) {
+    NormalizeWifi(nets);
+    {
+        std::lock_guard lock(g_wifiMutex);
+        if (gen != g_wifiGen.load()) return;
+        g_wifiNets = std::move(nets);
+        g_wifiStamp = GetTickCount64();
+    }
+    if (notify) PostMessageW(notify, msg, 0, 0);
+}
+
 void FinishWifi(unsigned gen, HWND notify, UINT msg, std::vector<WifiNet> nets, DWORD error, bool hadAdapter, bool hadSuccess = false) {
     if (gen != g_wifiGen.load()) return;
     std::stable_sort(nets.begin(), nets.end(), [](WifiNet const& a, WifiNet const& b) {
@@ -802,6 +1297,14 @@ void FinishWifi(unsigned gen, HWND notify, UINT msg, std::vector<WifiNet> nets, 
         g_activeWifiScan.reset();
     }
     if (notify) PostMessageW(notify, msg, 0, 0);
+}
+
+// FinishWifi plus normalisation and the freshness stamp, for a result that will actually be applied.
+void CompleteWifi(unsigned gen, HWND notify, UINT msg, std::vector<WifiNet> nets, DWORD error, bool hadAdapter, bool hadSuccess = false) {
+    const bool usable = hadSuccess || error == ERROR_SUCCESS;
+    if (usable) NormalizeWifi(nets);
+    if (usable && gen == g_wifiGen.load()) g_wifiStamp = GetTickCount64();
+    FinishWifi(gen, notify, msg, std::move(nets), error, hadAdapter, hadSuccess);
 }
 
 void WifiScanTaskBody(unsigned gen, HWND notify, UINT msg, std::shared_ptr<ScanSignal> signal) {
@@ -830,6 +1333,14 @@ void WifiScanTaskBody(unsigned gen, HWND notify, UINT msg, std::shared_ptr<ScanS
         return;
     }
     hadAdapter = true;
+    {   // Phase A: the OS keeps its own scan results (it rescans on its own); publish them now so the page has rows
+        // while the real scan below runs. The old code showed nothing until WlanScan had completed (1-4 s).
+        std::vector<WifiNet> early;
+        bool any = false;
+        for (DWORD i = 0; i < list->dwNumberOfItems && !cancelled(); ++i)
+            if (ReadWifiList(wlan.value, list->InterfaceInfo[i].InterfaceGuid, early) == ERROR_SUCCESS) any = true;
+        if (any && !cancelled()) PublishWifiPartial(gen, notify, msg, std::move(early));
+    }
     {
         std::lock_guard lock(g_scanRegistryMutex);
         g_scanRegistry[signal.get()] = signal;
@@ -854,33 +1365,23 @@ void WifiScanTaskBody(unsigned gen, HWND notify, UINT msg, std::shared_ptr<ScanS
             signal->result = ERROR_SUCCESS;
         }
         error = WlanScan(wlan.value, &iface.InterfaceGuid, nullptr, nullptr, nullptr);
+        DWORD scanError = error;
         if (error == ERROR_SUCCESS) {
             std::unique_lock lock(signal->mutex);
             bool ended = signal->changed.wait_for(lock, std::chrono::seconds(4), [&] {
                 return signal->complete || signal->cancelled || cancelled();
             });
             if (signal->cancelled || cancelled()) break;
-            error = ended ? signal->result : ERROR_TIMEOUT;
+            scanError = ended ? signal->result : ERROR_TIMEOUT;
         }
-        if (error == ERROR_SUCCESS) {
-            WlanMemory available;
-            auto status = WlanGetAvailableNetworkList(wlan.value, &iface.InterfaceGuid, 0, nullptr,
-                    reinterpret_cast<PWLAN_AVAILABLE_NETWORK_LIST*>(&available.value));
-            if (status == ERROR_SUCCESS) {
-                hadSuccess = true;
-                auto networks = available.as<WLAN_AVAILABLE_NETWORK_LIST>();
-                for (DWORD j = 0; networks && j < networks->dwNumberOfItems; ++j) {
-                    auto const& item = networks->Network[j];
-                    auto ssid = SsidText(item.dot11Ssid);
-                    if (ssid.empty()) continue;
-                    std::wstring profile = item.strProfileName;
-                    nets.push_back({std::move(ssid), radio_policy::SignalBars(item.wlanSignalQuality),
-                                    item.bSecurityEnabled != FALSE,
-                                    (item.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) != 0,
-                                    std::move(profile), iface.InterfaceGuid});
-                }
-                error = ERROR_SUCCESS;
-            } else error = status;
+        // Read the list whether or not the scan finished in time: a slow or throttled scan still leaves the
+        // OS's latest results, and those are better than losing the rows phase A already showed.
+        const DWORD status = ReadWifiList(wlan.value, iface.InterfaceGuid, nets);
+        if (status == ERROR_SUCCESS) {
+            hadSuccess = true;
+            error = scanError;  // kept as a diagnostic: FinishWifi reports Ready when any adapter delivered rows
+        } else {
+            error = scanError != ERROR_SUCCESS ? scanError : status;
         }
         if (error != ERROR_SUCCESS && firstError == ERROR_SUCCESS) firstError = error;
     }
@@ -888,7 +1389,7 @@ void WifiScanTaskBody(unsigned gen, HWND notify, UINT msg, std::shared_ptr<ScanS
     registration.Reset();
     if (!cancelled()) {
         DWORD result = hadSuccess ? firstError : firstError == ERROR_SUCCESS ? ERROR_GEN_FAILURE : firstError;
-        FinishWifi(gen, notify, msg, std::move(nets), result, hadAdapter, hadSuccess);
+        CompleteWifi(gen, notify, msg, std::move(nets), result, hadAdapter, hadSuccess);
     }
 }
 
@@ -912,185 +1413,307 @@ void WifiScanTask(unsigned gen, HWND notify, UINT msg, std::shared_ptr<ScanSigna
     }
 }
 
-std::mutex g_btMutex;
-std::vector<BtDevice> g_btDevices;
-DiscoveryStatus g_btStatus;
-unsigned g_btGen = 0;
+// ---- Bluetooth: one long-lived watcher pair over AssociationEndpoints --------------------------------------------
+// Classic (BluetoothDevice) and LE (BluetoothLEDevice) paired devices are separate selectors; the old code watched
+// Classic only. Connection state comes from System.Devices.Aep.IsConnected, requested with the watcher, so it needs
+// no BluetoothDevice object per device (the old code opened every paired device with FromIdAsync, again on every
+// Updated event). Entries of one physical device (Classic + LE) share a ContainerId and are merged into one row.
+namespace wde = winrt::Windows::Devices::Enumeration;
+namespace wdb = winrt::Windows::Devices::Bluetooth;
 
-struct BtEntry {
-    std::wstring name;
-    bool connected = false;
-    winrt::Windows::Devices::Bluetooth::BluetoothDevice device{nullptr};
-    winrt::Windows::Devices::Bluetooth::BluetoothDevice::ConnectionStatusChanged_revoker connectionRev;
+struct BtRec {
+    std::wstring name, group;
+    bool connected = false, classic = false;
+    wde::DeviceInformation info{nullptr};
 };
-struct BtSession {
-    using Watcher = winrt::Windows::Devices::Enumeration::DeviceWatcher;
-    std::atomic<bool> live{true};
-    unsigned gen = 0;
-    HWND notify{};
-    UINT msg{};
-    Watcher watcher{nullptr};
-    Watcher::Added_revoker addedRev;
-    Watcher::Updated_revoker updatedRev;
-    Watcher::Removed_revoker removedRev;
-    Watcher::EnumerationCompleted_revoker completedRev;
-    Watcher::Stopped_revoker stoppedRev;
-    std::unordered_map<std::wstring, unsigned> serials;
-    std::unordered_map<std::wstring, BtEntry> entries;
-    unsigned pending = 0;
-    bool enumerated = false;
+struct BtTransport {
+    wde::DeviceWatcher watcher{nullptr};
+    wde::DeviceWatcher::Added_revoker addedRev;
+    wde::DeviceWatcher::Updated_revoker updatedRev;
+    wde::DeviceWatcher::Removed_revoker removedRev;
+    wde::DeviceWatcher::EnumerationCompleted_revoker completedRev;
+    wde::DeviceWatcher::Stopped_revoker stoppedRev;
+    bool running = false, enumerated = false;
 };
-std::shared_ptr<BtSession> g_btSession;
+struct BtHub {
+    std::mutex m;
+    std::unordered_map<std::wstring, BtRec> recs;  // by AEP id
+    std::vector<BtDevice> list;                    // the published snapshot
+    DiscoveryStatus status;
+    ULONGLONG updated = 0;
+    bool sawConnectionProperty = false, workerBusy = false;
+    BtTransport t[2];  // 0 = Classic, 1 = LE
+    std::unordered_set<std::wstring> connecting;  // NormId of the devices with a connect/disconnect in flight
+    Coalescer post;
+};
+BtHub& Bt() {
+    static BtHub* hub = new BtHub;  // never destroyed: watcher callbacks may still run at process exit
+    return *hub;
+}
+void BtNoteAudioChanged() { Bt().post.Poke(); }
 
-void PostBt(std::shared_ptr<BtSession> const& session) {
-    if (session && session->live.load() && session->notify) PostMessageW(session->notify, session->msg, 0, 0);
+auto BtProps() {
+    return winrt::single_threaded_vector<winrt::hstring>({L"System.Devices.Aep.IsConnected", L"System.Devices.Aep.ContainerId", L"System.Devices.Aep.DeviceAddress"});
 }
-bool IsCurrentBt(std::shared_ptr<BtSession> const& session) {
-    return session && session->live.load() && g_btSession == session && g_btGen == session->gen;
+winrt::hstring BtSelector(bool classic) {
+    return classic ? wdb::BluetoothDevice::GetDeviceSelectorFromPairingState(true)
+                   : wdb::BluetoothLEDevice::GetDeviceSelectorFromPairingState(true);
 }
-void SortBt() {
-    std::stable_sort(g_btDevices.begin(), g_btDevices.end(), [](BtDevice const& a, BtDevice const& b) {
+
+// Caller holds h.m.
+void FillBt(BtHub& h, BtRec& r, wde::DeviceInformation const& info, bool classic) {
+    r.info = info;
+    r.classic = classic;
+    r.name = info.Name().c_str();
+    auto props = info.Properties();
+    if (auto conn = props.TryLookup(L"System.Devices.Aep.IsConnected")) {
+        h.sawConnectionProperty = true;
+        r.connected = winrt::unbox_value_or<bool>(conn, false);
+    }
+    winrt::guid container = winrt::unbox_value_or<winrt::guid>(props.TryLookup(L"System.Devices.Aep.ContainerId"), winrt::guid{});
+    std::wstring address = winrt::unbox_value_or<winrt::hstring>(props.TryLookup(L"System.Devices.Aep.DeviceAddress"), winrt::hstring{}).c_str();
+    for (auto& c : address) c = static_cast<wchar_t>(towlower(c));
+    if (container != winrt::guid{}) r.group = winrt::to_hstring(container).c_str();
+    else if (!address.empty()) r.group = address;
+    else r.group = info.Id().c_str();
+}
+
+// Caller holds h.m. Builds the merged, ordered snapshot; true if it differs from the published one.
+bool RebuildBt(BtHub& h) {
+    std::unordered_map<std::wstring, BtDevice> merged;
+    for (auto const& [id, r] : h.recs) {
+        auto& d = merged[r.group];
+        d.id = r.group;
+        d.connected = d.connected || r.connected;
+        if (r.classic || d.aepId.empty()) d.aepId = id;
+        if (!r.name.empty() && (d.name.empty() || r.classic)) d.name = r.name;
+    }
+    std::vector<BtDevice> next;
+    for (auto& [_, d] : merged) if (!d.name.empty()) next.push_back(std::move(d));
+    std::sort(next.begin(), next.end(), [](BtDevice const& a, BtDevice const& b) {
         if (a.connected != b.connected) return a.connected > b.connected;
-        return a.name < b.name;
+        if (int c = CompareNoCase(a.name, b.name)) return c < 0;
+        return a.id < b.id;
     });
-}
-void RebuildBt(std::shared_ptr<BtSession> const& session) {
-    g_btDevices.clear();
-    for (auto const& [_, entry] : session->entries)
-        g_btDevices.push_back({entry.name, entry.connected});
-    SortBt();
-}
-void BtConnectionChanged(std::weak_ptr<BtSession> weak, std::wstring id, unsigned serial,
-                         winrt::Windows::Devices::Bluetooth::BluetoothConnectionStatus status) {
-    auto session = weak.lock();
-    if (!session) return;
-    {
-        std::lock_guard lock(g_btMutex);
-        if (!IsCurrentBt(session)) return;
-        auto current = session->serials.find(id);
-        if (current == session->serials.end() || current->second != serial) return;
-        auto entry = session->entries.find(id);
-        if (entry == session->entries.end()) return;
-        entry->second.connected = status == winrt::Windows::Devices::Bluetooth::BluetoothConnectionStatus::Connected;
-        RebuildBt(session);
-    }
-    PostBt(session);
+    bool same = next.size() == h.list.size();
+    for (size_t i = 0; same && i < next.size(); ++i)
+        same = next[i].id == h.list[i].id && next[i].name == h.list[i].name && next[i].connected == h.list[i].connected;
+    if (same) return false;
+    h.list = std::move(next);
+    h.updated = GetTickCount64();
+    return true;
 }
 
-winrt::fire_and_forget ResolveBt(std::weak_ptr<BtSession> weak, std::wstring id, std::wstring name, unsigned serial) {
-    namespace wdb = winrt::Windows::Devices::Bluetooth;
-    auto session = weak.lock();
-    if (!session || !session->live.load()) co_return;
+void BtAdded(bool classic, wde::DeviceInformation const& info) {
+    auto& h = Bt();
+    bool changed;
+    {
+        std::lock_guard lock(h.m);
+        FillBt(h, h.recs[info.Id().c_str()], info, classic);
+        changed = RebuildBt(h);
+    }
+    if (changed) h.post.Poke();
+}
+void BtUpdated(bool classic, wde::DeviceInformationUpdate const& update) {
+    auto& h = Bt();
+    bool changed;
+    {
+        std::lock_guard lock(h.m);
+        auto it = h.recs.find(update.Id().c_str());
+        if (it == h.recs.end()) return;
+        it->second.info.Update(update);
+        FillBt(h, it->second, it->second.info, classic);
+        changed = RebuildBt(h);
+    }
+    if (changed) h.post.Poke();
+}
+void BtRemoved(wde::DeviceInformationUpdate const& update) {
+    auto& h = Bt();
+    bool changed;
+    {
+        std::lock_guard lock(h.m);
+        h.recs.erase(update.Id().c_str());
+        changed = RebuildBt(h);
+    }
+    if (changed) h.post.Poke();
+}
+
+// Worker thread only. Throws on failure; the caller decides what that means for the status.
+void StartBtTransport(BtHub& h, int i) {
+    auto& t = h.t[i];
+    const bool classic = i == 0;
+    t.addedRev.revoke();
+    t.updatedRev.revoke();
+    t.removedRev.revoke();
+    t.completedRev.revoke();
+    t.stoppedRev.revoke();
+    t.watcher = wde::DeviceInformation::CreateWatcher(BtSelector(classic), BtProps(), wde::DeviceInformationKind::AssociationEndpoint);
+    t.addedRev = t.watcher.Added(winrt::auto_revoke, [classic](auto const&, wde::DeviceInformation const& info) { BtAdded(classic, info); });
+    t.updatedRev = t.watcher.Updated(winrt::auto_revoke, [classic](auto const&, wde::DeviceInformationUpdate const& u) { BtUpdated(classic, u); });
+    t.removedRev = t.watcher.Removed(winrt::auto_revoke, [](auto const&, wde::DeviceInformationUpdate const& u) { BtRemoved(u); });
+    t.completedRev = t.watcher.EnumerationCompleted(winrt::auto_revoke, [i](auto const&, auto const&) {
+        std::lock_guard lock(Bt().m);
+        Bt().t[i].enumerated = true;
+    });
+    t.stoppedRev = t.watcher.Stopped(winrt::auto_revoke, [i](auto const&, auto const&) {  // aborted: the next refresh restarts it
+        std::lock_guard lock(Bt().m);
+        Bt().t[i].running = false;
+    });
+    {
+        std::lock_guard lock(h.m);
+        t.running = true;
+        t.enumerated = false;
+    }
     try {
-        auto device = co_await wdb::BluetoothDevice::FromIdAsync(id);
-        if (!device) throw winrt::hresult_error(E_FAIL, L"Bluetooth device lookup returned no device");
-        if (name.empty()) name = device.Name().c_str();
-        {
-            std::lock_guard lock(g_btMutex);
-            if (!IsCurrentBt(session)) co_return;
-            auto current = session->serials.find(id);
-            if (current != session->serials.end() && current->second == serial) {
-                BtEntry entry;
-                entry.name = name;
-                entry.device = device;
-                entry.connectionRev = device.ConnectionStatusChanged(winrt::auto_revoke,
-                    [weak, id, serial](auto const& sender, auto const&) {
-                        try { BtConnectionChanged(weak, id, serial, sender.ConnectionStatus()); } catch (...) {}
-                    });
-                entry.connected = device.ConnectionStatus() == wdb::BluetoothConnectionStatus::Connected;
-                session->entries[id] = std::move(entry);
-                RebuildBt(session);
-            }
-            if (session->pending) --session->pending;
-            if (session->enumerated && !session->pending && g_btStatus.phase == DiscoveryPhase::Loading)
-                g_btStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
-        }
-        PostBt(session);
-    } catch (winrt::hresult_error const& e) {
-        {
-            std::lock_guard lock(g_btMutex);
-            if (!IsCurrentBt(session)) co_return;
-            HRESULT hr = e.code();
-            DWORD error = static_cast<DWORD>(hr);
-            auto current = session->serials.find(id);
-            if (current != session->serials.end() && current->second == serial && !name.empty()) {
-                g_btStatus = {hr == E_ACCESSDENIED ? DiscoveryPhase::AccessDenied : DiscoveryPhase::Failed, error};
-                session->entries[id].name = name;
-                session->entries[id].connected = false;
-                RebuildBt(session);
-            }
-            if (session->pending) --session->pending;
-            if (session->enumerated && !session->pending && g_btStatus.phase == DiscoveryPhase::Loading)
-                g_btStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
-        }
-        PostBt(session);
+        t.watcher.Start();
     } catch (...) {
-        {
-            std::lock_guard lock(g_btMutex);
-            if (!IsCurrentBt(session)) co_return;
-            auto current = session->serials.find(id);
-            if (current != session->serials.end() && current->second == serial)
-                g_btStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
-            if (session->pending) --session->pending;
-            if (session->enumerated && !session->pending && g_btStatus.phase == DiscoveryPhase::Loading)
-                g_btStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
+        std::lock_guard lock(h.m);
+        t.running = false;
+        throw;
+    }
+}
+
+// Re-reads both transports with FindAllAsync (bounded) and reconciles the cache: a safety net for a missed event.
+// Returns true if every transport answered in time.
+bool ReconcileBt(BtHub& h) {
+    namespace wf = winrt::Windows::Foundation;
+    bool allAnswered = true;
+    for (int i = 0; i < 2; ++i) {
+        const bool classic = i == 0;
+        std::vector<wde::DeviceInformation> fresh;
+        try {
+            auto op = wde::DeviceInformation::FindAllAsync(BtSelector(classic), BtProps(), wde::DeviceInformationKind::AssociationEndpoint);
+            if (op.wait_for(std::chrono::seconds(4)) != wf::AsyncStatus::Completed) {
+                op.Cancel();
+                allAnswered = false;
+                continue;
+            }
+            for (auto const& info : op.GetResults()) fresh.push_back(info);
+        } catch (...) {
+            allAnswered = false;
+            continue;
         }
-        PostBt(session);
+        std::lock_guard lock(h.m);
+        std::unordered_map<std::wstring, bool> seen;
+        for (auto const& info : fresh) {
+            std::wstring id = info.Id().c_str();
+            seen[id] = true;
+            FillBt(h, h.recs[id], info, classic);
+        }
+        for (auto it = h.recs.begin(); it != h.recs.end();) {
+            if (it->second.classic == classic && !seen.count(it->first)) it = h.recs.erase(it);
+            else ++it;
+        }
+        RebuildBt(h);
     }
+    return allAnswered;
 }
 
-void StopBtSession(std::shared_ptr<BtSession> session) {
-    if (!session) return;
-    session->live = false;
-    session->addedRev.revoke();
-    session->updatedRev.revoke();
-    session->removedRev.revoke();
-    session->completedRev.revoke();
-    session->stoppedRev.revoke();
-    std::unordered_map<std::wstring, BtEntry> entries;
+// Only if the AEP never reported IsConnected: ask each Classic device object once, then release it.
+void ProbeBtConnection(BtHub& h) {
+    namespace wf = winrt::Windows::Foundation;
+    std::vector<std::wstring> ids;
     {
-        std::lock_guard lock(g_btMutex);
-        entries.swap(session->entries);
-        session->serials.clear();
+        std::lock_guard lock(h.m);
+        if (h.sawConnectionProperty) return;
+        for (auto const& [id, r] : h.recs) if (r.classic) ids.push_back(id);
     }
-    for (auto& [_, entry] : entries) entry.connectionRev.revoke();
-    try { if (session->watcher) session->watcher.Stop(); } catch (...) {}
+    for (auto const& id : ids) {
+        try {
+            auto op = wdb::BluetoothDevice::FromIdAsync(id);
+            if (op.wait_for(std::chrono::seconds(2)) != wf::AsyncStatus::Completed) { op.Cancel(); continue; }
+            auto device = op.GetResults();
+            if (!device) continue;
+            const bool connected = device.ConnectionStatus() == wdb::BluetoothConnectionStatus::Connected;
+            device.Close();
+            std::lock_guard lock(h.m);
+            auto it = h.recs.find(id);
+            if (it != h.recs.end()) it->second.connected = connected;
+        } catch (...) {}
+    }
+    std::lock_guard lock(h.m);
+    RebuildBt(h);
 }
 
-void BtResolveEvent(std::weak_ptr<BtSession> weak, std::wstring id, std::wstring name) {
-    auto session = weak.lock();
-    if (!session) return;
-    unsigned serial;
-    {
-        std::lock_guard lock(g_btMutex);
-        if (!IsCurrentBt(session)) return;
-        serial = ++session->serials[id];
-        ++session->pending;
-        g_btStatus = {DiscoveryPhase::Loading, ERROR_SUCCESS};
+void BtWorker() {
+    auto& h = Bt();
+    DiscoveryStatus result{DiscoveryPhase::Ready, ERROR_SUCCESS};
+    try {
+        bool wasRunning;
+        {
+            std::lock_guard lock(h.m);
+            wasRunning = h.t[0].running && h.t[1].running;
+        }
+        HRESULT firstFailure = S_OK;
+        int started = 0;
+        for (int i = 0; i < 2; ++i) {
+            bool running;
+            { std::lock_guard lock(h.m); running = h.t[i].running; }
+            if (running) { ++started; continue; }
+            try {
+                StartBtTransport(h, i);
+                ++started;
+            } catch (winrt::hresult_error const& e) {
+                if (firstFailure == S_OK) firstFailure = e.code();
+            } catch (...) {
+                if (firstFailure == S_OK) firstFailure = E_FAIL;
+            }
+        }
+        if (!started) {
+            result = {firstFailure == E_ACCESSDENIED ? DiscoveryPhase::AccessDenied : DiscoveryPhase::Failed, static_cast<DWORD>(firstFailure)};
+        } else if (wasRunning) {
+            if (!ReconcileBt(h)) {
+                std::lock_guard lock(h.m);
+                result = {h.list.empty() ? DiscoveryPhase::Failed : DiscoveryPhase::Ready, ERROR_TIMEOUT};
+            }
+        } else {
+            for (int waited = 0; waited < 8000; waited += 50) {  // first enumeration: rows stream in through the watchers
+                bool done = true;
+                {
+                    std::lock_guard lock(h.m);
+                    for (auto& t : h.t) if (t.running && !t.enumerated) done = false;
+                }
+                if (done) break;
+                Sleep(50);
+            }
+        }
+        if (started) ProbeBtConnection(h);
+    } catch (winrt::hresult_error const& e) {
+        result = {e.code() == E_ACCESSDENIED ? DiscoveryPhase::AccessDenied : DiscoveryPhase::Failed, static_cast<DWORD>(e.code())};
+    } catch (...) {
+        result = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
     }
-    ResolveBt(weak, std::move(id), std::move(name), serial);
+    {
+        std::lock_guard lock(h.m);
+        h.status = result;
+        h.workerBusy = false;
+        if (result.phase == DiscoveryPhase::Ready) h.updated = GetTickCount64();
+    }
+    h.post.PostNow();
 }
 
 }  // namespace
 
 void WifiRefresh(HWND notify, UINT msg) {
-    const unsigned gen = ++g_wifiGen;
     auto signal = std::make_shared<ScanSignal>();
-    std::shared_ptr<ScanSignal> old;
+    unsigned gen;
     {
         std::lock_guard lock(g_wifiMutex);
-        old = g_activeWifiScan.lock();
-        g_activeWifiScan = signal;
-        g_wifiNets.clear();
-        g_wifiStatus = {DiscoveryPhase::Loading, ERROR_SUCCESS};
         g_wifiNotify = notify;
         g_wifiMsg = msg;
+        if (g_activeWifiScan.lock()) {
+            // A scan is already running: join it instead of cancelling and restarting, so a user who presses
+            // Refresh repeatedly does not stack scans (the old code cancelled and restarted on every press).
+            gen = 0;
+        } else {
+            gen = ++g_wifiGen;
+            g_activeWifiScan = signal;
+            g_wifiStatus = {DiscoveryPhase::Loading, ERROR_SUCCESS};  // the cached rows stay: the page opens with them
+        }
     }
-    if (old) {
-        std::lock_guard lock(old->mutex);
-        old->cancelled = true;
-        old->changed.notify_all();
-    }
+    // Immediately: the page re-reads the cache (and the Loading status) on its next message.
+    if (notify) PostMessageW(notify, msg, 0, 0);
+    if (!gen) return;
     try {
         std::thread(WifiScanTask, gen, notify, msg, std::move(signal)).detach();
     } catch (...) {
@@ -1109,7 +1732,7 @@ void WifiStop() {
         std::lock_guard lock(g_wifiMutex);
         active = g_activeWifiScan.lock();
         g_activeWifiScan.reset();
-        g_wifiNets.clear();
+        ClearWifiPendingLocked();  // the cached rows stay for the next open
         g_wifiStatus = {};
         g_wifiNotify = nullptr;
         g_wifiMsg = 0;
@@ -1147,146 +1770,285 @@ bool WifiConnect(WifiNet const& network) {
                 : L"DRYRUN open Windows Wi-Fi Settings for unprofiled network");
         return true;
     }
-    if (!radio_policy::HasSavedProfile(net.profileName.c_str())) {
-        HINSTANCE result = ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
-        if (reinterpret_cast<INT_PTR>(result) > 32) return true;
+    // Everything below is a blocking call (WlanOpenHandle, WlanConnect, ShellExecute): it runs on a worker. The row is
+    // marked pending and the status says Connecting at once, so the page can draw the state before Windows answers.
+    const bool profiled = radio_policy::HasSavedProfile(net.profileName.c_str());
+    if (profiled) {
         {
             std::lock_guard lock(g_wifiMutex);
-            if (generation == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
+            if (generation == g_wifiGen.load()) {
+                g_wifiStatus = {DiscoveryPhase::Connecting, ERROR_SUCCESS};
+                for (auto& row : g_wifiNets)
+                    if (!net.id.empty() ? row.id == net.id : row.ssid == net.ssid && row.interfaceId == net.interfaceId) row.pending = true;
+            }
         }
         if (notify) PostMessageW(notify, msg, 0, 0);
-        return false;
-    }
-    WlanHandle wlan;
-    DWORD error = wlan.Open();
-    if (error == ERROR_SUCCESS) {
-        WLAN_CONNECTION_PARAMETERS cp{};
-        cp.wlanConnectionMode = wlan_connection_mode_profile;
-        cp.strProfile = net.profileName.c_str();
-        cp.dot11BssType = dot11_BSS_type_any;
-        error = WlanConnect(wlan.value, &net.interfaceId, &cp, nullptr);
-    }
-    if (error != ERROR_SUCCESS) {
-        {
-            std::lock_guard lock(g_wifiMutex);
-            if (generation == g_wifiGen.load()) g_wifiStatus = {radio_policy::PhaseForWlanError(error), error};
-        }
-        if (notify) PostMessageW(notify, msg, 0, 0);
-        return false;
     }
     try {
-        {
-            std::lock_guard lock(g_wifiMutex);
-            if (generation == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Connecting, ERROR_SUCCESS};
-        }
-        if (notify) PostMessageW(notify, msg, 0, 0);
-        std::thread(WifiConnectionReadback, generation, notify, msg, std::move(net.profileName), net.interfaceId).detach();
+        std::thread([net = std::move(net), generation, notify, msg, profiled]() mutable {
+            auto fail = [&](DiscoveryPhase phase, DWORD error) {
+                {
+                    std::lock_guard lock(g_wifiMutex);
+                    if (generation == g_wifiGen.load()) { g_wifiStatus = {phase, error}; ClearWifiPendingLocked(); }
+                }
+                if (notify) PostMessageW(notify, msg, 0, 0);
+            };
+            if (!profiled) {
+                const bool co = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+                HINSTANCE result = ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
+                if (co) CoUninitialize();
+                if (reinterpret_cast<INT_PTR>(result) <= 32) fail(DiscoveryPhase::Failed, ERROR_GEN_FAILURE);
+                return;
+            }
+            WlanHandle wlan;
+            DWORD error = wlan.Open();
+            if (error == ERROR_SUCCESS) {
+                WLAN_CONNECTION_PARAMETERS cp{};
+                cp.wlanConnectionMode = wlan_connection_mode_profile;
+                cp.strProfile = net.profileName.c_str();
+                cp.dot11BssType = dot11_BSS_type_any;
+                error = WlanConnect(wlan.value, &net.interfaceId, &cp, nullptr);
+            }
+            if (error != ERROR_SUCCESS) { fail(radio_policy::PhaseForWlanError(error), error); return; }
+            WifiConnectionReadback(generation, notify, msg, std::move(net.profileName), net.interfaceId);
+        }).detach();
     } catch (...) {
         {
             std::lock_guard lock(g_wifiMutex);
-            if (generation == g_wifiGen.load()) g_wifiStatus = {DiscoveryPhase::Failed, ERROR_NOT_ENOUGH_MEMORY};
+            if (generation == g_wifiGen.load()) { g_wifiStatus = {DiscoveryPhase::Failed, ERROR_NOT_ENOUGH_MEMORY}; ClearWifiPendingLocked(); }
         }
         if (notify) PostMessageW(notify, msg, 0, 0);
+        return false;
     }
     return true;
 }
 
+ListInfo WifiInfo() {
+    std::lock_guard lock(g_wifiMutex);
+    const ULONGLONG stamp = g_wifiStamp.load();
+    return {stamp != 0, g_wifiStatus.phase == DiscoveryPhase::Loading, stamp};
+}
+
+
 void BtRefresh(HWND notify, UINT msg) {
-    auto session = std::make_shared<BtSession>();
-    std::shared_ptr<BtSession> old;
+    auto& h = Bt();
+    h.post.SetTarget(notify, msg);
+    Out().listeners |= 2;  // the rows' audio facts follow the endpoints
+    OutputsKick();
+    bool start;
     {
-        std::lock_guard lock(g_btMutex);
-        old = std::move(g_btSession);
-        if (old) old->live = false;
-        session->gen = ++g_btGen;
-        session->notify = notify;
-        session->msg = msg;
-        g_btSession = session;
-        g_btDevices.clear();
-        g_btStatus = {DiscoveryPhase::Loading, ERROR_SUCCESS};
-    }
-    StopBtSession(std::move(old));
-    try {
-        namespace wdb = winrt::Windows::Devices::Bluetooth;
-        namespace wde = winrt::Windows::Devices::Enumeration;
-        auto selector = wdb::BluetoothDevice::GetDeviceSelectorFromPairingState(true);
-        session->watcher = wde::DeviceInformation::CreateWatcher(selector);
-        std::weak_ptr<BtSession> weak = session;
-        session->addedRev = session->watcher.Added(winrt::auto_revoke, [weak](auto const&, auto const& info) {
-            BtResolveEvent(weak, info.Id().c_str(), info.Name().c_str());
-        });
-        session->updatedRev = session->watcher.Updated(winrt::auto_revoke, [weak](auto const&, auto const& update) {
-            BtResolveEvent(weak, update.Id().c_str(), {});
-        });
-        session->removedRev = session->watcher.Removed(winrt::auto_revoke, [weak](auto const&, auto const& update) {
-            auto current = weak.lock();
-            if (!current) return;
-            {
-                std::lock_guard lock(g_btMutex);
-                if (!IsCurrentBt(current)) return;
-                ++current->serials[update.Id().c_str()];
-                current->entries.erase(update.Id().c_str());
-                RebuildBt(current);
-            }
-            PostBt(current);
-        });
-        session->completedRev = session->watcher.EnumerationCompleted(winrt::auto_revoke, [weak](auto const&, auto const&) {
-            auto current = weak.lock();
-            if (!current) return;
-            {
-                std::lock_guard lock(g_btMutex);
-                if (!IsCurrentBt(current)) return;
-                current->enumerated = true;
-                if (!current->pending && g_btStatus.phase == DiscoveryPhase::Loading)
-                    g_btStatus = {DiscoveryPhase::Ready, ERROR_SUCCESS};
-            }
-            PostBt(current);
-        });
-        session->stoppedRev = session->watcher.Stopped(winrt::auto_revoke, [weak](auto const&, auto const&) {
-            auto current = weak.lock();
-            if (!current) return;
-            {
-                std::lock_guard lock(g_btMutex);
-                if (!IsCurrentBt(current)) return;
-                if (g_btStatus.phase == DiscoveryPhase::Loading) g_btStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
-            }
-            PostBt(current);
-        });
-        session->watcher.Start();
-    } catch (winrt::hresult_error const& e) {
-        std::lock_guard lock(g_btMutex);
-        if (IsCurrentBt(session)) {
-            HRESULT hr = e.code();
-            g_btStatus = {hr == E_ACCESSDENIED ? DiscoveryPhase::AccessDenied : DiscoveryPhase::Failed, static_cast<DWORD>(hr)};
+        std::lock_guard lock(h.m);
+        start = !h.workerBusy;  // a refresh already running is joined, not stacked
+        if (start) {
+            h.workerBusy = true;
+            h.status = {DiscoveryPhase::Loading, ERROR_SUCCESS};  // the cached rows stay
         }
-        PostBt(session);
-    } catch (...) {
-        std::lock_guard lock(g_btMutex);
-        if (IsCurrentBt(session)) g_btStatus = {DiscoveryPhase::Failed, ERROR_GEN_FAILURE};
-        PostBt(session);
+    }
+    h.post.PostNow();  // the page re-reads the cache (and the Loading status) on its next message
+    if (start && !RunOffThread(BtWorker)) {
+        {
+            std::lock_guard lock(h.m);
+            h.workerBusy = false;
+            h.status = {DiscoveryPhase::Failed, ERROR_NOT_ENOUGH_MEMORY};
+        }
+        h.post.PostNow();
     }
 }
 
+// The watchers keep running and keep the cache current; only the notifications stop.
 void BtStop() {
-    std::shared_ptr<BtSession> old;
-    {
-        std::lock_guard lock(g_btMutex);
-        ++g_btGen;
-        old = std::move(g_btSession);
-        if (old) old->live = false;
-        g_btDevices.clear();
-        g_btStatus = {};
-    }
-    StopBtSession(std::move(old));
+    Out().listeners &= ~2;
+    Bt().post.SetTarget(nullptr, 0);
 }
 
 std::vector<BtDevice> BtDevices() {
-    std::lock_guard lock(g_btMutex);
-    return g_btDevices;
+    auto& h = Bt();
+    std::vector<BtDevice> list;
+    std::unordered_set<std::wstring> connecting;
+    {
+        std::lock_guard lock(h.m);
+        list = h.list;
+        connecting = h.connecting;
+    }
+    auto& out = Out();
+    std::lock_guard lock(out.m);
+    for (auto& d : list) {
+        const std::wstring key = NormId(d.id);
+        d.pending = connecting.count(key) != 0;
+        std::vector<EpInfo const*> mine;
+        for (auto const& ep : out.all) if (!ep.container.empty() && ep.container == key) mine.push_back(&ep);
+        if (mine.empty()) continue;
+        d.audio = true;
+        if (auto const* active = BestEndpoint(mine, true)) {
+            d.audioActive = true;
+            d.audioDefault = active->isDefault;
+            d.endpointId = active->id;
+        } else if (auto const* any = BestEndpoint(mine, false)) {
+            d.endpointId = any->id;
+        }
+    }
+    return list;
 }
 DiscoveryStatus BtStatus() {
-    std::lock_guard lock(g_btMutex);
-    return g_btStatus;
+    auto& h = Bt();
+    std::lock_guard lock(h.m);
+    return h.status;
+}
+ListInfo BtInfo() {
+    auto& h = Bt();
+    std::lock_guard lock(h.m);
+    return {h.updated != 0, h.status.phase == DiscoveryPhase::Loading, h.updated};
+}
+
+// ---- Bluetooth audio: connect / disconnect through the audio driver's one-shot properties ---------------------------
+// Windows has no public "connect this paired device" call for desktop apps. The Bluetooth audio drivers implement
+// KSPROPERTY_ONESHOT_RECONNECT / _DISCONNECT on their KS filter (Microsoft Learn: "prompt the audio driver to attempt
+// to connect to the Bluetooth audio device"; Get-only, target Filter, no value, success only means the driver tried);
+// that is what the Sound control panel's Connect command uses. Reaching the filter from an endpoint:
+//   IMMDevice(endpoint) -> Activate(IDeviceTopology) -> IConnector -> GetDeviceIdConnectedTo() -> IMMDeviceEnumerator::
+//   GetDevice(that id) -> Activate(IKsControl) -> KsProperty({KSPROPSETID_BtAudio, id, GET}).
+// Constants: KSPROPSETID_BtAudio {7FA06C40-B8F6-4C7E-8556-E8C33A12E54D}, KSPROPERTY_ONESHOT_RECONNECT = 0, _DISCONNECT = 1
+// (microsoft/windows-rs metadata/win32/ksmedia.rdl, generated from the SDK headers; MicrosoftDocs kspropsetid-btaudio.md).
+// The sequence was cross-checked against two independent open implementations (read for the approach only; this code
+// is written fresh).
+namespace {
+constexpr GUID kKsetBtAudio = {0x7fa06c40, 0xb8f6, 0x4c7e, {0x85, 0x56, 0xe8, 0xc3, 0x3a, 0x12, 0xe5, 0x4d}};
+constexpr ULONG kBtOneShotReconnect = 0, kBtOneShotDisconnect = 1;
+
+bool SendKsBtProperty(IMMDeviceEnumerator* en, wchar_t const* filterDeviceId, ULONG propId) {
+    winrt::com_ptr<IMMDevice> dev;
+    if (FAILED(en->GetDevice(filterDeviceId, dev.put()))) return false;
+    winrt::com_ptr<IKsControl> ks;
+    if (FAILED(dev->Activate(__uuidof(IKsControl), CLSCTX_ALL, nullptr, ks.put_void()))) return false;
+    KSPROPERTY prop{};
+    prop.Set = kKsetBtAudio;
+    prop.Id = propId;
+    prop.Flags = KSPROPERTY_TYPE_GET;
+    ULONG returned = 0;
+    return SUCCEEDED(ks->KsProperty(&prop, sizeof(prop), nullptr, 0, &returned));
+}
+
+// One endpoint -> its Bluetooth filter -> the one-shot. True if the driver accepted a request.
+bool SendBtOneShot(IMMDeviceEnumerator* en, std::wstring const& endpointId, ULONG propId) {
+    winrt::com_ptr<IMMDevice> endpoint;
+    if (FAILED(en->GetDevice(endpointId.c_str(), endpoint.put()))) return false;
+    winrt::com_ptr<IDeviceTopology> topo;
+    if (FAILED(endpoint->Activate(__uuidof(IDeviceTopology), CLSCTX_ALL, nullptr, topo.put_void()))) return false;
+    UINT count = 0;
+    if (FAILED(topo->GetConnectorCount(&count))) return false;
+    for (UINT i = 0; i < count; ++i) {
+        winrt::com_ptr<IConnector> conn;
+        if (FAILED(topo->GetConnector(i, conn.put()))) continue;
+        LPWSTR other = nullptr;
+        if (SUCCEEDED(conn->GetDeviceIdConnectedTo(&other)) && other) {
+            std::wstring id = other;
+            CoTaskMemFree(other);
+            if (SendKsBtProperty(en, id.c_str(), propId)) return true;
+        }
+        // Second route to the same filter: the connected connector's part -> its topology object -> device id.
+        winrt::com_ptr<IConnector> peer;
+        if (FAILED(conn->GetConnectedTo(peer.put()))) continue;
+        auto part = peer.try_as<IPart>();
+        winrt::com_ptr<IDeviceTopology> peerTopo;
+        LPWSTR peerId = nullptr;
+        // (mingw-w64's header spells IPart::GetTopologyObject with an s; it is the same vtable slot.)
+        if (part && SUCCEEDED(part->GetTopologyObjects(peerTopo.put())) && SUCCEEDED(peerTopo->GetDeviceId(&peerId)) && peerId) {
+            std::wstring id = peerId;
+            CoTaskMemFree(peerId);
+            if (SendKsBtProperty(en, id.c_str(), propId)) return true;
+        }
+    }
+    return false;
+}
+
+bool AnyActive(std::vector<EpInfo> const& all, std::wstring const& container) {
+    for (auto const& ep : all) if (ep.container == container && ep.state == DEVICE_STATE_ACTIVE) return true;
+    return false;
+}
+
+// Runs on a worker. Returns the result; the caller does the bookkeeping.
+AudioOpResult RunBtAudio(std::wstring const& container, bool connect) {
+    const AudioOpResult kSettings = AudioOpResult::FellBackToSettings;
+    auto openSettings = [&] {
+        OpenSettings(L"ms-settings:bluetooth");
+        return kSettings;
+    };
+    if (DryRun()) { Log(std::wstring(L"DRYRUN bluetooth audio ") + (connect ? L"connect " : L"disconnect ") + container); return AudioOpResult::Succeeded; }
+    if (container.empty()) return connect ? openSettings() : AudioOpResult::Failed;
+    winrt::com_ptr<IMMDeviceEnumerator> en;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), en.put_void())))
+        return connect ? openSettings() : AudioOpResult::Failed;
+    auto all = AllRenderEndpoints();
+    std::vector<EpInfo const*> mine;
+    for (auto const& ep : all) if (ep.container == container) mine.push_back(&ep);
+    if (mine.empty()) return connect ? openSettings() : AudioOpResult::Failed;  // not an audio device Windows knows
+
+    const bool wasActive = AnyActive(all, container);
+    if (connect == wasActive && connect) {
+        // already connected for audio: only the default output is left to do
+    } else if (connect == wasActive) {
+        // asked to disconnect something that is not connected: nothing to do
+        return AudioOpResult::Succeeded;
+    } else {
+        int sent = 0;
+        for (auto const* ep : mine)
+            if (SendBtOneShot(en.get(), ep->id, connect ? kBtOneShotReconnect : kBtOneShotDisconnect)) ++sent;
+        if (!sent) return connect ? openSettings() : AudioOpResult::Failed;
+        bool settled = false;
+        for (int waited = 0; waited < 10000 && !settled; waited += 250) {
+            Sleep(250);
+            settled = AnyActive(AllRenderEndpoints(), container) == connect;
+        }
+        if (!settled) return connect ? openSettings() : AudioOpResult::Failed;
+    }
+    if (!connect) return AudioOpResult::Succeeded;
+    // Connected for audio: make the stereo endpoint the default output (unless it already is).
+    all = AllRenderEndpoints();
+    mine.clear();
+    for (auto const& ep : all) if (ep.container == container) mine.push_back(&ep);
+    if (auto const* best = BestEndpoint(mine, true)) {
+        if (!best->isDefault) return SetDefaultNow(best->id);
+    }
+    return AudioOpResult::Succeeded;
+}
+
+void BtAudioOp(std::wstring const& deviceId, bool connect, HWND notify, UINT msg, std::function<void(AudioOpResult)> done) {
+    auto& h = Bt();
+    const std::wstring key = NormId(deviceId);
+    {
+        std::lock_guard lock(h.m);
+        if (!h.connecting.insert(key).second) return;  // one at a time per device
+    }
+    h.post.PostNow();  // the row shows "Connecting…" at once
+    const bool started = RunOffThread([key, connect, notify, msg, done] {
+        AudioOpResult result = AudioOpResult::Failed;
+        try { result = RunBtAudio(key, connect); } catch (...) {}
+        {
+            auto& hub = Bt();
+            std::lock_guard lock(hub.m);
+            hub.connecting.erase(key);
+        }
+        if (done) done(result);
+        OutputsKick();
+        Bt().post.PostNow();
+        if (notify) PostMessageW(notify, msg, 0, 0);
+    });
+    if (!started) {
+        {
+            std::lock_guard lock(h.m);
+            h.connecting.erase(key);
+        }
+        h.post.PostNow();
+        if (done) done(AudioOpResult::Failed);
+    }
+}
+}  // namespace
+
+void ConnectBluetoothAudio(std::wstring const& btDeviceId, HWND notify, UINT msg, std::function<void(AudioOpResult)> done) {
+    BtAudioOp(btDeviceId, true, notify, msg, std::move(done));
+}
+void DisconnectBluetoothAudio(std::wstring const& btDeviceId, HWND notify, UINT msg, std::function<void(AudioOpResult)> done) {
+    BtAudioOp(btDeviceId, false, notify, msg, std::move(done));
 }
 
 // ---- Now Playing ------------------------------------------------------------------------------

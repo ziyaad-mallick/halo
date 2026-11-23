@@ -23,6 +23,7 @@
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Composition.Desktop.h>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -87,7 +88,7 @@ public:
     void Raise();                // back to the top of the topmost band
 
 private:
-    enum class Kind { App, File, Result, Settings, Power, MenuItem, AllApps,
+    enum class Kind { App, File, Result, Settings, Power, Lock, MenuItem, AllApps,
                       PowerMode, CcWifi, CcWifiMore, CcBt, CcBtMore, CcBright, CcVol, CcMute, CcPrev, CcPlay, CcNext, CcBack, CcRefresh, CcRadioSettings, CcRow, CcQuick, CcAction, CcOutMore,
                       CcToggle };  // CcToggle: a tile's logo zone (index 0 Wi-Fi, 1 Bluetooth, 10+i quick tile i); the rest of the tile opens its menu or page
     struct Hit {
@@ -97,6 +98,7 @@ private:
     };
     struct FileEntry {
         std::wstring name, path;
+        ULONGLONG time = 0;  // the shortcut's last write (FILETIME), for the row's caption
     };
     struct AppEntry {
         std::wstring name, lname, path;  // path: the Start-menu .lnk or shell:AppsFolder\<id>, which the host launches
@@ -126,6 +128,7 @@ private:
     wuc::CompositionBrush FileBrush(std::wstring const& path, float logicalPx);
     static std::vector<FileEntry> LoadFiles();
     void BuildIndex();  // every app, once (the Apps folder arrives later, on kMsgAppsFolder)
+    void RefreshIndex();  // rescans everything on a thread and swaps the result in: installs and removals since startup
     void AddToIndex(Found const& found);
     void Prefetch();
     void Refresh();
@@ -162,8 +165,8 @@ private:
     void Close();  // after the fade
     void ShowDim(bool on);
 
-    // ---- HALO 2.0 (settings.halo2): the wider two-column panel. Left = Start plus a widget strip; right = a compact
-    // control centre on the same services the Control Center uses. With halo2 off none of this runs. ----
+    // ---- HALO 2.0 (settings.halo2): three cards. Notifications and a calendar; Start (greeting, widgets, search, apps, files);
+    // a control column on the same services the Control Center uses. With halo2 off none of this runs. ----
     enum class Detail { None, Wifi, Bt, Output };
     float PanelX() const;                  // the panel's left edge in screen px (halo2 sits on the left of the screen)
     float CornerX() const;                 // where along the panel the swoop grows from (the dock is under it)
@@ -173,7 +176,8 @@ private:
     void SetScroll(wuc::ContainerVisual const& hold, float y);  // slides a scroll holder to -y on the compositor
     void RehoverAtCursor();
     void CcPlate(D2D1_RECT_F const* r, float radius);            // the right column's hover plate (content coords)
-    void CcPress(bool down);
+    void CcPress(bool down, Hit const* hit = nullptr);          // mouse-down on a right-column control: the plate answers at once
+    void CcPlateAt(int cc);                                     // the hover plate for control `cc` (an index into m_ccHits)
     void ApplySliders(bool animate);
     std::wstring AppName(std::wstring const& target) const;
     void ReleaseVisuals();
@@ -187,6 +191,10 @@ private:
     void DrawWidgets(ID2D1DeviceContext* dc, float ox, float oy);  // greeting, quote, clock, month, battery, power mode
     void DrawRight(ID2D1DeviceContext* dc, float ox, float oy);    // tiles, sliders, now playing / the radio list
     void DrawUsage(ID2D1DeviceContext* dc, float ox, float oy);    // the usage monitor
+    void DrawFoot(ID2D1DeviceContext* dc, float ox, float oy);     // the control column's footer: battery, Lock, Settings, Power
+    void PressFeel(Hit const* hit, bool down);                     // the mouse-down look of any control, drawn at once
+    std::wstring RowKey(int index) const;                          // the id of the list row at `index` on the open page (Wi-Fi, Bluetooth, output): presses are keyed by it
+    void RunDeferred();                                            // service calls queued behind an optimistic redraw
     void RedrawRight();
     void RedrawUsage();
     void RedrawBody();
@@ -254,6 +262,15 @@ private:
     std::vector<Hit> m_ccBase;             // the right column's controls in content coords (what is drawn)
     wuc::ContainerVisual m_ccClip{nullptr}, m_ccHold{nullptr}, m_homeHold{nullptr};
     wuc::ShapeVisual m_ccPlate{nullptr}, m_sliderShapes{nullptr};
+    wuc::CompositionColorBrush m_hoverBrush{nullptr}, m_ccPlateBrush{nullptr};  // the plates' fills: hover, and the pressed colour on mouse-down
+    wuc::CompositionSpriteShape m_hoverSprite{nullptr}, m_menuHoverSprite{nullptr};
+    wuc::CompositionColorBrush m_menuHoverBrush{nullptr};
+    wuc::CompositionDrawingSurface m_footSurface{nullptr};
+    std::wstring m_pressedRowKey;                   // the id of the list row the button went down on (a data update must not move or reset it)
+    std::vector<std::function<void()>> m_deferred;  // the slow part of a click (radio, DND, ...): runs after the new state is on screen
+    D2D1_RECT_F m_lockRect{}, m_modeCard{};  // the control footer's Lock button; the power-mode widget card
+    bool m_menuGlassBuilt = false;           // the Power menu's glass is built on its first opening, not with the panel
+    wuc::ContainerVisual m_menuGlassHold{nullptr};
     wuc::CompositionRoundedRectangleGeometry m_ccPlateShape{nullptr}, m_brTrack{nullptr}, m_brFill{nullptr}, m_vlTrack{nullptr}, m_vlFill{nullptr};
     wuc::CompositionSpriteShape m_ccPlateSprite{nullptr};
     bool m_ccPlateOn = false;
@@ -351,6 +368,8 @@ private:
     int m_avatarPx = 0;
     bool m_avatarTried = false;
     bool m_indexed = false;
+    std::atomic<bool> m_rescanning{false};  // a RefreshIndex thread is out; cleared when its result is swapped in
+    ULONGLONG m_rescanAt = 0;               // GetTickCount64 of the last RefreshIndex
     bool m_dryRun = false;
     float m_iconPx = 44;           // app icon size, logical px
 

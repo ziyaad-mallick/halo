@@ -61,7 +61,8 @@ struct Fixture {
     Expand expand=Expand::None;
     struct Config { bool showSliders=true, showMedia=true; } config;
     Config const& cfg() const { return config; }
-    struct { struct S { bool has=true; } s; S const& State() const { return s; } } media;  // now playing: controls are laid out only while something plays
+    struct S { bool has=true; } playing;  // now playing: controls are laid out only while something plays
+    S const& Playing() const { return playing; }
     void Layout();
 '''
 code += maxh + '\n' + dense + '\n};\n' + layout

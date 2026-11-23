@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|all]
+# Build Halo with the LLVM-MinGW toolchain. Usage: tools/build.sh [halo|guardian|icons_test|taskbar_test|all]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # Compiler: HALO_CXX (any LLVM-MinGW clang++ with C++/WinRT headers, or add them with HALO_INCLUDE),
@@ -19,9 +19,27 @@ COMMON=(${HALO_INCLUDE:+-I"$HALO_INCLUDE"} -include exception -D____FIReference_
 WINLIBS=(-lwindowsapp -lruntimeobject -lcoremessaging -ld3d11 -ldxgi -ld2d1 -ldwrite -ldcomp -ldwmapi
          -lole32 -luuid -loleaut32 -lpowrprof -ldxva2 -luser32 -lgdi32 -lshell32 -lshcore -lcomctl32 -lwindowscodecs -lsecur32 -ladvapi32 -lversion)
 
+# Symbols for crash offsets. Always: a linker map next to the exe (no size change). HALO_DEBUG=1: line tables
+# (-gline-tables-only) split into <exe>.debug with llvm-objcopy, the exe itself stays as small as without it.
+# crash.log lines name `module+0xOFFSET`: look the offset up in the map, or with
+#   llvm-addr2line -e <exe>.debug -f -C -a <imagebase + offset>   (image base 0x140000000)
+halo_debug_flags() { [ "${HALO_DEBUG:-0}" = 1 ] && echo -gline-tables-only || true; }
+halo_split_debug() {
+  [ "${HALO_DEBUG:-0}" = 1 ] || return 0
+  local out="$1" oc
+  oc="$(dirname "$CXX")/llvm-objcopy.exe"; [ -x "$oc" ] || oc="$(dirname "$CXX")/objcopy.exe"
+  if [ -x "$oc" ]; then
+    "$oc" --only-keep-debug "$out" "${out%.exe}.debug" && "$oc" --strip-debug "$out" && "$oc" --add-gnu-debuglink="${out%.exe}.debug" "$out"
+  else
+    echo "no objcopy next to the compiler: left the debug info inside $out" >&2
+  fi
+}
+
 build_halo() {
   echo "== halo.exe"
-  "$CXX" "${COMMON[@]}" -mwindows src/halo.cpp src/dock.cpp src/cluster.cpp src/icons.cpp src/apps.cpp src/winkey.cpp src/edge.cpp src/launcher.cpp src/usage.cpp src/previews.cpp src/menu.cpp src/pins.cpp src/swoop.cpp src/swoop_compositor.cpp     src/control_center.cpp src/notifications.cpp src/notif_feed.cpp src/notif_column.cpp src/services.cpp src/settings.cpp src/taskbar.cpp -lwbemuuid -lwlanapi -lpsapi -lpdh     -o "${HALO_OUT:-build/halo.exe}" "${WINLIBS[@]}" -lkernel32
+  local out="${HALO_OUT:-build/halo.exe}"
+  "$CXX" "${COMMON[@]}" $(halo_debug_flags) -Wl,-Map="${out%.exe}.map" -mwindows src/halo.cpp src/dock.cpp src/cluster.cpp src/icons.cpp src/apps.cpp src/winkey.cpp src/edge.cpp src/launcher.cpp src/usage.cpp src/previews.cpp src/menu.cpp src/pins.cpp src/swoop.cpp src/swoop_compositor.cpp     src/control_center.cpp src/notifications.cpp src/notif_feed.cpp src/notif_column.cpp src/services.cpp src/settings.cpp src/taskbar.cpp -lwbemuuid -lwlanapi -lpsapi -lpdh -ldbghelp     -o "$out" "${WINLIBS[@]}" -lkernel32
+  halo_split_debug "$out"
 }
 
 build_guardian() {
@@ -79,9 +97,19 @@ build_start_test() {
   "$CXX" "${COMMON[@]}" src/usage.cpp tools/start_test.cpp -o build/start_test.exe -lpdh -luser32
 }
 
+build_panel_preview() {
+  echo "== panel_preview.exe"
+  "$CXX" "${COMMON[@]}" -DHALO_NOTIF_TEST tools/panel_preview.cpp src/control_center.cpp src/notifications.cpp src/icons.cpp src/services.cpp src/settings.cpp -o "${PANEL_PREVIEW_OUT:-build/panel_preview.exe}" "${WINLIBS[@]}" -lwlanapi -lwbemuuid -lpsapi
+}
+
 build_start_perf() {
   echo "== start_perf.exe"
   "$CXX" "${COMMON[@]}" tools/start_perf.cpp src/launcher.cpp src/usage.cpp src/icons.cpp src/notif_column.cpp src/notif_feed.cpp src/notifications.cpp src/services.cpp src/settings.cpp     -lwbemuuid -lwlanapi -lpsapi -lpdh -o "${START_PERF_OUT:-build/start_perf.exe}" "${WINLIBS[@]}" -lkernel32
+}
+
+build_start_preview() {
+  echo "== start_preview.exe"
+  "$CXX" "${COMMON[@]}" tools/start_preview.cpp src/launcher.cpp src/usage.cpp src/icons.cpp src/notif_column.cpp src/notif_feed.cpp src/notifications.cpp src/services.cpp src/settings.cpp     -lwbemuuid -lwlanapi -lpsapi -lpdh -o "${START_PREVIEW_OUT:-build/start_preview.exe}" "${WINLIBS[@]}" -lkernel32
 }
 
 build_notification_preview() {
@@ -89,9 +117,24 @@ build_notification_preview() {
   "$CXX" "${COMMON[@]}" -DHALO_NOTIF_TEST tools/notification_preview.cpp src/notifications.cpp src/services.cpp src/settings.cpp -o "${NOTIFICATION_OUT:-build/notification_preview.exe}" "${WINLIBS[@]}" -lwlanapi -lwbemuuid -lpsapi
 }
 
+build_crash_recorder_test() {
+  echo "== crash_recorder_test.exe"
+  "$CXX" "${COMMON[@]}" tools/crash_recorder_test.cpp -o "${CRASH_TEST_OUT:-build/crash_recorder_test.exe}" -ldbghelp -lwindowsapp -lruntimeobject -lole32 -loleaut32 -luser32
+}
+
 build_settings_launch_test() {
   echo "== settings_launch_test.exe"
   "$CXX" "${COMMON[@]}" tools/settings_launch_test.cpp -o build/settings_launch_test.exe -lole32 -luuid -lshell32 -luser32
+}
+
+build_taskbar_probe() {
+  echo "== taskbar_probe.exe"
+  "$CXX" "${COMMON[@]}" tools/taskbar_probe.cpp -o "${TASKBAR_PROBE_OUT:-build/taskbar_probe.exe}" -lshell32 -luser32 -lgdi32 -lole32
+}
+
+build_taskbar_test() {
+  echo "== taskbar_test.exe"
+  "$CXX" "${COMMON[@]}" src/taskbar.cpp tools/taskbar_test.cpp -o "${TASKBAR_TEST_OUT:-build/taskbar_test.exe}" -lshell32 -luser32 -lgdi32 -lole32 -ladvapi32
 }
 
 case "${1:-halo}" in
@@ -106,9 +149,14 @@ case "${1:-halo}" in
   swoop_lamp_test) build_swoop_lamp_test ;;
   swoop_handoff_probe) build_swoop_handoff_probe ;;
   settings_launch_test) build_settings_launch_test ;;
+  crash_recorder_test) build_crash_recorder_test ;;
   start_test) build_start_test ;;
   start_perf) build_start_perf ;;
+  start_preview) build_start_preview ;;
   notification_preview) build_notification_preview ;;
+  taskbar_probe) build_taskbar_probe ;;
+  taskbar_test) build_taskbar_test ;;
+  panel_preview) build_panel_preview ;;
   all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test; build_start_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac
