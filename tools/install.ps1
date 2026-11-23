@@ -56,19 +56,29 @@ $installed = Join-Path $app 'halo.exe'
 if ((Test-Path $installed) -and ((Resolve-Path $Halo).Path -ne (Join-Path $app 'halo.previous.exe'))) {
     Copy-Item $installed (Join-Path $app 'halo.previous.exe') -Force -ErrorAction SilentlyContinue
 }
-foreach ($pair in @(@($Halo, 'halo.exe'), @($Guardian, 'guardian.exe'), @($Settings, 'halo-settings.exe'))) {
-    if ($pair[1] -eq 'halo-settings.exe' -and !(Test-Path $pair[0])) { continue }
-    for ($i = 0; ; $i++) {
-        try { Copy-Item $pair[0] (Join-Path $app $pair[1]) -Force; break }
-        catch { if ($i -ge 20) { throw }; Start-Sleep -Milliseconds 250 }
+# Whatever happens while copying, the guardian is started again: a failed copy must never leave the PC without its
+# dock (on 23 Nov an open Halo Preferences window locked halo-settings.exe and the old script exited with Halo stopped).
+try {
+    foreach ($pair in @(@($Halo, 'halo.exe'), @($Guardian, 'guardian.exe'), @($Settings, 'halo-settings.exe'))) {
+        if ($pair[1] -eq 'halo-settings.exe' -and !(Test-Path $pair[0])) { continue }
+        for ($i = 0; ; $i++) {
+            try { Copy-Item $pair[0] (Join-Path $app $pair[1]) -Force; break }
+            catch {
+                if ($i -lt 20) { Start-Sleep -Milliseconds 250; continue }
+                # Halo Preferences open: not worth failing the install for. Close it and run this again to update it.
+                if ($pair[1] -eq 'halo-settings.exe') { Write-Warning "halo-settings.exe is in use (Halo Preferences open): not updated. Close it and run install.ps1 again."; break }
+                throw
+            }
+        }
     }
+    if ($hasGit) { Add-Content -Path $ledger -Value (& $ledgerRow) -Encoding utf8 }
+    # Halo Preferences: its Start-menu shortcut, which carries its app ID (skipped if the exe wasn't built).
+    if (Test-Path (Join-Path $app 'halo-settings.exe')) {
+        Start-Process (Join-Path $app 'halo-settings.exe') -ArgumentList '--register' -Wait
+    }
+} finally {
+    Start-Process $running
 }
-if ($hasGit) { Add-Content -Path $ledger -Value (& $ledgerRow) -Encoding utf8 }
-# Halo Preferences: its Start-menu shortcut, which carries its app ID (skipped if the exe wasn't built).
-if (Test-Path (Join-Path $app 'halo-settings.exe')) {
-    Start-Process (Join-Path $app 'halo-settings.exe') -ArgumentList '--register' -Wait
-}
-Start-Process $running
 Start-Sleep 3
 Get-Process halo, guardian -ErrorAction SilentlyContinue | Select-Object Name, Id, Path
 Get-Content (Join-Path $env:LOCALAPPDATA 'Halo\guardian.log') -Tail 3
