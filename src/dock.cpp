@@ -73,13 +73,13 @@ DockMetrics FitMetrics(DockMetrics const& full, float fit, float scale) {
     DockMetrics m = full;
     if (fit >= 1.0f) return m;
     m.restSize = full.restSize * fit;
-    m.gap = std::max(4.0f * scale, full.gap * fit);
+    m.gap = std::min(full.gap, std::max(4.0f * scale, full.gap * fit));  // spacing 0..3 stays as set
     m.padding = std::max(6.0f * scale, full.padding * fit);
     m.radius = full.radius * std::max(fit, 0.5f);
     // The pill keeps its margin around the icon in proportion, but no thinner than 40 logical px: the cluster
     // beside the icons (Start, time, Wi-Fi, battery) needs that height.
     m.pillHeight = std::min(full.pillHeight, std::max(m.restSize + (full.pillHeight - full.restSize) * fit, 40.0f * scale));
-    m.cornerRadius = std::min(full.cornerRadius, m.pillHeight * 0.4f);
+    m.cornerRadius = std::min(full.cornerRadius * m.pillHeight / full.pillHeight, m.pillHeight * 0.5f);  // keeps its roundness as the dock shrinks
     return m;
 }
 

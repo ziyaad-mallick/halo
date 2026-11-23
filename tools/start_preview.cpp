@@ -435,6 +435,13 @@ int wmain(int argc, wchar_t** argv) {
     {
         std::string ini = std::string("[general]\ntheme = ") + (g_dark ? "dark" : "light") + "\nreduce_motion = off\nhalo2 = " + (h2 ? "on" : "off") +
                           "\n[start]\neffect = none\nrecent_apps = 6\nrecent_files = 12\ndim_desktop = off\n";
+        // HALO_PREVIEW_START="columns=8;icon_size=56": extra [start] keys (later keys win), for trying the layout settings.
+        if (const char* extra = std::getenv("HALO_PREVIEW_START"))
+            for (std::string e = extra; !e.empty();) {
+                const size_t k = e.find(';');
+                ini += e.substr(0, k) + "\n";
+                e = k == std::string::npos ? "" : e.substr(k + 1);
+            }
         WriteText(dir + L"\\settings.ini", ini);
     }
     SetEnvironmentVariableW(L"HALO_SETTINGS_FILE", (dir + L"\\settings.ini").c_str());

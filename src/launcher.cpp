@@ -146,7 +146,7 @@ constexpr float kMenuPad = ui::kS2;
 constexpr float kMinWidth = 560, kMaxWidth = 720, kWidth = 640, kScreenMargin = 24;
 constexpr float kTop = 8;         // room above the panel for the spring's overshoot
 constexpr int kH2Apps = 12, kH2Files = 6, kH2AppCols = 6;  // the 2.0 middle pane: 6 x 2 apps, 2 x 3 files
-constexpr int kMaxFiles = 12, kFileCols = 6, kKeepApps = 12, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
+constexpr int kMaxFiles = 12, kFileCols = 6, kKeepApps = 32, kKeepFiles = 60, kMaxResults = 8, kMaxQuery = 120;
 constexpr UINT_PTR kRefreshTimer = 1, kClockTimer = 2, kCaretTimer = 3, kServicesTimer = 4, kOpenTimer = 5, kRehoverTimer = 6, kWaveOffTimer = 7, kSettleTimer = 8;  // kClockTimer: halo2, re-armed to each minute boundary
 constexpr int kQuickTiles = 10;  // Airplane, Hotspot, Do not disturb, Night light, Dark mode, Microphone, Battery saver, Screenshot, Cast, Project
 constexpr int kListBuffer = 4, kScrollMs = 180, kScrollSpringMs = 85;  // rows drawn past each end of the list; the scroll slide
@@ -815,8 +815,10 @@ void Launcher::Build() {
         m_nw = m_notifW > 0 ? m_notifW + m_gap : 0;  // the middle card starts here
         m_w = std::round(wl * s) + m_gap + std::round(rightW * s);
     } else {
-        wl = std::min(kWidth, (m_anchor.monitor.right - m_anchor.monitor.left) / s - 2 * kScreenMargin);
-        wl = std::clamp(wl, std::min(kMinWidth, wl), kMaxWidth);
+        // [start] width (520 to 1000; 640 as shipped), never wider than the screen allows.
+        const float want = std::clamp(static_cast<float>(settings::Get().start.width), 520.0f, 1000.0f);
+        wl = std::min(want, (m_anchor.monitor.right - m_anchor.monitor.left) / s - 2 * kScreenMargin);
+        wl = std::max(wl, std::min(kMinWidth, wl));
         m_nw = m_notifW = m_gap = 0;
         m_w = std::round(wl * s);
     }
@@ -825,7 +827,7 @@ void Launcher::Build() {
 
     // HALO 2.0 keeps twelve slots per section; classic Start follows its preferences.
     auto const& cfg = settings::Get().start;
-    const size_t maxApps = m_h2 ? kH2Apps : std::min(cfg.recentApps, 6);
+    size_t maxApps = m_h2 ? kH2Apps : static_cast<size_t>(std::clamp(cfg.recentApps, 0, 32));
     size_t maxFiles = m_h2 ? kH2Files : std::min(cfg.recentFiles, kMaxFiles);
     if (m_h2) {  // Keep every recent item; the home body scrolls on smaller displays.
         m_plan = start::PlanCenter(std::min(start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s),
@@ -848,8 +850,13 @@ void Launcher::Build() {
 
     // Top to bottom. Classic: search bar, recent apps (one row), recent files (2 x 6), the dock bar under a hairline.
     // HALO 2.0 (the middle card, no footer): greeting and date, three widget cards, search, recent apps (6 x 2), recent files (2 x 3).
-    const int appCols = m_h2 ? kH2AppCols : kFileCols;
+    const int appCols = m_h2 ? kH2AppCols : std::clamp(cfg.columns, 4, 8);
     const float innerW = wl - 2 * kPad, colW = innerW / appCols;
+    // Classic: [start] icon_size (32 to 64, 44 as shipped), never wider than its column allows; the cell grows with it.
+    const float iconSz = m_h2 ? kIconSize : std::min(std::clamp(static_cast<float>(cfg.iconSize), 32.0f, 64.0f), colW - ui::kS4);
+    const float appRowH = kAppRowH - kIconSize + iconSz;
+    m_appCols = appCols;
+    m_appRowH = appRowH;
     const float searchTop = m_h2 ? m_plan.searchY : kSearchTop;
     const float searchBot = searchTop + (m_h2 ? start::kSearchH : kSearchH);
     float appsLabelY, appsTop, filesLabelY, filesTop, dividerY, panelH;
@@ -867,16 +874,23 @@ void Launcher::Build() {
     } else {
         appsLabelY = searchBot + ui::kS6;
         appsTop = appsLabelY + kLabelH + ui::kS2;
-        filesLabelY = m_showApps ? appsTop + kAppRowH + ui::kS4 : appsLabelY;
-        filesTop = filesLabelY + kLabelH + ui::kS2;
         const int fileRows = std::max<int>(1, (static_cast<int>(m_files.size()) + 1) / 2);  // 2 columns of 40 px rows
-        const float contentEnd = m_showFiles ? filesTop + fileRows * start::tk::kFileRowH
-                                             : m_showApps ? appsTop + kAppRowH : searchBot;
-        dividerY = std::max(contentEnd + ui::kS4,
-                            searchBot + 8 + 4 + kMaxResults * kResultRowH + 4);  // a page of results always fits
-        panelH = dividerY + 1 + kBottomH;
+        // Recent apps wrap into rows of `appCols`; rows that would push the panel past the screen are dropped.
+        const float availH = start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s);
+        auto layout = [&](int appRows) {
+            filesLabelY = m_showApps ? appsTop + appRows * appRowH + ui::kS4 : appsLabelY;
+            filesTop = filesLabelY + kLabelH + ui::kS2;
+            const float contentEnd = m_showFiles ? filesTop + fileRows * start::tk::kFileRowH
+                                                 : m_showApps ? appsTop + appRows * appRowH : searchBot;
+            dividerY = std::max(contentEnd + ui::kS4,
+                                searchBot + 8 + 4 + kMaxResults * kResultRowH + 4);  // a page of results always fits
+            panelH = dividerY + 1 + kBottomH;
+        };
+        int appRows = std::max(1, (static_cast<int>(m_apps.size()) + appCols - 1) / appCols);
+        layout(appRows);
+        while (appRows > 1 && panelH > availH) layout(--appRows);
+        if (m_apps.size() > static_cast<size_t>(appRows * appCols)) m_apps.resize(appRows * appCols);
     }
-    const float iconSz = kIconSize;
     m_iconPx = iconSz;
     m_h = std::round(panelH * s);
     m_bodyTop = (searchBot + ui::kS2) * s;
@@ -891,7 +905,7 @@ void Launcher::Build() {
     m_appCells.clear();
     m_fileCells.clear();
     for (size_t i = 0; i < m_apps.size(); i++) {
-        float x = kPad + (i % appCols + 0.5f) * colW - iconSz / 2, y = appsTop + (i / appCols) * kAppRowH + start::tk::kAppPadTop;
+        float x = kPad + (i % appCols + 0.5f) * colW - iconSz / 2, y = appsTop + (i / appCols) * appRowH + start::tk::kAppPadTop;
         m_appCells.push_back(R(x * s, y * s, (x + iconSz) * s, (y + iconSz) * s));
     }
     const float fileColW = (innerW - start::tk::kPad) / 2;  // HALO 2.0: recent files are a two-column list of rows
@@ -958,7 +972,8 @@ void Launcher::Build() {
     m_shadowHold = nullptr;
     // HALO 2.0 is three cards (notifications, middle, control centre), each its own glass with its own edge, shadow and
     // rounded corners; classic Start is one. `boxes` are the cards' x and width in panel px.
-    const float panelR = ui::kPanelRadius * s;  // 36: a 20 px card plus its 16 px inset, so inner corners stay concentric
+    // 36: a 20 px card plus its 16 px inset, so inner corners stay concentric. Classic follows [start] roundness.
+    const float panelR = (m_h2 ? ui::kPanelRadius : std::clamp(static_cast<float>(settings::Get().start.roundness), 0.0f, 48.0f)) * s;
     struct Box { float x, w; };
     std::vector<Box> boxes;
     if (m_h2) {
@@ -1330,9 +1345,9 @@ void Launcher::BuildBody() {
     } else {
         for (size_t i = 0; i < m_apps.size(); i++) {
             auto const& c = m_appCells[i];
-            const float cw = (m_lw - m_gap - 2 * kPad * s) / kH2AppCols;  // the whole cell, icon and name, is one target
+            const float cw = (m_lw - m_gap - 2 * kPad * s) / m_appCols;  // the whole cell, icon and name, is one target
             const float inset = ui::kS1 / 2 * s, top = c.top - start::tk::kAppPadTop * s;
-            m_hits.push_back({R((c.left + c.right) / 2 - cw / 2 + inset, top, (c.left + c.right) / 2 + cw / 2 - inset, top + kAppRowH * s), Kind::App, static_cast<int>(i)});
+            m_hits.push_back({R((c.left + c.right) / 2 - cw / 2 + inset, top, (c.left + c.right) / 2 + cw / 2 - inset, top + m_appRowH * s), Kind::App, static_cast<int>(i)});
             m_appSprites.push_back(sprite(m_host.appIcon(m_apps[i]), c));
             if (m_h2 && m_appSprites.back().v) {
                 m_waveItems.push_back({m_appSprites.back(), (c.left + c.right) / 2, (c.top + c.bottom) / 2, c.bottom - c.top});
@@ -1551,7 +1566,7 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
         // App names under their icons, in the six-column grid (empty slots stay empty; the grid keeps its height).
         auto fApp = txt.Format(ui::kFontText, tk::kCap * s, DWRITE_FONT_WEIGHT_NORMAL);
         auto fFile = txt.Format(ui::kFontText, tk::kText * s, DWRITE_FONT_WEIGHT_NORMAL);
-        const float colW = (m_lw - m_gap - 2 * kPad * s) / kH2AppCols;
+        const float colW = (m_lw - m_gap - 2 * kPad * s) / m_appCols;
         for (size_t i = 0; i < m_apps.size(); i++) {
             auto const& c = m_appCells[i];
             const float cx = (c.left + c.right) / 2;

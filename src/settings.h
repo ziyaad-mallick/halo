@@ -34,7 +34,9 @@ struct Surface {
 };
 struct Taskbar : Surface {
     int iconSize = 48, magnification = 150, hideDelay = 500;
+    int spacing = 10, thickness = 11, roundness = 80, lift = 6, zoomRange = 100;
     bool autohide = true, bounceOnLaunch = true, runningDots = true;
+    bool alwaysOn = false;  // never hide, and reserve the dock's strip of the screen (an app bar), so maximised windows stop above it
 };
 struct ControlCenter : Surface {
     bool hotCorner = true, closeOnLeave = true, showMedia = true, showSliders = true;
@@ -42,6 +44,7 @@ struct ControlCenter : Surface {
 };
 struct Start : Surface {
     int recentApps = 6, recentFiles = 12;
+    int columns = 6, iconSize = 44, width = 640, roundness = 36;  // classic Start's grid and shape
     bool dimDesktop = false;
 };
 struct Settings {

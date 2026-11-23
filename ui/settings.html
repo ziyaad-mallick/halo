@@ -406,10 +406,16 @@ const BEHAVIOUR = {
   taskbar: [
     { k: "icon_size", type: "slider", label: "Icon size", help: "How big app icons are when your pointer isn't over them.", step: 2, ends: ["Smaller", "Larger"], fmt: (v) => v + " px" },
     { k: "magnification", type: "slider", label: "Zoom on hover", help: "How much icons grow as your pointer passes over them. Slide fully left to turn zoom off.", step: 5, ends: ["Off", "Big"], fmt: (v) => v <= 100 ? "Off" : v + "%" },
-    { k: "autohide", type: "toggle", label: "Hide automatically", help: "Slide the dock out of the way when a window reaches the bottom of the screen." },
+    { k: "always_on", type: "toggle", label: "Always on", help: "The dock never hides, and maximised windows stop above it instead of sliding underneath, like the Windows taskbar." },
+    { k: "autohide", type: "toggle", label: "Hide automatically", help: "Slide the dock out of the way when a window reaches the bottom of the screen.", unless: "always_on" },
     { k: "hide_delay", type: "slider", label: "Hide delay", help: "How long your pointer must stay away before the dock hides.", step: 50, ends: ["Right away", "Slowly"], fmt: (v) => v === 0 ? "Right away" : secs(v), needs: "autohide" },
     { k: "bounce_on_launch", type: "toggle", label: "Bounce when opening an app", help: "The icon hops up and down while the app starts." },
     { k: "running_dots", type: "toggle", label: "Show which apps are open", help: "A small dot under every app that is running." },
+    { k: "spacing", type: "slider", label: "Icon spacing", help: "The space between icons in the dock.", step: 1, ends: ["Tight", "Airy"], fmt: (v) => v + " px" },
+    { k: "thickness", type: "slider", label: "Dock height", help: "How much glass sits above and below the icons.", step: 1, ends: ["Slim", "Tall"], fmt: (v) => v + " px" },
+    { k: "roundness", type: "slider", label: "Corner roundness", help: "From square corners to fully round ends.", step: 5, ends: ["Square", "Round"], fmt: (v) => v === 0 ? "Square" : v === 100 ? "Fully round" : v + "%" },
+    { k: "lift", type: "slider", label: "Distance from the edge", help: "How far the dock floats above the bottom of the screen.", step: 1, ends: ["Touching", "Floating"], fmt: (v) => v === 0 ? "Touching" : v + " px" },
+    { k: "zoom_range", type: "slider", label: "Zoom spread", help: "How many neighbouring icons grow with the one under your pointer.", step: 10, ends: ["Narrow", "Wide"], fmt: (v) => v === 100 ? "As designed" : v + "%" },
   ],
   controlcenter: [
     { k: "hot_corner", type: "toggle", label: "Open from the corner", help: "Open the panel when your pointer rests in the bottom-right corner of the screen." },
@@ -420,9 +426,13 @@ const BEHAVIOUR = {
     { k: "show_sliders", type: "toggle", label: "Show Display and Sound sliders", help: "Brightness and volume sliders at the top of the panel." },
   ],
   start: [
-    { k: "recent_apps", type: "slider", label: "Recent apps", help: "How many recently used apps to show in the top row. Choose 0 to hide the row.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " app" : " apps") },
+    { k: "recent_apps", type: "slider", label: "Recent apps", help: "How many recently used apps to show. They wrap into rows; choose 0 to hide them.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " app" : " apps") },
     { k: "recent_files", type: "slider", label: "Recent files", help: "How many recent files to list, in rows of six. Choose 0 to hide them.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " file" : " files") },
     { k: "dim_desktop", type: "toggle", label: "Dim the desktop", help: "Darken everything behind the Start menu so it stands out." },
+    { k: "columns", type: "slider", label: "Apps per row", help: "How many apps sit side by side. More apps wrap into extra rows.", step: 1, ends: ["4", "8"], fmt: (v) => v + " per row" },
+    { k: "icon_size", type: "slider", label: "App icon size", help: "How big app icons are in Start. Very large icons are limited by the row's width.", step: 2, ends: ["Smaller", "Larger"], fmt: (v) => v + " px" },
+    { k: "width", type: "slider", label: "Width", help: "How wide Start opens. It never grows past your screen.", step: 20, ends: ["Narrow", "Wide"], fmt: (v) => v + " px" },
+    { k: "roundness", type: "slider", label: "Corner roundness", help: "How rounded Start's corners are.", step: 2, ends: ["Square", "Round"], fmt: (v) => v === 0 ? "Square" : v + " px" },
   ],
 };
 const SPEED_FMT = (v) => v === 100 ? "Normal" : (v < 100 ? "Slower" : "Faster") + " · " + (v / 100).toFixed(2).replace(/0$/, "") + "×";
@@ -529,7 +539,10 @@ function sliderRow(sec, spec, fmt, ends) {
   return row;
 }
 function applyDeps(sec) {
-  for (const spec of BEHAVIOUR[sec] || []) if (spec.needs) { const c = ctl[sec + "." + spec.k]; if (c) c.disable(values[sec + "." + spec.needs] !== "on"); }
+  for (const spec of BEHAVIOUR[sec] || []) {
+    const c = ctl[sec + "." + spec.k]; if (!c || !(spec.needs || spec.unless)) continue;
+    c.disable((spec.needs && values[sec + "." + spec.needs] !== "on") || (spec.unless && values[sec + "." + spec.unless] === "on"));
+  }
 }
 function swatchGroup(key, colours, { themeDefault, name, current }) {
   const wrap = h("div", { class: "swatches", role: "radiogroup", "aria-label": name });
@@ -736,7 +749,7 @@ function derived(key) {
   if (key === "*" || key === "general.accent") applyAccent();
   if (key === "*" || key.endsWith(".opacity") || key.endsWith(".blur") || key.endsWith(".tint")) updateGlass();
   if (key === "*" || key.endsWith(".speed") || key.endsWith(".motion") || key === "general.reduce_motion") { schedulePreviews(); updateNote(); }
-  if (key === "*" || key.endsWith(".hot_corner") || key.endsWith(".autohide")) applyDeps(page);
+  if (key === "*" || key.endsWith(".hot_corner") || key.endsWith(".autohide") || key.endsWith(".always_on")) applyDeps(page);
 }
 mqDark.addEventListener("change", () => updateGlass());
 mqMotion.addEventListener("change", () => { schedulePreviews(); updateNote(); });

@@ -25,9 +25,15 @@ const std::vector<Key>& Schema() {
         {"taskbar", "icon_size", Type::Int, "48", 32, 72},
         {"taskbar", "magnification", Type::Int, "150", 100, 250},
         {"taskbar", "autohide", Type::Bool, "on"},
+        {"taskbar", "always_on", Type::Bool, "off"},  // never hides, and keeps its space free like the Windows taskbar
         {"taskbar", "hide_delay", Type::Int, "500", 0, 2000},
         {"taskbar", "bounce_on_launch", Type::Bool, "on"},
         {"taskbar", "running_dots", Type::Bool, "on"},
+        {"taskbar", "spacing", Type::Int, "10", 0, 24},      // px between icons
+        {"taskbar", "thickness", Type::Int, "11", 4, 24},    // px of glass above and below the icons
+        {"taskbar", "roundness", Type::Int, "80", 0, 100},   // corner radius, % of half the dock's height
+        {"taskbar", "lift", Type::Int, "6", 0, 40},          // px between the dock and the screen edge
+        {"taskbar", "zoom_range", Type::Int, "100", 50, 250},  // how far the hover zoom spreads, %
 
         {"controlcenter", "effect", Type::Effect, "rise"},
         {"controlcenter", "speed", Type::Int, "100", 50, 200},
@@ -48,7 +54,11 @@ const std::vector<Key>& Schema() {
         {"start", "opacity", Type::Int, "66", 20, 100},
         {"start", "tint", Type::Color, ""},
         {"start", "blur", Type::Int, "40", 0, 80},
-        {"start", "recent_apps", Type::Int, "6", 0, 6},
+        {"start", "recent_apps", Type::Int, "6", 0, 32},
+        {"start", "columns", Type::Int, "6", 4, 8},
+        {"start", "icon_size", Type::Int, "44", 32, 64},
+        {"start", "width", Type::Int, "640", 520, 1000},
+        {"start", "roundness", Type::Int, "36", 0, 48},
         {"start", "recent_files", Type::Int, "12", 0, 12},
         {"start", "dim_desktop", Type::Bool, "off"},
     };
@@ -199,9 +209,15 @@ Settings Parse(Values const& v) {
     s.taskbar.iconSize = num("taskbar", "icon_size");
     s.taskbar.magnification = num("taskbar", "magnification");
     s.taskbar.autohide = on("taskbar", "autohide");
+    s.taskbar.alwaysOn = on("taskbar", "always_on");
     s.taskbar.hideDelay = num("taskbar", "hide_delay");
     s.taskbar.bounceOnLaunch = on("taskbar", "bounce_on_launch");
     s.taskbar.runningDots = on("taskbar", "running_dots");
+    s.taskbar.spacing = num("taskbar", "spacing");
+    s.taskbar.thickness = num("taskbar", "thickness");
+    s.taskbar.roundness = num("taskbar", "roundness");
+    s.taskbar.lift = num("taskbar", "lift");
+    s.taskbar.zoomRange = num("taskbar", "zoom_range");
 
     surface("controlcenter", s.cc);
     s.cc.hotCorner = on("controlcenter", "hot_corner");
@@ -214,6 +230,10 @@ Settings Parse(Values const& v) {
     surface("start", s.start);
     s.start.recentApps = num("start", "recent_apps");
     s.start.recentFiles = num("start", "recent_files");
+    s.start.columns = num("start", "columns");
+    s.start.iconSize = num("start", "icon_size");
+    s.start.width = num("start", "width");
+    s.start.roundness = num("start", "roundness");
     s.start.dimDesktop = on("start", "dim_desktop");
 
     if (s.reduceMotion)

@@ -372,6 +372,8 @@ private:
     ULONGLONG m_rescanAt = 0;               // GetTickCount64 of the last RefreshIndex
     bool m_dryRun = false;
     float m_iconPx = 44;           // app icon size, logical px
+    int m_appCols = 6;             // apps per row ([start] columns in classic; 6 in 2.0)
+    float m_appRowH = 88;          // an app cell's height: the icon plus its name
 
     HWND m_dim{};                 // [start] dim_desktop: the click-through sheet under the panel
     bool m_showApps = true, m_showFiles = true;  // [start] recent_apps / recent_files are not 0

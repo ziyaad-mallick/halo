@@ -98,6 +98,7 @@ constexpr UINT kMsgAppsChanged = WM_APP + 1;  // from the window tracker
 // Test hook (HALO_TEST=1): simulate the pointer without touching the real one.
 constexpr UINT kMsgTestMove = WM_APP + 2;   // wParam = pointer x, client px
 constexpr UINT kMsgTestLeave = WM_APP + 3;
+constexpr UINT kMsgAppBar = WM_APP + 70;  // the shell's app bar notifications ([taskbar] always_on)
 constexpr UINT kMsgIntellihideChanged = WM_APP + 5;  // wParam = overlap, lParam = fullscreen
 constexpr UINT kMsgMonitorSwitch = WM_APP + 6;       // wParam = HMONITOR
 // Test hook (HALO_TEST=1): wParam 0 = open the launcher panel, 1 = close it, else Launcher::TestCommand.
@@ -251,6 +252,8 @@ private:
     void InitGraphics();
     wuc::ContainerVisual BuildPill(int noiseHeight = 0, float radius = 0.0f, halo::settings::Surface const* glass = nullptr, int noiseWidth = 0);
     void ComputeMetrics();
+    void UpdateAppBar();   // [taskbar] always_on: register / move / remove the reserved strip
+    bool m_appBar = false;
     void ApplySettings(bool themeFlipped = false);
     void RebuildDock(bool keepIcons = false);
     wuc::SpriteVisual BuildPillShadow(wuc::ContainerVisual const& pill, float radius = 0.0f);
@@ -371,7 +374,7 @@ bool Halo::Create(HINSTANCE inst) {
         setDpi(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     halo::theme::Refresh();
     m_cfg = halo::settings::Get();
-    m_autoHide = !_wgetenv(L"HALO_TEST") && m_cfg.taskbar.autohide;
+    m_autoHide = !_wgetenv(L"HALO_TEST") && m_cfg.taskbar.autohide && !m_cfg.taskbar.alwaysOn;
 
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = WndProc;
@@ -408,6 +411,7 @@ bool Halo::Create(HINSTANCE inst) {
         Log(L"CreateWindowEx failed " + std::to_wstring(GetLastError()));
         return false;
     }
+    UpdateAppBar();
     Log(L"window " + std::to_wstring(m_width) + L"x" + std::to_wstring(m_height) + L" at " + std::to_wstring(x) +
         L"," + std::to_wstring(y) + L" scale " + std::to_wstring(m_scale.v) + L", " +
         std::to_wstring(m_apps.size()) + L" apps");
@@ -692,11 +696,15 @@ void Halo::ApplySettings(bool themeFlipped) {
     const bool h2Changed = prev.halo2 != c.halo2;
     const bool dockChanged = h2Changed || look || glass(prev.taskbar) != glass(c.taskbar) || prev.reduceMotion != c.reduceMotion ||
                              prev.taskbar.iconSize != c.taskbar.iconSize || prev.taskbar.magnification != c.taskbar.magnification ||
-                             prev.taskbar.runningDots != c.taskbar.runningDots;
+                             prev.taskbar.runningDots != c.taskbar.runningDots || prev.taskbar.spacing != c.taskbar.spacing ||
+                             prev.taskbar.thickness != c.taskbar.thickness || prev.taskbar.roundness != c.taskbar.roundness ||
+                             prev.taskbar.lift != c.taskbar.lift || prev.taskbar.zoomRange != c.taskbar.zoomRange;
     const bool ccChanged = look || glass(prev.cc) != glass(c.cc) || prev.cc.showMedia != c.cc.showMedia ||
                            prev.cc.showSliders != c.cc.showSliders;
     const bool startChanged = look || glass(prev.start) != glass(c.start) || prev.start.recentApps != c.start.recentApps ||
-                              prev.start.recentFiles != c.start.recentFiles || prev.start.dimDesktop != c.start.dimDesktop;
+                              prev.start.recentFiles != c.start.recentFiles || prev.start.dimDesktop != c.start.dimDesktop ||
+                              prev.start.columns != c.start.columns || prev.start.iconSize != c.start.iconSize ||
+                              prev.start.width != c.start.width || prev.start.roundness != c.start.roundness;
     Log(L"settings: changed, applying (dock " + std::to_wstring(dockChanged) + L", control center " +
         std::to_wstring(ccChanged) + L", start " + std::to_wstring(startChanged) + L"; accent #" + [&] {
             wchar_t hex[8];
@@ -711,8 +719,9 @@ void Halo::ApplySettings(bool themeFlipped) {
     }
     halo::edge::Configure(c.cc.hotCorner, c.cc.cornerWidth, c.cc.cornerDelay);
     if (m_swoop) m_swoop->SetEnabled(kLampGenie && !c.reduceMotion);
-    m_autoHide = !_wgetenv(L"HALO_TEST") && c.taskbar.autohide;
-    if (!c.taskbar.autohide) Reveal();
+    m_autoHide = !_wgetenv(L"HALO_TEST") && c.taskbar.autohide && !c.taskbar.alwaysOn;
+    if (prev.taskbar.alwaysOn != c.taskbar.alwaysOn) UpdateAppBar();
+    if (!m_autoHide) Reveal();
     else if (!prev.taskbar.autohide && !m_trackingMouse) PointerLeave();
     if (startChanged && m_launcher && m_launcher->IsOpen()) m_launcher->Hide();  // it is built per open
     if (ccChanged && m_cc) {
@@ -744,6 +753,7 @@ void Halo::RebuildDock(bool keepIcons) {
     const int x = m_monitor.left, y = m_monitor.bottom - m_height;
     m_full = {x, y, x + m_width, y + m_height};
     SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, m_width, m_height, SWP_NOACTIVATE);
+    UpdateAppBar();
     if (m_state == State::Hidden) m_slide.Offset({0, static_cast<float>(m_height), 0});
     BuildDock();
     m_label = std::make_unique<halo::AppLabel>(m_comp, m_slide, m_gdev, m_scale.v);
@@ -1024,9 +1034,36 @@ RECT Halo::GetPillRectScreen() const {
     float half = m_dock->RestWidth() / 2.0f;
     int pillLeft = m_full.left + static_cast<int>(m_metrics.centerX - m_dock->CapsuleExtent() / 2 - half);
     int pillRight = m_full.left + static_cast<int>(std::ceil(m_metrics.centerX - m_dock->CapsuleExtent() / 2 + half));
-    int pillTop = m_full.bottom - static_cast<int>(m_metrics.pillHeight + m_scale.px(6));
+    int pillTop = m_full.bottom - static_cast<int>(m_metrics.pillHeight + m_scale.px(static_cast<float>(halo::settings::Get().taskbar.lift)));
     int pillBottom = m_full.bottom;
     return RECT{pillLeft, pillTop, pillRight, pillBottom};
+}
+
+// [taskbar] always_on: the dock registers as a bottom app bar for the strip it occupies (the pill, its distance from
+// the edge and a small gap), so the work area ends above it and maximised windows stop there, as with the Windows
+// taskbar. Off (or no window yet): the strip is given back. Only the reservation is the shell's; the window itself
+// stays where Halo puts it.
+void Halo::UpdateAppBar() {
+    if (!m_hwnd) return;
+    APPBARDATA abd{sizeof(abd), m_hwnd};
+    const bool want = m_cfg.taskbar.alwaysOn && !_wgetenv(L"HALO_TEST");
+    if (!want) {
+        if (m_appBar) { SHAppBarMessage(ABM_REMOVE, &abd); m_appBar = false; Log(L"appbar: removed"); }
+        return;
+    }
+    if (!m_appBar) {
+        abd.uCallbackMessage = kMsgAppBar;
+        if (!SHAppBarMessage(ABM_NEW, &abd)) { Log(L"appbar: ABM_NEW failed"); return; }
+        m_appBar = true;
+    }
+    const int reserve = static_cast<int>(std::ceil(m_metrics.pillHeight)) + m_scale.px(static_cast<float>(m_cfg.taskbar.lift)) + m_scale.px(4);
+    abd.uEdge = ABE_BOTTOM;
+    abd.rc = m_monitor;
+    abd.rc.top = abd.rc.bottom - reserve;
+    SHAppBarMessage(ABM_QUERYPOS, &abd);  // the shell may move it above another bottom bar
+    abd.rc.top = abd.rc.bottom - reserve;
+    SHAppBarMessage(ABM_SETPOS, &abd);
+    Log(L"appbar: reserving " + std::to_wstring(reserve) + L" px at the bottom");
 }
 
 // The dock's sizes from the DPI scale and [taskbar] icon_size / magnification. icon_size 48 is the shipped
@@ -1034,15 +1071,15 @@ RECT Halo::GetPillRectScreen() const {
 void Halo::ComputeMetrics() {
     auto const& tb = halo::settings::Get().taskbar;
     m_metrics.restSize = m_scale.f(28 * tb.iconSize / 48.0f);
-    m_metrics.gap = m_scale.f(10);
+    m_metrics.gap = m_scale.f(static_cast<float>(tb.spacing));
     m_metrics.maxScale = halo::settings::Get().reduceMotion ? 1.0f : 1.0f + (tb.magnification - 100) / 100.0f * 1.14f;
-    m_metrics.radius = m_scale.f(100);
+    m_metrics.radius = m_scale.f(static_cast<float>(tb.zoomRange));  // the wave's reach (100 = as shipped)
     m_metrics.padding = m_scale.f(10);
-    m_metrics.pillHeight = m_metrics.restSize + m_scale.f(22);  // 50 at the shipped icon size
-    m_metrics.cornerRadius = m_scale.f(20);
+    m_metrics.pillHeight = m_metrics.restSize + m_scale.f(2.0f * tb.thickness);  // 50 at the shipped icon size and thickness 11
+    m_metrics.cornerRadius = m_metrics.pillHeight / 2 * tb.roundness / 100.0f;      // 80 % = the shipped 20 px
     // The window reaches the monitor's bottom edge so a hiding dock slides
     // fully off-screen; the dock itself sits a margin above it.
-    int margin = m_scale.px(6);
+    int margin = m_scale.px(static_cast<float>(halo::settings::Get().taskbar.lift));
     float peak = (m_metrics.pillHeight - m_metrics.restSize) / 2 + m_metrics.restSize * m_metrics.maxScale;
     // Above the peak: room for the hover name label (kLabelRoom).
     m_height = static_cast<int>(std::ceil(std::max(m_metrics.pillHeight, peak) + m_scale.f(kLabelRoom))) + margin;
@@ -1081,6 +1118,7 @@ void Halo::MigrateToMonitor(HMONITOR mon, bool reveal) {
     m_full = {x, y, x + m_width, y + m_height};
 
     SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, m_width, m_height, SWP_NOACTIVATE);
+    UpdateAppBar();
 
     if (m_multimon) m_multimon->SetCurrentMonitor(mon);
     if (m_intellihide) m_intellihide->SetMonitor(mon, m_monitor);
@@ -1462,7 +1500,7 @@ void Halo::Reveal() {
 
 void Halo::StartHide() {
     if (m_state != State::Shown) return;
-    if (!m_cfg.taskbar.autohide) return;             // [taskbar] autohide off: the dock stays
+    if (!m_cfg.taskbar.autohide || m_cfg.taskbar.alwaysOn) return;  // autohide off, or always on: the dock stays
     if (m_launcher && m_launcher->IsOpen()) return;  // the panel is up; its close brings the hide back
     if (m_menu && m_menu->IsOpen()) return;          // likewise the right-click menu
     m_state = State::Hiding;
@@ -1842,7 +1880,13 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_CLOSE: m_swoop.reset(); m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); m_dockMedia.Stop(); m_dockRadios.Stop(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
-        case WM_DESTROY: PostQuitMessage(0); return 0;
+        case kMsgAppBar:
+            if (w == ABN_POSCHANGED) UpdateAppBar();  // another app bar moved, or the work area changed
+            return 0;
+        case WM_DESTROY:
+            if (m_appBar) { APPBARDATA abd{sizeof(abd), m_hwnd}; SHAppBarMessage(ABM_REMOVE, &abd); m_appBar = false; }
+            PostQuitMessage(0);
+            return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);
 }
