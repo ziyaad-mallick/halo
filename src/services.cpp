@@ -2075,10 +2075,12 @@ winrt::fire_and_forget Media::Init(std::shared_ptr<unsigned> live, unsigned gen)
     try {
         auto mgr = co_await Manager::RequestAsync();
         if (gen != *live) co_return;
-        m_mgr = mgr;
         HWND h = m_notify;
         UINT e = m_event;
-        m_mgrRev = mgr.CurrentSessionChanged(winrt::auto_revoke, [h, e](auto&&, auto&&) { PostMessageW(h, e, 0, 0); });
+        auto rev = mgr.CurrentSessionChanged(winrt::auto_revoke, [h, e](auto&&, auto&&) { PostMessageW(h, e, 0, 0); });
+        if (gen != *live) co_return;  // stopped while registering: the local revoker unregisters
+        m_mgr = mgr;
+        m_mgrRev = std::move(rev);
         PullAsync();
     } catch (...) {}
 }
@@ -2118,19 +2120,30 @@ void DecodeArt(std::vector<uint8_t> const& bytes, MediaState& out) {
 winrt::fire_and_forget Media::PullAsync() {
     auto live = m_gen, newest = m_seq;
     const unsigned gen = *live, seq = ++*newest;
-    if (!m_mgr) co_return;
+    // Every GSMTC call goes through an owning local, never a member. These calls are cross-process, and while the UI
+    // thread waits on one it can run other work: a nested Stop() then released m_mgr while its method was still running,
+    // the likeliest source of the heap corruption crash.log caught in MediaControl.dll on 24 Nov (UNVERIFIED: one record).
+    // Members are written only after the generation and sequence are checked again.
+    auto mgr = m_mgr;
+    if (!mgr) co_return;
     try {
-        auto sess = m_mgr.GetCurrentSession();
+        auto sess = mgr.GetCurrentSession();
+        if (gen != *live || seq != *newest) co_return;
         if (sess != m_sess) {
             m_pbRev.revoke();
             m_propRev.revoke();
-            m_sess = sess;
+            Session::PlaybackInfoChanged_revoker pb;
+            Session::MediaPropertiesChanged_revoker prop;
             if (sess) {
                 HWND h = m_notify;
                 UINT e = m_event;
-                m_pbRev = sess.PlaybackInfoChanged(winrt::auto_revoke, [h, e](auto&&, auto&&) { PostMessageW(h, e, 0, 0); });
-                m_propRev = sess.MediaPropertiesChanged(winrt::auto_revoke, [h, e](auto&&, auto&&) { PostMessageW(h, e, 0, 0); });
+                pb = sess.PlaybackInfoChanged(winrt::auto_revoke, [h, e](auto&&, auto&&) { PostMessageW(h, e, 0, 0); });
+                prop = sess.MediaPropertiesChanged(winrt::auto_revoke, [h, e](auto&&, auto&&) { PostMessageW(h, e, 0, 0); });
             }
+            if (gen != *live || seq != *newest) co_return;  // stopped or overtaken meanwhile: the locals unregister
+            m_sess = sess;
+            m_pbRev = std::move(pb);
+            m_propRev = std::move(prop);
         }
         MediaState next;
         if (sess) {
@@ -2181,15 +2194,15 @@ winrt::fire_and_forget Media::PullAsync() {
 
 void Media::PlayPause() {
     if (DryRun()) return Log(L"DRYRUN media play/pause");
-    try { if (m_sess) m_sess.TryTogglePlayPauseAsync(); } catch (...) {}  // the player may have just quit
+    try { if (auto s = m_sess) s.TryTogglePlayPauseAsync(); } catch (...) {}  // the player may have just quit
 }
 void Media::Next() {
     if (DryRun()) return Log(L"DRYRUN media next");
-    try { if (m_sess) m_sess.TrySkipNextAsync(); } catch (...) {}
+    try { if (auto s = m_sess) s.TrySkipNextAsync(); } catch (...) {}
 }
 void Media::Prev() {
     if (DryRun()) return Log(L"DRYRUN media previous");
-    try { if (m_sess) m_sess.TrySkipPreviousAsync(); } catch (...) {}
+    try { if (auto s = m_sess) s.TrySkipPreviousAsync(); } catch (...) {}
 }
 
 }  // namespace halo::svc

@@ -244,6 +244,7 @@ void StartAdopter() {
 class Halo {
 public:
     ~Halo();
+    void SilenceTracker();
     bool Create(HINSTANCE inst);
     int Run();
     HWND Hwnd() const { return m_hwnd; }
@@ -370,7 +371,18 @@ private:
 // m_label's destructor calls m_parent.Children().Remove() on a visual of the dead compositor, which
 // throws winrt::hresult_error out of a noexcept destructor -> terminate on every exit. Drop the
 // visual owners while the compositor is still alive.
+// The window tracker's WinEvent hook stays live until m_tracker dies, which is after m_launcher (members die in reverse
+// order). A destructor that releases WinRT objects can pump messages, and a foreground event delivered then reached
+// m_launcher->Note() through a null m_launcher (libc++ nulls a unique_ptr before deleting): crash.log 16 Nov, read@0x9C8
+// during exit. So the tracker's callbacks go first, here and in WM_CLOSE; the hook itself only updates the tracker.
+void Halo::SilenceTracker() {
+    if (!m_tracker) return;
+    m_tracker->onForeground = nullptr;
+    m_tracker->onWindow = nullptr;
+}
+
 Halo::~Halo() {
+    SilenceTracker();
     m_dockMedia.Stop();
     m_dockRadios.Stop();
     m_label.reset();
@@ -461,7 +473,9 @@ bool Halo::Create(HINSTANCE inst) {
                     if (m_menu) m_menu->Show(std::move(entries), x, y, monitor, scale);
                 });
                 m_launcher = std::make_unique<halo::Launcher>(inst, m_comp, m_gdev, std::move(host));
-                m_tracker->onForeground = Guarded("tracker.onForeground", [this](RunningApp const& app) { m_launcher->Note(LaunchTarget(app)); });
+                m_tracker->onForeground = Guarded("tracker.onForeground", [this](RunningApp const& app) {
+                    if (m_launcher) m_launcher->Note(LaunchTarget(app));  // null while Start is being destroyed
+                });
             });
             Step(L"menu", [&] {
                 halo::MenuHost host;
@@ -1948,7 +1962,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 ExitProcess(0);
             }
             return 0;
-        case WM_CLOSE: m_swoop.reset(); m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); m_dockMedia.Stop(); m_dockRadios.Stop(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
+        case WM_CLOSE: SilenceTracker(); m_swoop.reset(); m_menu.reset(); m_previews.reset(); m_cc.reset(); m_notif.reset(); m_dockMedia.Stop(); m_dockRadios.Stop(); KillTimer(m_hwnd, kHideTimer); DestroyWindow(m_hwnd); return 0;
         case kMsgAppBar:
             if (w == ABN_POSCHANGED) UpdateAppBar();  // another app bar moved, or the work area changed
             return 0;
