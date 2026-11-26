@@ -144,14 +144,9 @@ std::wstring Path() {
     return Dir() + L"\\settings.ini";
 }
 
-Values Read() {
+Values ParseIni(std::string text, size_t maxLine, int* dropped) {
     Values out;
-    FILE* f = _wfopen(Path().c_str(), L"rb");
-    if (!f) return out;
-    std::string text;
-    char buf[4096];
-    for (size_t n; text.size() < (1 << 20) && (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);  // ~1 KB in practice; a runaway file is not read whole
-    fclose(f);
+    int drop = 0;
     if (text.rfind("\xEF\xBB\xBF", 0) == 0) text.erase(0, 3);
     std::string section;
     size_t pos = 0;
@@ -160,17 +155,31 @@ Values Read() {
         std::string line = Trim(text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos));
         pos = nl == std::string::npos ? text.size() + 1 : nl + 1;
         if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+        if (maxLine && line.size() > maxLine) { drop++; continue; }
         if (line.front() == '[' && line.back() == ']') { section = Lower(Trim(line.substr(1, line.size() - 2))); continue; }
         size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
+        if (eq == std::string::npos) { drop++; continue; }
         std::string sk = section + "." + Lower(Trim(line.substr(0, eq)));
         std::string raw = Trim(line.substr(eq + 1));
         if (size_t sc = raw.find(" ;"); sc != std::string::npos) raw = Trim(raw.substr(0, sc));
-        if (!Find(sk)) continue;
+        Key const* k = Find(sk);
+        if (!k) { drop++; continue; }
         std::string v = Normalize(sk, raw);
-        if (!v.empty() || (Find(sk)->type == Type::Color && raw.empty())) out[sk] = v;
+        if (!v.empty() || (k->type == Type::Color && !*k->def && raw.empty())) out[sk] = v;
+        else drop++;
     }
+    if (dropped) *dropped = drop;
     return out;
+}
+
+Values Read() {
+    FILE* f = _wfopen(Path().c_str(), L"rb");
+    if (!f) return {};
+    std::string text;
+    char buf[4096];
+    for (size_t n; text.size() < (1 << 20) && (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);  // ~1 KB in practice; a runaway file is not read whole
+    fclose(f);
+    return ParseIni(std::move(text));
 }
 
 Values Defaults() {
@@ -246,7 +255,7 @@ Settings Parse(Values const& v) {
     return s;
 }
 
-bool Write(Values const& v) {
+std::string Serialize(Values const& v) {
     std::string out = "; Halo settings. Edited by Halo Settings; see docs/SETTINGS.md for every key.\n";
     std::string section;
     for (auto const& k : Schema()) {
@@ -260,6 +269,10 @@ bool Write(Values const& v) {
         if (val.empty() && !(k.type == Type::Color && !*k.def)) val = k.def;
         out += std::string(k.name) + " = " + val + "\n";
     }
+    return out;
+}
+
+bool WriteText(std::string const& out) {
     CreateDirectoryW(Dir().c_str(), nullptr);
     std::wstring path = Path(), tmp = path + L".tmp";
     FILE* f = _wfopen(tmp.c_str(), L"wb");
@@ -269,6 +282,20 @@ bool Write(Values const& v) {
     ok = ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     if (!ok) DeleteFileW(tmp.c_str());  // read-only target, full disk: do not leave the half-written copy behind
     return ok;
+}
+
+bool Write(Values const& v) { return WriteText(Serialize(v)); }
+
+ImportResult MergeImport(std::string const& currentIni, std::string const& imported) {
+    ImportResult r;
+    if (imported.size() > kMaxImport) { r.error = "that file is too large to be a Halo settings file"; return r; }
+    Values merged = ParseIni(currentIni);
+    Values in = ParseIni(imported, kMaxImportLine, &r.dropped);
+    for (auto const& [k, val] : in) merged[k] = val;
+    r.applied = static_cast<int>(in.size());
+    r.text = Serialize(merged);
+    r.ok = true;
+    return r;
 }
 
 const Settings& Get() {

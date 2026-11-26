@@ -10,6 +10,8 @@ Halo Preferences writes the whole file atomically: it writes `settings.ini.tmp`,
 `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)`. Halo re-reads the file when its directory reports a change,
 debounced by 150 ms.
 
+**Export and Import** (General, under Your settings file) save the file as `halo-settings.ini` and load one back. An imported file is untrusted: only keys in the tables below survive, each coerced to its type (ints clamped, colours exactly `#RRGGBB`, bad values dropped), keys it doesn't mention keep their value, and it is capped at 64 KB.
+
 ## Types
 
 | Type    | Format                                                            |

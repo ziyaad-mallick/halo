@@ -122,6 +122,11 @@ build_crash_recorder_test() {
   "$CXX" "${COMMON[@]}" tools/crash_recorder_test.cpp -o "${CRASH_TEST_OUT:-build/crash_recorder_test.exe}" -ldbghelp -lwindowsapp -lruntimeobject -lole32 -loleaut32 -luser32
 }
 
+build_settings_import_test() {
+  echo "== settings_import_test.exe"
+  "$CXX" "${COMMON[@]}" src/settings.cpp tools/settings_import_test.cpp -o build/settings_import_test.exe -luser32
+}
+
 build_settings_launch_test() {
   echo "== settings_launch_test.exe"
   "$CXX" "${COMMON[@]}" tools/settings_launch_test.cpp -o build/settings_launch_test.exe -lole32 -luuid -lshell32 -luser32
@@ -149,6 +154,7 @@ case "${1:-halo}" in
   swoop_lamp_test) build_swoop_lamp_test ;;
   swoop_handoff_probe) build_swoop_handoff_probe ;;
   settings_launch_test) build_settings_launch_test ;;
+  settings_import_test) build_settings_import_test ;;
   crash_recorder_test) build_crash_recorder_test ;;
   start_test) build_start_test ;;
   start_perf) build_start_perf ;;
@@ -157,6 +163,6 @@ case "${1:-halo}" in
   taskbar_probe) build_taskbar_probe ;;
   taskbar_test) build_taskbar_test ;;
   panel_preview) build_panel_preview ;;
-  all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test; build_start_test ;;
+  all) build_halo; build_guardian; build_settings; build_icons_test; build_cluster_test; build_settings_launch_test; build_settings_import_test; build_start_test ;;
   *) echo "unknown target $1" >&2; exit 2 ;;
 esac

@@ -134,6 +134,7 @@ motion.
 Halo Preferences writes everything to `%LOCALAPPDATA%\Halo\settings.ini`, which you can also edit by hand.
 Every key, its default and its range is listed in [docs/SETTINGS.md](docs/SETTINGS.md). A bad value
 falls back to its default, so a typo can't break the shell.
+Export and Import (General, under Your settings file) save the settings as `halo-settings.ini` and load a shared one; an imported file is checked key by key against the schema and anything else in it is ignored.
 
 Other files in `%LOCALAPPDATA%\Halo`: `pins.txt` (your dock pins, one per line), `guardian.log` (start
 here when something goes wrong).
@@ -191,7 +192,7 @@ or, if the exe is gone, restart Explorer from Task Manager (Ctrl+Shift+Esc → *
 
 ## Build targets
 
-`tools/build.sh [halo|guardian|settings|icons_test|pins_test|cluster_test|swoop_test|settings_launch_test|all]`.
+`tools/build.sh [halo|guardian|settings|icons_test|pins_test|cluster_test|swoop_test|settings_launch_test|settings_import_test|all]`.
 `build/settings_launch_test.exe` checks Settings launch routing without opening apps. With Python available,
 `python tools/settings_search_test.py` checks search ranking using synthetic app/file data.
 `python tools/preferences_shortcut_test.py` checks upgrade shortcut migration using scratch files under `build/`.

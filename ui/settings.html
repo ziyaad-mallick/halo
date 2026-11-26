@@ -306,6 +306,8 @@ dialog menu { margin: var(--s5) 0 0; padding: 0; display: flex; justify-content:
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
   <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.6-5.9"/><path d="M4 4v4.5h4.5"/></symbol>
+  <symbol id="i-export" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M7.5 8.5L12 4l4.5 4.5"/><path d="M5 14v5h14v-5"/></symbol>
+  <symbol id="i-import" viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7.5 10.5L12 15l4.5-4.5"/><path d="M5 14v5h14v-5"/></symbol>
   <symbol id="i-taskbar" viewBox="0 0 24 24"><rect x="3" y="13" width="18" height="7" rx="3.5"/><path d="M8 16.5h.01M12 16.5h.01M16 16.5h.01"/><path d="M6 6h12"/></symbol>
   <symbol id="i-cc" viewBox="0 0 24 24"><path d="M4 8h9M19 8h1M4 16h1M11 16h9"/><circle cx="16" cy="8" r="2.5"/><circle cx="8" cy="16" r="2.5"/></symbol>
   <symbol id="i-start" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="2"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="2"/></symbol>
@@ -702,6 +704,10 @@ function renderPage() {
     body.append(card("Motion", "For people who find movement distracting.", [toggleRow("general", { k: "reduce_motion", label: "Reduce motion", help: "Every animation becomes a simple fade, and icons stop zooming when you hover. Applies to Halo and to the previews here." })]));
     body.append(card("Your settings file", "Halo Preferences is a friendly front end for one plain-text file. You can back it up or share it.", [
       h("div", { class: "block", style: "border-top:0;padding-top:0" }, h("span", { class: "file-path" }, settingsPath)),
+      h("div", { class: "row" }, h("span", { class: "txt" }, h("span", { class: "label" }, "Export and import"), h("span", { class: "help" }, "Save your settings as halo-settings.ini, or load one from a file. Only Halo's own settings are read from it; anything else is ignored."), h("span", { class: "help", role: "status" }, fileNote)),
+        h("span", { style: "display:flex;gap:var(--s2)" },
+          h("button", { class: "btn", type: "button", onclick: exportSettings }, svgUse("i-export"), "Export"),
+          h("button", { class: "btn", type: "button", onclick: pickImport }, svgUse("i-import"), "Import"))),
       h("div", { class: "row" }, h("span", { class: "txt" }, h("span", { class: "label" }, "Start over"), h("span", { class: "help" }, "Put every setting in every section back to how Halo ships. This can't be undone.")),
         h("button", { class: "btn", type: "button", onclick: () => ask("Reset everything?", "Every setting in every section goes back to how Halo ships. This can't be undone.", () => reset("all")) }, svgUse("i-reset"), "Reset everything"))]));
   }
@@ -723,6 +729,31 @@ function renderNav() {
 }
 function markNav() { document.querySelectorAll(".nav-btn").forEach((b) => (b.dataset.page === page ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"))); }
 function go(id, focus) { page = id; history.replaceState(null, "", "#" + id); markNav(); renderPage(); if (focus) $("#page-title").focus({ preventScroll: true }); }
+
+/* ===================================================================== EXPORT + IMPORT */
+let fileNote = "";  // shown with textContent semantics only (h() appends text nodes); never innerHTML
+function noteFile(text) { fileNote = text; const el = $("[role=status].help"); if (el) el.textContent = text; }
+async function exportSettings() {
+  try {
+    const r = await api("api/export");
+    const a = h("a", { href: URL.createObjectURL(new Blob([r.text], { type: "text/plain" })), download: "halo-settings.ini" });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    noteFile("Exported halo-settings.ini.");
+  } catch (e) { noteFile("Couldn't export your settings."); }
+}
+function pickImport() { h("input", { type: "file", accept: ".ini,text/plain", onchange: (e) => importSettings(e.target.files[0]) }).click(); }
+async function importSettings(file) {
+  if (!file) return;
+  if (file.size > 65536) { noteFile("That file is too large to be a Halo settings file."); return; }
+  try {
+    const r = await api("api/import", { text: await file.text() });
+    clearTimeout(timer); pending = {};
+    values = r.values;
+    fileNote = "Imported " + r.applied + " setting" + (r.applied === 1 ? "" : "s") + (r.dropped ? ", skipped " + r.dropped + " line" + (r.dropped === 1 ? "" : "s") + " that weren't valid Halo settings" : "") + ".";
+    derived("*"); renderPage(); setStatus("saved");
+  } catch (e) { noteFile("Couldn't import that file. Is it a Halo settings file?"); }
+}
 
 /* ===================================================================== RESET + CONFIRM */
 const dlg = $("#confirm");

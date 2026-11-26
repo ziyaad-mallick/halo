@@ -73,6 +73,19 @@ bool Write(Values const& v);         // atomic (tmp + MoveFileEx); writes every 
 // Validates one value for "section.key"; returns the normalised value, or "" when it is not acceptable.
 std::string Normalize(std::string const& sectionKey, std::string const& value);
 
+// Pure ini handling (no file access). ParseIni keeps only valid schema keys; maxLine > 0 drops longer lines, and
+// `dropped` (if given) counts the key lines and stray lines it could not keep (comments and headers are not counted).
+Values ParseIni(std::string text, size_t maxLine = 0, int* dropped = nullptr);
+std::string Serialize(Values const& v);   // the file text Write() would save
+bool WriteText(std::string const& text);  // atomic (tmp + MoveFileEx)
+
+// Import of an untrusted settings file (a shared theme). Only schema keys survive, each coerced by its type;
+// keys the file does not mention keep their value in `currentIni`. `text` is the merged file; ok is false (and
+// `error` says why) when `imported` is over kMaxImport bytes.
+constexpr size_t kMaxImport = 64 * 1024, kMaxImportLine = 256;
+struct ImportResult { bool ok = false; std::string text, error; int applied = 0, dropped = 0; };
+ImportResult MergeImport(std::string const& currentIni, std::string const& imported);
+
 // The settings Halo runs with. Reload() re-reads the file; true when anything changed.
 const Settings& Get();
 bool Reload();

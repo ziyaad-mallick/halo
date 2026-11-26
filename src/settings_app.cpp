@@ -416,6 +416,23 @@ Response Route(std::string const& method, std::string const& path, std::string c
         r.body = "{\"ok\":true,\"values\":" + ValuesJson(Current()) + "}";
         return r;
     }
+    if (rest == "api/export") {
+        if (method != "GET") return Err(405, "method not allowed");
+        std::lock_guard lk(g_settingsMu);
+        r.body = "{\"ok\":true,\"text\":" + JStr(st::Serialize(st::Read())) + "}";
+        return r;
+    }
+    if (rest == "api/import") {
+        if (method != "POST") return Err(405, "method not allowed");
+        std::lock_guard lk(g_settingsMu);
+        std::map<std::string, std::string> in;
+        if (!ParseFlatJson(body, in) || !in.count("text")) return Err(400, "body must be a JSON object like {\"text\":\"[general]\ntheme = dark\"}");
+        st::ImportResult res = st::MergeImport(st::Serialize(st::Read()), in["text"]);  // the file is untrusted: only schema keys, coerced by type
+        if (!res.ok) return Err(400, res.error.c_str());
+        if (res.applied && !st::WriteText(res.text)) return Err(500, "could not write the settings file");
+        r.body = "{\"ok\":true,\"applied\":" + std::to_string(res.applied) + ",\"dropped\":" + std::to_string(res.dropped) + ",\"values\":" + ValuesJson(Current()) + "}";
+        return r;
+    }
     return Err(404, "not found");
 }
 
