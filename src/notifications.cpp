@@ -742,6 +742,12 @@ LRESULT NotificationCenter::Impl::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 Dismissed();
             }
             return 0;
+        case WM_DPICHANGED:
+        case WM_DISPLAYCHANGE:
+            // The fonts, noise brush, surfaces and hit rects use the scale from Open(), which takes it from its monitor.
+            // Close by the normal path; the next Open() rebuilds the window at the new scale.
+            if (st == St::Open) Dismissed();
+            return 0;
         case WM_KEYDOWN:
             if (w == VK_ESCAPE) Dismissed();
             return 0;

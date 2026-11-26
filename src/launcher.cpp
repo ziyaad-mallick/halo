@@ -2760,6 +2760,12 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                 Hide();
             }
             break;  // DefWindowProc gives the keyboard focus to the window
+        case WM_DPICHANGED:
+        case WM_DISPLAYCHANGE:
+            // Fonts, surfaces and hit rects were laid out at the scale Show() took from its anchor, and the work area may be
+            // gone. Close by the normal path: the next Show() builds everything at the new scale.
+            if (m_open) { Log(L"display or DPI changed, closing"); Hide(); }
+            return 0;
         case WM_KEYDOWN:
             if (m_open) OnKey(w);
             return 0;
