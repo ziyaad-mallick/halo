@@ -120,6 +120,9 @@ constexpr UINT_PTR kPreviewTimer = 21;  // the pointer rested on a running app
 constexpr UINT_PTR kPreviewGrace = 22;  // the pointer left the icon and the strip
 constexpr UINT_PTR kPanelStagger = 23;  // the notification column follows the Control Center
 constexpr UINT_PTR kMediaExpiry = 24;
+constexpr UINT_PTR kGraphicsRetry = 25;  // a drawing surface failed (a lost device after resume): rebuild the dock
+constexpr UINT kGraphicsRetryMs = 1500;  // a device is often usable again a moment after resume
+constexpr int kGraphicsRetries = 2;      // rebuilds within a minute before Halo exits for the guardian to restart it
 constexpr UINT kPanelStaggerMs = 40;
 constexpr UINT kPreviewDelayMs = 400;
 constexpr UINT kPreviewGraceMs = 300;
@@ -292,6 +295,7 @@ private:
     RECT GetPillRectScreen() const;
     void MigrateToMonitor(HMONITOR mon, bool reveal = true);
     wuc::CompositionDrawingSurface MakeSurface(Size size);
+    void GraphicsFailed();
     wuc::CompositionBrush MakeIconBrush(IconImage const& icon, float size);
 
     HWND m_hwnd{};
@@ -335,6 +339,11 @@ private:
     float m_pressX = 0;       // ... and where, for telling a click from a drag
     bool m_dragging = false;  // a pinned icon is being dragged to a new place (m_pressed is its current index)
     bool m_pressedStart = false;  // the button went down on the Start logo
+    // GraphicsFailed(): the last surface failure, rebuilds since, and whether one is already scheduled.
+    DWORD m_graphicsFailAt = 0;
+    int m_graphicsRetries = 0;
+    bool m_graphicsRetryArmed = false;
+    int m_exitCode = 0;  // WM_DESTROY quits with this: non-zero tells the guardian to restart Halo
     Dock::Kind m_pressedWidget = Dock::Kind::None;  // HALO 2.0: ... or on the Wi-Fi / volume widget
     bool m_autoHide = true;  // off under HALO_TEST
     halo::settings::Settings m_cfg;  // what the dock was last built / applied with
@@ -539,9 +548,37 @@ void Halo::InitGraphics() {
         reinterpret_cast<ABI::Windows::UI::Composition::ICompositionGraphicsDevice**>(winrt::put_abi(m_gdev))));
 }
 
+// After a sleep/resume the device can fail here, or hand back an empty surface without failing. The empty one used
+// to reach `.as<>()` in BuildPillShadow and take the shell down (crash.log 22 and 25 Nov: a null read there, inside
+// WM_POWERBROADCAST). Both now throw, which every caller already catches and logs, and schedule a fresh dock.
 wuc::CompositionDrawingSurface Halo::MakeSurface(Size size) {
-    return m_gdev.CreateDrawingSurface(size, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                                       winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+    wuc::CompositionDrawingSurface surface{nullptr};
+    try {
+        if (m_gdev)
+            surface = m_gdev.CreateDrawingSurface(size, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                                  winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+    } catch (winrt::hresult_error const&) {
+        GraphicsFailed();
+        throw;
+    }
+    if (!surface) {
+        GraphicsFailed();
+        throw winrt::hresult_error(E_POINTER, L"empty drawing surface");
+    }
+    return surface;
+}
+
+// A surface failed: rebuild the dock in a moment. If drawing keeps failing (kGraphicsRetries rebuilds within a
+// minute), close with a failure code so the guardian restarts Halo on fresh devices: Start, the menus and the panels
+// share m_gdev, so the dock alone cannot swap it.
+void Halo::GraphicsFailed() {
+    const DWORD now = GetTickCount();
+    if (now - m_graphicsFailAt > 60000) m_graphicsRetries = 0;
+    m_graphicsFailAt = now;
+    if (m_hwnd && !m_graphicsRetryArmed) {
+        m_graphicsRetryArmed = true;
+        SetTimer(m_hwnd, kGraphicsRetry, kGraphicsRetryMs, nullptr);
+    }
 }
 
 // Draws the 256px icon into a surface the size of the fully magnified icon,
@@ -694,7 +731,7 @@ void Halo::ApplySettings(bool themeFlipped) {
     auto glass = [](Surface const& g) { return std::make_tuple(g.opacity, g.blur, g.hasTint, g.tint); };
     const bool look = themeFlipped || prev.theme != c.theme || prev.accent != c.accent;
     const bool h2Changed = prev.halo2 != c.halo2;
-    const bool dockChanged = h2Changed || look || glass(prev.taskbar) != glass(c.taskbar) || prev.reduceMotion != c.reduceMotion ||
+    const bool dockChanged = h2Changed || prev.developerMode != c.developerMode || look || glass(prev.taskbar) != glass(c.taskbar) || prev.reduceMotion != c.reduceMotion ||
                              prev.taskbar.iconSize != c.taskbar.iconSize || prev.taskbar.magnification != c.taskbar.magnification ||
                              prev.taskbar.runningDots != c.taskbar.runningDots || prev.taskbar.spacing != c.taskbar.spacing ||
                              prev.taskbar.thickness != c.taskbar.thickness || prev.taskbar.roundness != c.taskbar.roundness ||
@@ -1773,6 +1810,19 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
                     m_previews->Hide();
                     if (!m_trackingMouse) PointerLeave();  // now the dock may auto-hide
                 }
+            } else if (w == kGraphicsRetry) {
+                KillTimer(m_hwnd, kGraphicsRetry);
+                m_graphicsRetryArmed = false;
+                if (m_graphicsRetries >= kGraphicsRetries) {
+                    Log(L"graphics: drawing still fails after " + std::to_wstring(m_graphicsRetries) +
+                        L" rebuilds; closing so the guardian restarts Halo on fresh devices");
+                    m_exitCode = 3;
+                    PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
+                } else {
+                    ++m_graphicsRetries;
+                    Log(L"graphics: a drawing surface failed; rebuilding the dock (attempt " + std::to_wstring(m_graphicsRetries) + L")");
+                    RebuildDock(false);  // false: the cached icon brushes may be the failed ones
+                }
             } else if (w == DockCluster::kClockTimer) {
                 if (m_dock) m_dock->OnClockTimer();
             }
@@ -1805,7 +1855,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_LBUTTONDOWN:
             if (m_dock && m_state == State::Shown) {
                 const Dock::Target target = m_dock->HitTarget(mx, my);
-                m_pressedStart = target.kind == Dock::Kind::Start;
+                m_pressedStart = target.kind == Dock::Kind::Start || target.kind == Dock::Kind::Logo;
                 m_pressedWidget = target.kind == Dock::Kind::Media || target.kind == Dock::Kind::MediaPlay || target.kind == Dock::Kind::MediaNext ? target.kind : Dock::Kind::None;
                 if (m_widgets) m_widgets->SetPressed(MediaPart(m_pressedWidget));
                 m_pressed = m_dock->HitTest(mx, my);
@@ -1818,8 +1868,15 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
         case WM_CAPTURECHANGED: {
             const bool wasDragging = std::exchange(m_dragging, false);  // a drag ends here, and is never also a click
             if (wasDragging && m_dock) m_dock->EndDrag();
-            if (std::exchange(m_pressedStart, false) && m == WM_LBUTTONUP && m_dock && m_dock->HitStart(mx, my))
-                OpenLauncher();
+            if (std::exchange(m_pressedStart, false) && m == WM_LBUTTONUP && m_dock) {
+                const Dock::Kind released = m_dock->HitTarget(mx, my).kind;
+                if (released == Dock::Kind::Start) {
+                    OpenLauncher();
+                } else if (released == Dock::Kind::Logo) {  // developer mode: Windows' power-user (Win+X) menu
+                    const UINT sent = halo::winkey::OpenPowerUserMenu();
+                    Log(L"dock: Windows logo -> power-user menu (" + std::to_wstring(sent) + L"/4 key events sent)");
+                }
+            }
             {
                 const Dock::Kind releasedWidget = std::exchange(m_pressedWidget, Dock::Kind::None);
                 if (m_widgets && releasedWidget != Dock::Kind::None) {
@@ -1885,7 +1942,7 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_DESTROY:
             if (m_appBar) { APPBARDATA abd{sizeof(abd), m_hwnd}; SHAppBarMessage(ABM_REMOVE, &abd); m_appBar = false; }
-            PostQuitMessage(0);
+            PostQuitMessage(m_exitCode);
             return 0;
     }
     return DefWindowProcW(m_hwnd, m, w, l);

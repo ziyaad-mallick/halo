@@ -44,6 +44,7 @@ slow, `200` = twice as fast). `motion` scales distances and overshoot (`0` = no 
 | `accent` | color | `#14A394` | | the "on" colour for toggles, sliders and focus everywhere |
 | `reduce_motion` | bool | `off` | | every effect behaves like `fade`, hover magnification off |
 | `halo2` | bool | `off` | | HALO 2.0 preview: clicking the left cluster opens Start (which hosts the control centre); the right side opens notifications and a calendar instead of the Control Center, and the dock gets Wi-Fi and volume widgets. Applies live |
+| `developer_mode` | bool | `off` | | clicking the Windows logo in the dock opens Windows' own power-user menu (the Win+X menu: Device Manager, Disk Management, Event Viewer, Terminal (Admin), Run ...) instead of Start. The time, Wi-Fi and battery still open Start, and so does the Windows key. Applies live |
 
 ### `[taskbar]` (the dock)
 | key | type | default | range | meaning |

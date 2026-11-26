@@ -14,6 +14,11 @@ UINT Message();               // registered window message posted to `target`
 UINT EscapeMessage();         // posted to `target` on each Esc press while WatchEscape(true); Esc is not swallowed
 void WatchEscape(bool on);
 UINT ControlCenterMessage();  // posted to `target` on Win+A (wParam 0) or Win+N (wParam 1); the key is swallowed
+// Opens Windows' own power-user menu (the Win+X menu: Device Manager, Disk Management, Terminal (Admin) ...) by
+// typing Win+X for the user. Explorer draws it where its hidden Start button would be. Marked as Halo's own input,
+// so the hook above lets it through and the Win release does not count as a Start tap. Returns the events sent
+// (4 on success; 0 when Windows refused, e.g. an elevated window has the foreground).
+UINT OpenPowerUserMenu();
 
 // The decision logic, separate from the hook so it can be unit tested.
 struct Tracker {

@@ -120,7 +120,8 @@ change applies live, without restarting Halo.
 
 You can change:
 
-- **General**: theme (system / dark / light), accent colour, reduce motion
+- **General**: theme (system / dark / light), accent colour, reduce motion, and **developer mode**: clicking the
+  Windows logo in the dock opens the Windows power-user menu (Device Manager, Disk Management, Terminal (Admin) ...)
 - **Dock**: icon size, magnification, auto-hide and hide delay, bounce on launch, running dots, glass
   tint and opacity, and the reveal effect
 - **Control Center**: hot corner on/off, its width and delay, close when the pointer leaves, Now Playing

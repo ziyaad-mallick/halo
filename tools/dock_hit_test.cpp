@@ -1,6 +1,7 @@
 // Headless test of the dock's magnetic hit-testing (Dock::HitTarget). Not part of build.sh; build ad hoc:
 //   clang++ <COMMON flags> src/dock.cpp src/cluster.cpp src/settings.cpp tools/dock_hit_test.cpp -o build/dock_hit_test.exe <WINLIBS>
-// Run with no argument for HALO 2.0 off, with `h2` for HALO 2.0 on (it writes a temp settings file).
+// Run with no argument for HALO 2.0 off, with `h2` for HALO 2.0 on, and add `dev` for developer mode (it writes a
+// temp settings file).
 #include <windows.h>
 #include <d3d11.h>
 #include <d2d1_1.h>
@@ -25,18 +26,23 @@ static int g_fail = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); g_fail++; } } while (0)
 
 int wmain(int argc, wchar_t** argv) {
-    const bool h2 = argc > 1 && !wcscmp(argv[1], L"h2");
+    bool h2 = false, dev = false;
+    for (int i = 1; i < argc; i++) {
+        if (!wcscmp(argv[i], L"h2")) h2 = true;
+        if (!wcscmp(argv[i], L"dev")) dev = true;
+    }
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     std::wstring ini = std::wstring(tmp) + L"halo_dock_hit_test.ini";
     if (FILE* f = _wfopen(ini.c_str(), L"wb")) {
-        fprintf(f, "[general]\r\nhalo2 = %s\r\n", h2 ? "on" : "off");
+        fprintf(f, "[general]\r\nhalo2 = %s\r\ndeveloper_mode = %s\r\n", h2 ? "on" : "off", dev ? "on" : "off");
         fclose(f);
     }
     SetEnvironmentVariableW(L"HALO_SETTINGS_FILE", ini.c_str());
     halo::settings::Reload();
     CHECK(halo::settings::Get().halo2 == h2);
-    printf("=== Dock hit-testing, HALO 2.0 %s ===\n", h2 ? "ON" : "off");
+    CHECK(halo::settings::Get().developerMode == dev);
+    printf("=== Dock hit-testing, HALO 2.0 %s, developer mode %s ===\n", h2 ? "ON" : "off", dev ? "ON" : "off");
 
     // Magnetic snapping on one axis: spans touch or leave a gap, and the ends reach `tol` past their edge.
     {
@@ -114,14 +120,23 @@ int wmain(int argc, wchar_t** argv) {
     float last = dock.RestIconCenter(4).first;
     CHECK(dock.HitTest(last + 19.0f + 2.0f, midY) == 4 || h2);
     CHECK(dock.HitTest(pillL - 40.0f, midY) == -1 && dock.HitTest(pillR + 40.0f, midY) == -1);
-    CHECK(dock.HitTarget(pillL + 3.0f, midY).kind == (h2 ? Dock::Kind::Start : Dock::Kind::None));  // the pill edge: the cluster is Start only with HALO 2.0
+    CHECK(dock.HitTarget(pillL + 3.0f, midY).kind == Dock::Kind::Start);  // the pill edge: the cluster opens Start in both modes (dc2a2bf)
 
     const float cl = pillL + 10.0f;
-    if (!h2) {
-        // Only the Start logo (the last 28 px of the cluster) is a target.
+    if (dev) {
+        // Developer mode: the logo (the cluster's right end) is its own target; the time, Wi-Fi and battery stay Start.
+        const float logoL = cl + cluster.StartX(), logoR = logoL + cluster.StartWidth();
+        for (float x = logoL + 1.0f; x < logoR; x += 2.0f) CHECK(dock.HitTarget(x, midY).kind == Dock::Kind::Logo);
+        CHECK(dock.HitTarget(cl + 20.0f, midY).kind == Dock::Kind::Start);    // the time
+        CHECK(dock.HitTarget(logoL - 2.0f, midY).kind == Dock::Kind::Start);  // just left of the logo: the battery
+        CHECK(dock.HitTarget(cl + cW + 2.0f, midY).kind == Dock::Kind::Logo); // the gap before the first icon
+        CHECK(!dock.HitStart((logoL + logoR) / 2, midY));
+        CHECK(dock.HitTarget(pillR - 3.0f, midY).kind == Dock::Kind::App);
+    } else if (!h2) {
+        // The whole cluster opens Start (dc2a2bf, kept by the owner 23 Nov): the logo, the time, the gap after it.
         CHECK(dock.HitStart(cl + cW - 14.0f, midY));
-        CHECK(dock.HitStart(cl + cW - 30.0f, midY));  // just left of the logo: snapped
-        CHECK(!dock.HitStart(cl + 20.0f, midY));          // the time: not clickable in 1.x
+        CHECK(dock.HitStart(cl + cW - 30.0f, midY));
+        CHECK(dock.HitStart(cl + 20.0f, midY));  // the time
         CHECK(dock.HitTarget(cl + cW + 2.0f, midY).kind == Dock::Kind::Start);  // the gap before the first icon
         CHECK(dock.HitTarget(pillR - 3.0f, midY).kind == Dock::Kind::App);
     } else {

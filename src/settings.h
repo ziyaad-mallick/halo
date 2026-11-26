@@ -54,6 +54,7 @@ struct Settings {
     int contrast = 1;  // 0 soft (flat tiles), 1 clear (firmer tiles with a hairline edge), 2 high
     int glass = 1;     // 0 clear (more see-through), 1 frosted (as designed), 2 solid (nearly opaque)
     bool halo2 = false;  // HALO 2.0: Start hosts the control centre; the right edge is notifications + calendar
+    bool developerMode = false;  // the dock's Windows logo opens Windows' power-user (Win+X) menu; Start stays on the Windows key
     Taskbar taskbar;
     ControlCenter cc;
     Start start;

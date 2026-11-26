@@ -13,6 +13,7 @@ const std::vector<Key>& Schema() {
         {"general", "accent", Type::Color, "#14A394"},
         {"general", "reduce_motion", Type::Bool, "off"},
         {"general", "halo2", Type::Bool, "off"},
+        {"general", "developer_mode", Type::Bool, "off"},
         {"general", "contrast", Type::Int, "1", 0, 2},  // 0 soft, 1 clear, 2 high
         {"general", "glass", Type::Int, "1", 0, 2},     // 0 clear, 1 frosted, 2 solid
 
@@ -202,6 +203,7 @@ Settings Parse(Values const& v) {
     if (std::string a = str("general", "accent"); a.size() == 7) s.accent = Hex(a);
     s.reduceMotion = on("general", "reduce_motion");
     s.halo2 = on("general", "halo2");
+    s.developerMode = on("general", "developer_mode");
     s.contrast = num("general", "contrast");
     s.glass = num("general", "glass");
 

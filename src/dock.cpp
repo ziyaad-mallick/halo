@@ -100,7 +100,7 @@ Dock::Dock(Compositor const& compositor, ContainerVisual const& parent,
            ContainerVisual const& pill, DockMetrics const& metrics,
            DockCluster* cluster, DockWidgets* widgets)
     : m_compositor(compositor), m_pill(pill), m_m(metrics), m_cluster(cluster), m_widgets(widgets),
-      m_h2(halo::settings::Get().halo2) {
+      m_h2(halo::settings::Get().halo2), m_dev(halo::settings::Get().developerMode) {
     m_root = m_compositor.CreateContainerVisual();
     m_root.RelativeSizeAdjustment({1.0f, 1.0f});
     parent.Children().InsertAtTop(m_root);
@@ -582,14 +582,21 @@ Dock::Target Dock::HitTarget(float x, float y) const {
     const float pillLeft = (m_m.centerX - CapsuleExtent() / 2) - pillWidth / 2;
     const float pillTop = m_m.bottom - m_m.pillHeight;
 
-    // The targets left to right, as horizontal spans: the cluster (all of it with HALO 2.0, else the Start logo),
-    // then every icon's whole slot, then the widgets.
+    // The targets left to right, as horizontal spans: the cluster, then every icon's whole slot, then the widgets.
     std::vector<halo::hit::Span> spans;
     std::vector<Target> targets;
     if (m_cluster) {
         const float cl = pillLeft + m_m.padding;
-        spans.push_back({cl, cl + m_clusterWidth});  // time, Wi-Fi, battery and the Start logo all open Start
-        targets.push_back({Kind::Start, -1});
+        if (m_dev) {  // developer mode: the time, Wi-Fi and battery open Start, the logo (the cluster's right end) is its own
+            const float logo = cl + std::min(m_cluster->StartX(), m_clusterWidth);
+            spans.push_back({cl, logo});
+            targets.push_back({Kind::Start, -1});
+            spans.push_back({logo, cl + m_clusterWidth});
+            targets.push_back({Kind::Logo, -1});
+        } else {
+            spans.push_back({cl, cl + m_clusterWidth});  // time, Wi-Fi, battery and the Start logo all open Start
+            targets.push_back({Kind::Start, -1});
+        }
     }
     float left = (m_m.centerX - CapsuleExtent() / 2) + m_shift - total / 2;
     for (size_t k = 0; k < n; k++) {

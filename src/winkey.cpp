@@ -122,6 +122,16 @@ void Remove() {
     g_thread = nullptr;
 }
 
+UINT OpenPowerUserMenu() {
+    INPUT in[4] = {};
+    Key(in[0], VK_LWIN, false);
+    Key(in[1], 'X', false);
+    Key(in[2], 'X', true);
+    Key(in[3], VK_LWIN, true);
+    in[0].ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;  // the Windows keys are extended keys
+    in[3].ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    return SendInput(4, in, sizeof(INPUT));
+}
 UINT EscapeMessage() {
     static UINT m = RegisterWindowMessageW(L"Halo.WinKeyEscape");
     return m;

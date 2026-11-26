@@ -74,7 +74,8 @@ public:
     // (an app icon, the Start logo or, with HALO 2.0, the whole left cluster, the Wi-Fi and volume widgets), so
     // the gaps between targets and the pill's edges are not dead, and a little above the pill still counts.
     // Media is the Now Playing capsule's artwork and title; MediaPlay and MediaNext are its buttons.
-    enum class Kind { None, App, Start, Media, MediaPlay, MediaNext };
+    // Logo is the Windows logo on its own, a target only in developer mode (it opens the Win+X menu there).
+    enum class Kind { None, App, Start, Logo, Media, MediaPlay, MediaNext };
     struct Target {
         Kind kind = Kind::None;
         int index = -1;  // App: into the last SetItems
@@ -174,6 +175,7 @@ private:
     DockCluster* m_cluster = nullptr;
     DockWidgets* m_widgets = nullptr;
     bool m_h2 = false;           // HALO 2.0 at construction (the dock is rebuilt when it flips)
+    bool m_dev = false;          // developer mode at construction: the logo is its own target (rebuilt likewise)
     float m_shift = 0.0f;        // (cluster - widgets) / 2: where the app icons' centre sits relative to the dock's
     unsigned m_magnetId = 0;     // the entry id pulled toward the pointer
     unsigned m_dragId = 0;       // the entry id being dragged to a new slot, 0 = none
