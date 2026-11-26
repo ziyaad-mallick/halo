@@ -200,4 +200,4 @@ Design notes and decisions are in [docs/DESIGN.md](docs/DESIGN.md); ideas not bu
 
 ## License
 
-[MIT](LICENSE). The genie mod is a fork of *MacOS Minimize Animation* by Abdullah Masood (MIT).
+[MIT](LICENSE). The genie mod is a fork of *MacOS Minimize Animation* by Abdullah Masood (MIT); its licence notice is in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

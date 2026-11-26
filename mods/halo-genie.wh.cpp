@@ -80,6 +80,9 @@ merge, publish, distribute, sublicense, and/or sell copies of the software,
 subject to the above copyright notice and this permission notice being
 included in all copies or substantial portions of the software. THE SOFTWARE
 IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+The full upstream licence notice is in THIRD-PARTY-NOTICES.md at the root of the
+Halo repository.
 */
 // ==/WindhawkModReadme==
 
