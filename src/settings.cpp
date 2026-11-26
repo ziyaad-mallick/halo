@@ -55,12 +55,13 @@ const std::vector<Key>& Schema() {
         {"start", "opacity", Type::Int, "66", 20, 100},
         {"start", "tint", Type::Color, ""},
         {"start", "blur", Type::Int, "40", 0, 80},
+        {"start", "pinned_apps", Type::Int, "12", 0, 24},
         {"start", "recent_apps", Type::Int, "6", 0, 32},
         {"start", "columns", Type::Int, "6", 4, 8},
         {"start", "icon_size", Type::Int, "44", 32, 64},
         {"start", "width", Type::Int, "640", 520, 1000},
         {"start", "roundness", Type::Int, "36", 0, 48},
-        {"start", "recent_files", Type::Int, "12", 0, 12},
+        {"start", "recent_files", Type::Int, "10", 0, 12},
         {"start", "dim_desktop", Type::Bool, "off"},
     };
     return keys;
@@ -230,6 +231,7 @@ Settings Parse(Values const& v) {
     s.cc.showSliders = on("controlcenter", "show_sliders");
 
     surface("start", s.start);
+    s.start.pinnedApps = num("start", "pinned_apps");
     s.start.recentApps = num("start", "recent_apps");
     s.start.recentFiles = num("start", "recent_files");
     s.start.columns = num("start", "columns");

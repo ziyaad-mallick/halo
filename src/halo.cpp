@@ -452,6 +452,14 @@ bool Halo::Create(HINSTANCE inst) {
                 host.appIcon = Guarded("launcher.appIcon", [this](std::wstring const& target) { return IconBrushFor(target); });
                 host.launch = Guarded("launcher.launch", [this](std::wstring const& target) { LaunchRecent(target); });
                 host.closed = Guarded("launcher.closed", [this] { if (!m_trackingMouse) PointerLeave(); });  // the dock may auto-hide again
+                host.dockPins = Guarded("launcher.dockPins", [] {
+                    std::vector<std::wstring> out;
+                    for (auto const& p : halo::pins::Load()) out.push_back(p.linkPath);
+                    return out;
+                });
+                host.menu = Guarded("launcher.menu", [this](std::vector<halo::MenuEntry> entries, int x, int y, RECT const& monitor, float scale) {
+                    if (m_menu) m_menu->Show(std::move(entries), x, y, monitor, scale);
+                });
                 m_launcher = std::make_unique<halo::Launcher>(inst, m_comp, m_gdev, std::move(host));
                 m_tracker->onForeground = Guarded("tracker.onForeground", [this](RunningApp const& app) { m_launcher->Note(LaunchTarget(app)); });
             });
@@ -738,7 +746,7 @@ void Halo::ApplySettings(bool themeFlipped) {
                              prev.taskbar.lift != c.taskbar.lift || prev.taskbar.zoomRange != c.taskbar.zoomRange;
     const bool ccChanged = look || glass(prev.cc) != glass(c.cc) || prev.cc.showMedia != c.cc.showMedia ||
                            prev.cc.showSliders != c.cc.showSliders;
-    const bool startChanged = look || glass(prev.start) != glass(c.start) || prev.start.recentApps != c.start.recentApps ||
+    const bool startChanged = look || glass(prev.start) != glass(c.start) || prev.start.pinnedApps != c.start.pinnedApps || prev.start.recentApps != c.start.recentApps ||
                               prev.start.recentFiles != c.start.recentFiles || prev.start.dimDesktop != c.start.dimDesktop ||
                               prev.start.columns != c.start.columns || prev.start.iconSize != c.start.iconSize ||
                               prev.start.width != c.start.width || prev.start.roundness != c.start.roundness;
@@ -1694,8 +1702,12 @@ LRESULT Halo::OnMessage(UINT m, WPARAM w, LPARAM l) {
     if (m == m_genieMsg && m) return DockIconForWindow(reinterpret_cast<HWND>(w), l);
     if (m == halo::winkey::Message()) { OpenLauncher(); return 0; }  // Win tapped alone
     if (m == halo::winkey::EscapeMessage()) {                        // Esc, while the panel or a menu is up
-        if (m_menu && m_menu->IsOpen()) m_menu->Close();
-        else if (m_launcher) m_launcher->Hide();
+        if (m_menu && m_menu->IsOpen()) {
+            m_menu->Close();
+            if (m_launcher && m_launcher->IsOpen()) m_launcher->EatNextEscape();  // Start's own Esc is this key: keep Start
+        } else if (m_launcher) {
+            m_launcher->Hide();
+        }
         return 0;
     }
     if (m == halo::winkey::ControlCenterMessage()) {  // Win+A (wParam 0) / Win+N (1): both toggle the one panel

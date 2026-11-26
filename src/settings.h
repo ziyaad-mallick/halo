@@ -43,7 +43,7 @@ struct ControlCenter : Surface {
     int cornerWidth = 20, cornerDelay = 120;
 };
 struct Start : Surface {
-    int recentApps = 6, recentFiles = 12;
+    int pinnedApps = 12, recentApps = 6, recentFiles = 10;  // classic Start, top to bottom: pinned, files, recent apps
     int columns = 6, iconSize = 44, width = 640, roundness = 36;  // classic Start's grid and shape
     bool dimDesktop = false;
 };

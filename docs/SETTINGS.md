@@ -87,8 +87,9 @@ slow, `200` = twice as fast). `motion` scales distances and overshoot (`0` = no 
 | `opacity` | int | `66` | 20–100 | |
 | `tint` | color | (theme) | | |
 | `blur` | int | `40` | 0–80 | |
-| `recent_apps` | int | `6` | 0–6 | apps in the recent row; 0 hides the row |
-| `recent_files` | int | `12` | 0–12 | recent files (two rows of six); 0 hides them |
+| `pinned_apps` | int | `12` | 0–24 | classic Start's first section: apps pinned to Start, in rows of `columns`. Right-click an app in Start or in search results to Pin to Start / Unpin. The list lives in `start-pins.txt` and starts as a copy of the first 12 dock pins; 0 hides the section |
+| `recent_apps` | int | `6` | 0–32 | the last section: recently used apps that are not pinned, in rows of `columns`; 0 hides it |
+| `recent_files` | int | `10` | 0–12 | the middle section: recent files in two columns; 0 hides them |
 | `dim_desktop` | bool | `off` | | dim the screen behind Start |
 
 ## Live stats (Halo Preferences only)

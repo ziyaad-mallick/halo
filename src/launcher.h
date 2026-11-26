@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "icons.h"
+#include "menu.h"  // MenuEntry only: the host shows the menu
 #include "notif_column.h"
 #include "services.h"
 #include "start_widgets.h"
@@ -54,6 +55,10 @@ struct LauncherHost {
     std::function<void(std::wstring const&)> launch;
     // The panel has gone (the dock may auto-hide again).
     std::function<void()> closed;
+    // The dock's pins as launch targets, in dock order: Start's own pin list starts as a copy of the first ones.
+    std::function<std::vector<std::wstring>()> dockPins;
+    // A glass context menu at screen point (x, y), above it, inside `monitor` (screen px) at `scale`.
+    std::function<void(std::vector<MenuEntry>, int x, int y, RECT const& monitor, float scale)> menu;
 };
 
 // Where the panel goes: above the dock, in screen px.
@@ -74,6 +79,9 @@ public:
     void Show(LauncherAnchor const& anchor);
     void Hide();
     bool IsOpen() const { return m_open; }
+    // The keyboard hook's Esc closed a context menu over the panel: the same key, arriving here next as input,
+    // must not also close Start. Only the Esc within the next 500 ms is eaten.
+    void EatNextEscape() { m_eatEscapeUntil = GetTickCount() + 500; }
 
     // Remembers an app for "Recent apps" (a launch target as the host's `launch` takes it).
     void Note(std::wstring const& target);
@@ -155,6 +163,12 @@ private:
     static std::wstring IconKey(std::wstring const& path);
     void LoadMru();
     void SaveMru() const;
+    // Classic Start's pinned section: %LOCALAPPDATA%\Halo\start-pins.txt, one launch target per line, seeded once
+    // from the dock's pins. Right-click an app (a cell or a search result) for Pin to Start / Unpin from Start.
+    void LoadStartPins();
+    void SaveStartPins() const;
+    bool StartPinned(std::wstring const& target) const;
+    void AppMenu(std::wstring const& target, int screenX, int screenY);
     void Animate(wuc::CompositionObject const& target, wchar_t const* prop, float to, int ms);
     void Highlight(D2D1_RECT_F const* r, float radius, bool inMenu);
     Hit const* HitAt(float x, float y) const;
@@ -377,6 +391,11 @@ private:
 
     HWND m_dim{};                 // [start] dim_desktop: the click-through sheet under the panel
     bool m_showApps = true, m_showFiles = true;  // [start] recent_apps / recent_files are not 0
+    bool m_showPinned = false;     // classic Start with [start] pinned_apps not 0
+    DWORD m_eatEscapeUntil = 0;    // EatNextEscape(): the tick until which one Esc is ignored
+    size_t m_pinnedCount = 0;      // m_apps holds the pinned apps first, then the recent ones (classic Start)
+    std::vector<std::wstring> m_startPins;  // Start's own pins, in order (start-pins.txt)
+    D2D1_RECT_F m_recentLabel{};   // classic: "Recent apps", under the files (m_appsLabel is "Pinned" there)
     bool m_open = false;
     bool m_activated = false;     // the panel has had activation since Show, so losing it means a click elsewhere
     bool m_menuOpen = false;

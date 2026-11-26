@@ -426,8 +426,9 @@ const BEHAVIOUR = {
     { k: "show_sliders", type: "toggle", label: "Show Display and Sound sliders", help: "Brightness and volume sliders at the top of the panel." },
   ],
   start: [
-    { k: "recent_apps", type: "slider", label: "Recent apps", help: "How many recently used apps to show. They wrap into rows; choose 0 to hide them.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " app" : " apps") },
-    { k: "recent_files", type: "slider", label: "Recent files", help: "How many recent files to list, in rows of six. Choose 0 to hide them.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " file" : " files") },
+    { k: "pinned_apps", type: "slider", label: "Pinned apps", help: "How many of your Start pins to show at the top. Right-click an app in Start to pin or unpin it; choose 0 to hide them.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " app" : " apps") },
+    { k: "recent_apps", type: "slider", label: "Recent apps", help: "How many recently used apps to show under your files, leaving out pinned ones. They wrap into rows; choose 0 to hide them.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " app" : " apps") },
+    { k: "recent_files", type: "slider", label: "Recent files", help: "How many recent files to list between your pinned and recent apps, in two columns. Choose 0 to hide them.", step: 1, ends: ["None", "Most"], fmt: (v) => v === 0 ? "Hidden" : v + (v === 1 ? " file" : " files") },
     { k: "dim_desktop", type: "toggle", label: "Dim the desktop", help: "Darken everything behind the Start menu so it stands out." },
     { k: "columns", type: "slider", label: "Apps per row", help: "How many apps sit side by side. More apps wrap into extra rows.", step: 1, ends: ["4", "8"], fmt: (v) => v + " per row" },
     { k: "icon_size", type: "slider", label: "App icon size", help: "How big app icons are in Start. Very large icons are limited by the row's width.", step: 2, ends: ["Smaller", "Larger"], fmt: (v) => v + " px" },

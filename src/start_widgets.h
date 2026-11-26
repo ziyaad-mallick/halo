@@ -344,4 +344,46 @@ inline RightPlan PlanRight(float height, int rows = 4, bool compact = false) {
     return r;
 }
 
+// Classic Start under its search bar, top to bottom: Pinned, Recent files (two columns of kFileRowH rows), Recent
+// apps. A section that is on keeps at least one row (for its hint, when it is empty); one that is off takes no room.
+// When the panel would run past `availH`, recent apps give up rows first (all of them), then pinned rows down to one,
+// then file rows down to one. `minBodyEnd` is where a page of search results ends: the body is never shorter.
+// All values are logical px from the panel's top; `height` includes the 1 px hairline and the `bottomH` bar.
+struct ClassicPlan {
+    int pinRows = 0, fileRows = 0, recentRows = 0;
+    float pinnedLabelY = 0, pinnedTop = 0, filesLabelY = 0, filesTop = 0, recentLabelY = 0, recentTop = 0;
+    float dividerY = 0, height = 0;
+};
+inline ClassicPlan PlanClassic(float searchBot, float availH, float appRowH, float minBodyEnd, float bottomH, int cols,
+                               bool showPinned, int pinned, bool showFiles, int files, bool showRecent, int recent) {
+    auto rowsOf = [](int n, int per) { return per > 0 ? (n + per - 1) / per : 0; };
+    ClassicPlan p;
+    p.pinRows = showPinned ? std::max(1, rowsOf(pinned, cols)) : 0;
+    p.fileRows = showFiles ? std::max(1, rowsOf(files, 2)) : 0;
+    p.recentRows = showRecent ? std::max(1, rowsOf(recent, cols)) : 0;
+    auto layout = [&] {
+        p.pinnedLabelY = searchBot + ui::kS6;
+        p.pinnedTop = p.pinnedLabelY + kLabelH + ui::kS2;
+        float y = p.pinnedLabelY, end = searchBot;
+        if (p.pinRows) { end = p.pinnedTop + p.pinRows * appRowH; y = end + ui::kS4; }
+        p.filesLabelY = y;
+        p.filesTop = p.filesLabelY + kLabelH + ui::kS2;
+        if (p.fileRows) { end = p.filesTop + p.fileRows * tk::kFileRowH; y = end + ui::kS4; }
+        p.recentLabelY = y;
+        p.recentTop = p.recentLabelY + kLabelH + ui::kS2;
+        if (p.recentRows) end = p.recentTop + p.recentRows * appRowH;
+        p.dividerY = std::max(end + ui::kS4, minBodyEnd);
+        p.height = p.dividerY + 1 + bottomH;
+    };
+    layout();
+    while (p.height > availH) {
+        if (p.recentRows > 0) --p.recentRows;
+        else if (p.pinRows > 1) --p.pinRows;
+        else if (p.fileRows > 1) --p.fileRows;
+        else break;
+        layout();
+    }
+    return p;
+}
+
 }  // namespace halo::start

@@ -231,6 +231,16 @@ std::wstring RecentFile() {
     CreateDirectoryW(d.c_str(), nullptr);
     return d + L"\\recent.txt";
 }
+
+std::wstring StartPinsFile() {
+    wchar_t over[MAX_PATH];  // HALO_TEST_START_PINS: a stand-in file, so tests leave the real list alone
+    if (GetEnvironmentVariableW(L"HALO_TEST_START_PINS", over, MAX_PATH)) return over;
+    wchar_t dir[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH)) return {};
+    std::wstring d = std::wstring(dir) + L"\\Halo";
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d + L"\\start-pins.txt";
+}
 // A picture file as premultiplied BGRA, via WIC.
 bool LoadImageFile(std::wstring const& path, std::vector<uint8_t>& bgra, int& px) {
     winrt::com_ptr<IWICImagingFactory> factory;
@@ -440,6 +450,7 @@ Launcher::Launcher(HINSTANCE inst, wuc::Compositor const& comp, wuc::Composition
                                              reinterpret_cast<IUnknown**>(m_dwrite.put())));
     m_easeOut = m_comp.CreateCubicBezierEasingFunction({0.2f, 0.0f}, {0.0f, 1.0f});
     LoadMru();
+    LoadStartPins();
     CreateHwnd(inst);
     Prefetch();
     Log(L"ready, " + std::to_wstring(m_mru.size()) + L" recent apps, " + std::to_wstring(m_index.size()) + L" start-menu apps" +
@@ -540,6 +551,84 @@ void Launcher::Note(std::wstring const& target) {
     m_mru.insert(m_mru.begin(), target);
     if (m_mru.size() > kKeepApps) m_mru.resize(kKeepApps);
     SaveMru();
+}
+
+void Launcher::LoadStartPins() {
+    m_startPins.clear();
+    const auto path = StartPinsFile();
+    if (path.empty()) return;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {  // the first time: a copy of the dock's first pins, so Start is not empty
+        if (GetLastError() != ERROR_FILE_NOT_FOUND || !m_host.dockPins) return;
+        for (auto& t : m_host.dockPins()) {
+            if (m_startPins.size() >= 12) break;
+            if (!t.empty() && !StartPinned(t)) m_startPins.push_back(std::move(t));
+        }
+        SaveStartPins();
+        Log(L"start pins: seeded " + std::to_wstring(m_startPins.size()) + L" from the dock");
+        return;
+    }
+    std::string data(GetFileSize(f, nullptr), '\0');
+    DWORD got = 0;
+    ReadFile(f, data.data(), static_cast<DWORD>(data.size()), &got, nullptr);
+    CloseHandle(f);
+    data.resize(got);
+    for (size_t at = 0; at < data.size();) {
+        size_t end = data.find('\n', at);
+        if (end == std::string::npos) end = data.size();
+        std::string line = data.substr(at, end - at);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (!line.empty() && !StartPinned(Utf16(line))) m_startPins.push_back(Utf16(line));
+        at = end + 1;
+    }
+}
+
+void Launcher::SaveStartPins() const {
+    const auto path = StartPinsFile();
+    if (path.empty()) return;
+    std::string data;
+    for (auto const& t : m_startPins) data += Utf8(t) + "\n";
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD put = 0;
+    WriteFile(f, data.data(), static_cast<DWORD>(data.size()), &put, nullptr);
+    CloseHandle(f);
+}
+
+bool Launcher::StartPinned(std::wstring const& target) const {
+    return std::any_of(m_startPins.begin(), m_startPins.end(), [&](std::wstring const& t) { return !_wcsicmp(t.c_str(), target.c_str()); });
+}
+
+// Right-click on an app in classic Start: open it, or pin / unpin it. The host draws the dock's glass menu; the
+// actions run after it closes, with the panel still open, so a pin shows up at once.
+void Launcher::AppMenu(std::wstring const& target, int screenX, int screenY) {
+    if (!m_host.menu || target.empty()) return;
+    std::vector<MenuEntry> entries;
+    entries.push_back({L"Open", false, [this, target] {
+        Hide();
+        if (_wcsicmp(target.c_str(), kSettingsApp) == 0) OpenQuietly(target);
+        else if (m_host.launch) m_host.launch(target);
+    }});
+    entries.push_back({L"", true, nullptr});
+    if (StartPinned(target)) {
+        entries.push_back({L"Unpin from Start", false, [this, target] {
+            std::erase_if(m_startPins, [&](std::wstring const& t) { return !_wcsicmp(t.c_str(), target.c_str()); });
+            SaveStartPins();
+            Relayout();
+        }});
+    } else {
+        entries.push_back({L"Pin to Start", false, [this, target] {
+            if (StartPinned(target)) return;
+            m_startPins.push_back(target);
+            SaveStartPins();
+            if (!m_query.empty()) {  // from a search result: back to the home view, where the pin now shows
+                m_query.clear();
+                QueryChanged();
+            }
+            Relayout();
+        }});
+    }
+    m_host.menu(std::move(entries), screenX, screenY, m_anchor.monitor, m_s);
 }
 
 // The newest non-folder files in the shell's Recent folder, from their shortcuts: the panel shows the
@@ -840,11 +929,26 @@ void Launcher::Build() {
     m_showFiles = maxFiles > 0;
     m_files.assign(m_allFiles.begin(), m_allFiles.begin() + std::min(m_allFiles.size(), maxFiles));
 
-    // Recent apps: those that still have an icon.
+    // Classic: Start's pins first (those with an icon), then recent apps that are not among them. HALO 2.0: recent only.
+    const size_t maxPinned = m_h2 ? 0 : static_cast<size_t>(std::clamp(cfg.pinnedApps, 0, 24));
+    m_showPinned = maxPinned > 0;
     m_apps.clear();
+    for (auto const& t : m_startPins) {
+        if (m_apps.size() >= maxPinned) break;
+        if (m_host.appIcon && m_host.appIcon(t)) m_apps.push_back(t);
+    }
+    m_pinnedCount = m_apps.size();
+    // The same app can reach Start as a .lnk and as shell:AppsFolder\<id>: a recent one is "pinned" by path or by name.
+    auto shownPinned = [&](std::wstring const& t) {
+        const std::wstring name = AppName(t);
+        for (size_t i = 0; i < m_pinnedCount; i++)
+            if (!_wcsicmp(m_apps[i].c_str(), t.c_str()) || (!name.empty() && !_wcsicmp(AppName(m_apps[i]).c_str(), name.c_str()))) return true;
+        return false;
+    };
     for (auto const& t : m_mru) {
-        if (m_apps.size() >= maxApps) break;
+        if (m_apps.size() - m_pinnedCount >= maxApps) break;
         if (t.find(L"LockApp") != std::wstring::npos) continue;  // the lock screen is not an app to relaunch
+        if (shownPinned(t)) continue;
         if (m_host.appIcon && m_host.appIcon(t)) m_apps.push_back(t);
     }
 
@@ -860,6 +964,7 @@ void Launcher::Build() {
     const float searchTop = m_h2 ? m_plan.searchY : kSearchTop;
     const float searchBot = searchTop + (m_h2 ? start::kSearchH : kSearchH);
     float appsLabelY, appsTop, filesLabelY, filesTop, dividerY, panelH;
+    float recentLabelY = 0, recentTop = 0;  // classic: the recent apps, under the files
     if (m_h2) {
         // Never taller than 78 % of the screen, and at least tall enough for the control column (its footer is pinned).
         const float availH = start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s);
@@ -872,24 +977,28 @@ void Launcher::Build() {
         filesTop = m_plan.filesTop;
         dividerY = panelH;  // no footer in the middle card: its body runs to the bottom edge
     } else {
-        appsLabelY = searchBot + ui::kS6;
-        appsTop = appsLabelY + kLabelH + ui::kS2;
-        const int fileRows = std::max<int>(1, (static_cast<int>(m_files.size()) + 1) / 2);  // 2 columns of 40 px rows
-        // Recent apps wrap into rows of `appCols`; rows that would push the panel past the screen are dropped.
+        // Top to bottom: Pinned (its label line also holds "All apps"), Recent files, Recent apps. An empty section
+        // that is switched on keeps one row for its hint; one switched off takes no room.
+        const int pinned = static_cast<int>(m_pinnedCount), recent = static_cast<int>(m_apps.size() - m_pinnedCount);
         const float availH = start::AvailHeight(static_cast<float>(m_anchor.monitor.top), static_cast<float>(m_anchor.bottom), s);
-        auto layout = [&](int appRows) {
-            filesLabelY = m_showApps ? appsTop + appRows * appRowH + ui::kS4 : appsLabelY;
-            filesTop = filesLabelY + kLabelH + ui::kS2;
-            const float contentEnd = m_showFiles ? filesTop + fileRows * start::tk::kFileRowH
-                                                 : m_showApps ? appsTop + appRows * appRowH : searchBot;
-            dividerY = std::max(contentEnd + ui::kS4,
-                                searchBot + 8 + 4 + kMaxResults * kResultRowH + 4);  // a page of results always fits
-            panelH = dividerY + 1 + kBottomH;
-        };
-        int appRows = std::max(1, (static_cast<int>(m_apps.size()) + appCols - 1) / appCols);
-        layout(appRows);
-        while (appRows > 1 && panelH > availH) layout(--appRows);
-        if (m_apps.size() > static_cast<size_t>(appRows * appCols)) m_apps.resize(appRows * appCols);
+        const auto plan = start::PlanClassic(searchBot, availH, appRowH, searchBot + 8 + 4 + kMaxResults * kResultRowH + 4,  // a page of results always fits
+                                             kBottomH, appCols, m_showPinned, pinned, m_showFiles, static_cast<int>(m_files.size()),
+                                             m_showApps, recent);
+        appsLabelY = plan.pinnedLabelY;
+        appsTop = plan.pinnedTop;
+        filesLabelY = plan.filesLabelY;
+        filesTop = plan.filesTop;
+        recentLabelY = plan.recentLabelY;
+        recentTop = plan.recentTop;
+        dividerY = plan.dividerY;
+        panelH = plan.height;
+        // What did not fit is not shown: the recent apps past their rows, then pinned ones, then files.
+        m_showApps = m_showApps && plan.recentRows > 0;
+        const int keepPinned = std::min(pinned, plan.pinRows * appCols), keepRecent = std::min(recent, plan.recentRows * appCols);
+        m_apps.erase(m_apps.begin() + keepPinned + keepRecent, m_apps.end());
+        m_apps.erase(m_apps.begin() + keepPinned, m_apps.begin() + pinned);
+        m_pinnedCount = static_cast<size_t>(keepPinned);
+        if (m_files.size() > static_cast<size_t>(plan.fileRows * 2)) m_files.resize(plan.fileRows * 2);
     }
     m_iconPx = iconSz;
     m_h = std::round(panelH * s);
@@ -899,13 +1008,16 @@ void Launcher::Build() {
     m_searchRect = R(kPad * s, searchTop * s, (kPad + innerW) * s, searchBot * s);
     m_appsLabel = R(kPad * s, appsLabelY * s, (kPad + innerW) * s, (appsLabelY + kLabelH) * s);
     m_filesLabel = R(kPad * s, filesLabelY * s, (kPad + innerW) * s, (filesLabelY + kLabelH) * s);
+    m_recentLabel = R(kPad * s, recentLabelY * s, (kPad + innerW) * s, (recentLabelY + kLabelH) * s);
     // "All apps" at the right end of the first label's line (its text, not its plate, on the margin).
     m_allAppsRect = R((kPad + innerW + 8 - 104) * s, (appsLabelY - 6) * s, (kPad + innerW + 8) * s, (appsLabelY + kLabelH + 6) * s);
     m_divider = R(kPad * s, dividerY * s, (wl - kPad) * s, (dividerY + 1) * s);
     m_appCells.clear();
     m_fileCells.clear();
     for (size_t i = 0; i < m_apps.size(); i++) {
-        float x = kPad + (i % appCols + 0.5f) * colW - iconSz / 2, y = appsTop + (i / appCols) * appRowH + start::tk::kAppPadTop;
+        const bool recentApp = !m_h2 && i >= m_pinnedCount;  // classic: pinned from appsTop, recent from recentTop
+        const size_t k = recentApp ? i - m_pinnedCount : i;
+        float x = kPad + (k % appCols + 0.5f) * colW - iconSz / 2, y = (recentApp ? recentTop : appsTop) + (k / appCols) * appRowH + start::tk::kAppPadTop;
         m_appCells.push_back(R(x * s, y * s, (x + iconSz) * s, (y + iconSz) * s));
     }
     const float fileColW = (innerW - start::tk::kPad) / 2;  // HALO 2.0: recent files are a two-column list of rows
@@ -1553,10 +1665,18 @@ void Launcher::DrawBody(ID2D1DeviceContext* dc, float ox, float oy) {
         return;
     }
 
-    if (m_showApps) txt.Draw(dc, L"Recent apps", fLabel.get(), at(m_appsLabel), dim.get());
-    if (m_showApps && m_apps.empty())
+    // HALO 2.0: Recent apps on the first line. Classic: Pinned there, and Recent apps under the files.
+    auto const& recentLabel = m_h2 ? m_appsLabel : m_recentLabel;
+    if (!m_h2 && m_showPinned) {
+        txt.Draw(dc, L"Pinned", fLabel.get(), at(m_appsLabel), dim.get());
+        if (m_pinnedCount == 0)
+            txt.Draw(dc, L"Right-click an app to pin it here", fRow.get(),
+                     at(R(m_appsLabel.left, m_appsLabel.bottom + 6 * s, m_appsLabel.right, m_appsLabel.bottom + 46 * s)), dim.get());
+    }
+    if (m_showApps) txt.Draw(dc, L"Recent apps", fLabel.get(), at(recentLabel), dim.get());
+    if (m_showApps && m_apps.size() == m_pinnedCount)
         txt.Draw(dc, L"Apps you open show up here", fRow.get(),
-                 at(R(m_appsLabel.left, m_appsLabel.bottom + 6 * s, m_appsLabel.right, m_appsLabel.bottom + 46 * s)), dim.get());
+                 at(R(recentLabel.left, recentLabel.bottom + 6 * s, recentLabel.right, recentLabel.bottom + 46 * s)), dim.get());
     if (m_showFiles) txt.Draw(dc, L"Recent files", fLabel.get(), at(m_filesLabel), dim.get());
     if (m_showFiles && m_files.empty())
         txt.Draw(dc, L"No recent files", fRow.get(),
@@ -2271,6 +2391,11 @@ void Launcher::OnKey(WPARAM vk) {
     }
     switch (vk) {
         case VK_ESCAPE:  // closes the Power menu first, then clears the query, then leaves All apps, then the panel
+            if (m_eatEscapeUntil && static_cast<LONG>(GetTickCount() - m_eatEscapeUntil) < 0) {  // it closed a context menu
+                m_eatEscapeUntil = 0;
+                break;
+            }
+            m_eatEscapeUntil = 0;
             if (m_menuOpen) ToggleMenu(false);
             else if (!m_query.empty()) {
                 m_query.clear();
@@ -2842,6 +2967,20 @@ LRESULT Launcher::OnMessage(UINT m, WPARAM w, LPARAM l) {
                     sq.Duration(std::chrono::milliseconds(ui::kPressDownMs));
                     ic->v.StartAnimation(L"Scale", sq);
                 }
+            }
+            return 0;
+        case WM_RBUTTONUP:
+            if (m_open && !m_h2 && !m_menuOpen) {
+                auto const* hit = HitAt(PX(mx), my - kTop * m_s);
+                std::wstring target;
+                if (hit && hit->kind == Kind::App && hit->index >= 0 && hit->index < static_cast<int>(m_apps.size()))
+                    target = m_apps[hit->index];
+                else if (hit && hit->kind == Kind::Result && hit->index >= 0 && hit->index < static_cast<int>(m_results.size()) &&
+                         m_results[hit->index].type == Result::Type::App)
+                    target = m_results[hit->index].path;
+                POINT pt{static_cast<LONG>(mx), static_cast<LONG>(my)};
+                ClientToScreen(m_hwnd, &pt);
+                if (!target.empty()) AppMenu(target, pt.x, pt.y);
             }
             return 0;
         case WM_LBUTTONUP:

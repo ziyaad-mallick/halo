@@ -213,7 +213,46 @@ static void Layout3() {
     CHECK(start::PlanWidths3(1366 / 1.25f).mid >= start::kMidMinW);
 }
 
+// Classic Start: pinned (12 in rows of 6), files (10 in two columns), recent apps (6), in that order, never overlapping;
+// on a short screen the recent apps go first, then pinned rows, then file rows.
+static void Classic() {
+    const float searchBot = 60, appRowH = start::kAppRowH, minBody = searchBot + 8 + 4 + 8 * 36 + 4, bottomH = start::kBottomH;
+    auto plan = [&](float avail, bool p, int np, bool f, int nf, bool r, int nr) {
+        return start::PlanClassic(searchBot, avail, appRowH, minBody, bottomH, 6, p, np, f, nf, r, nr);
+    };
+    auto ordered = [&](start::ClassicPlan const& c) {
+        bool ok = c.pinnedLabelY >= searchBot && c.pinnedTop > c.pinnedLabelY;
+        if (c.pinRows) ok = ok && c.pinnedTop + c.pinRows * appRowH <= c.filesLabelY;
+        if (c.fileRows) ok = ok && c.filesTop + c.fileRows * start::tk::kFileRowH <= c.recentLabelY;
+        if (c.recentRows) ok = ok && c.recentTop + c.recentRows * appRowH <= c.dividerY;
+        return ok && c.dividerY >= minBody && c.height == c.dividerY + 1 + bottomH;
+    };
+    // Roomy (1920x1200 at 125 %: about 850 logical px above the dock): everything shows.
+    auto roomy = plan(850, true, 12, true, 10, true, 6);
+    CHECK(roomy.pinRows == 2 && roomy.fileRows == 5 && roomy.recentRows == 1);
+    CHECK(roomy.pinnedLabelY < roomy.filesLabelY && roomy.filesLabelY < roomy.recentLabelY);
+    CHECK(ordered(roomy) && roomy.height <= 850);
+    std::printf("classic 12/10/6: height %.0f (pinned %d rows, files %d, recent %d)\n", roomy.height, roomy.pinRows, roomy.fileRows, roomy.recentRows);
+    // Short (1366x768 at 125 %: 508 px): recent apps give way first, and they go entirely before a pinned row does.
+    auto shortP = plan(508, true, 12, true, 10, true, 6);
+    CHECK(ordered(shortP) && shortP.height <= 508);
+    CHECK(shortP.recentRows == 0 || shortP.pinRows == 2);
+    CHECK(shortP.pinRows >= 1 && shortP.fileRows >= 1);
+    std::printf("classic at 508 px: height %.0f (pinned %d rows, files %d, recent %d)\n", shortP.height, shortP.pinRows, shortP.fileRows, shortP.recentRows);
+    // 150 % on the same screen (406 px): still one row of each of pinned and files.
+    auto tiny = plan(406, true, 12, true, 10, true, 6);
+    CHECK(ordered(tiny) && tiny.pinRows >= 1 && tiny.fileRows >= 1 && tiny.recentRows == 0);
+    // A section switched off takes no room; one switched on but empty keeps a row for its hint.
+    auto noPins = plan(850, false, 0, true, 10, true, 6);
+    CHECK(noPins.pinRows == 0 && noPins.filesLabelY == noPins.pinnedLabelY && ordered(noPins));
+    auto emptyPins = plan(850, true, 0, true, 10, true, 6);
+    CHECK(emptyPins.pinRows == 1 && ordered(emptyPins));
+    auto onlyRecent = plan(850, false, 0, false, 0, true, 3);
+    CHECK(onlyRecent.recentRows == 1 && onlyRecent.recentLabelY == onlyRecent.pinnedLabelY && ordered(onlyRecent));
+}
+
 int wmain() {
+    Classic();
     Quotes();
     Calendar();
     Names();
