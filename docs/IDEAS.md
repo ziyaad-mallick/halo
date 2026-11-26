@@ -1,5 +1,7 @@
 # Halo: what to build next (ranked)
 
+> 26 Nov 2026: status of every idea below, and the build order, is in [docs/LAUNCH.md](LAUNCH.md).
+
 *2026-10-17. Research pass, web search only. Reddit threads did not surface in
 search, so user-complaint evidence comes from forums, Steam, GitHub, news and
 Seelen's own known-issues page. Treat "users want it" as a hypothesis to check.*
