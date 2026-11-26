@@ -126,6 +126,8 @@ bool ParseFlatJson(std::string const& s, std::map<std::string, std::string>& out
                         else { r += (char)(0xE0 | (cp >> 12)); r += (char)(0x80 | ((cp >> 6) & 0x3F)); r += (char)(0x80 | (cp & 0x3F)); }
                         break;
                     }
+                    case 'b': r += '\b'; break;
+                    case 'f': r += '\f'; break;
                     default: r += e;
                 }
             } else r += s[i++];
@@ -429,7 +431,11 @@ Response Route(std::string const& method, std::string const& path, std::string c
         if (!ParseFlatJson(body, in) || !in.count("text")) return Err(400, "body must be a JSON object like {\"text\":\"[general]\ntheme = dark\"}");
         st::ImportResult res = st::MergeImport(st::Serialize(st::Read()), in["text"]);  // the file is untrusted: only schema keys, coerced by type
         if (!res.ok) return Err(400, res.error.c_str());
-        if (res.applied && !st::WriteText(res.text)) return Err(500, "could not write the settings file");
+        if (res.applied) {
+            const std::wstring path = st::Path();
+            CopyFileW(path.c_str(), (path + L".bak").c_str(), FALSE);  // the way back: what the import replaced (best effort)
+            if (!st::WriteText(res.text)) return Err(500, "could not write the settings file");
+        }
         r.body = "{\"ok\":true,\"applied\":" + std::to_string(res.applied) + ",\"dropped\":" + std::to_string(res.dropped) + ",\"values\":" + ValuesJson(Current()) + "}";
         return r;
     }

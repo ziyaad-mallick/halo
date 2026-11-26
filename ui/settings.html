@@ -745,14 +745,22 @@ async function exportSettings() {
 function pickImport() { h("input", { type: "file", accept: ".ini,text/plain", onchange: (e) => importSettings(e.target.files[0]) }).click(); }
 async function importSettings(file) {
   if (!file) return;
-  if (file.size > 65536) { noteFile("That file is too large to be a Halo settings file."); return; }
+  if (file.size > 60000) { noteFile("That file is too large to be a Halo settings file."); return; }  // the request body is capped at 64 KB
+  let text;
+  try { text = await file.text(); } catch (e) { noteFile("Couldn't read that file."); return; }
+  ask("Import these settings?", "Every setting the file names replaces yours, including HALO 2.0, developer mode and how the dock hides. Your current settings are kept next to the file as settings.ini.bak.", () => applyImport(text));
+}
+async function applyImport(text) {
   try {
-    const r = await api("api/import", { text: await file.text() });
+    const r = await api("api/import", { text });
     clearTimeout(timer); pending = {};
     values = r.values;
-    fileNote = "Imported " + r.applied + " setting" + (r.applied === 1 ? "" : "s") + (r.dropped ? ", skipped " + r.dropped + " line" + (r.dropped === 1 ? "" : "s") + " that weren't valid Halo settings" : "") + ".";
+    fileNote = r.applied ? "Imported " + r.applied + " setting" + (r.applied === 1 ? "" : "s") + (r.dropped ? ", skipped " + r.dropped + " line" + (r.dropped === 1 ? "" : "s") + " that weren't valid Halo settings" : "") + "."
+                         : "Nothing to import: that file has no Halo settings in it.";
     derived("*"); renderPage(); setStatus("saved");
-  } catch (e) { noteFile("Couldn't import that file. Is it a Halo settings file?"); }
+  } catch (e) {
+    noteFile(String(e.message).includes("500") ? "Couldn't save the imported settings. Your settings file may be read-only." : "Couldn't import that file. Is it a Halo settings file?");
+  }
 }
 
 /* ===================================================================== RESET + CONFIRM */

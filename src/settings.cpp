@@ -155,8 +155,18 @@ Values ParseIni(std::string text, size_t maxLine, int* dropped) {
         std::string line = Trim(text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos));
         pos = nl == std::string::npos ? text.size() + 1 : nl + 1;
         if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+        if (line.front() == '[') {  // a header, well formed or not: a broken one must not leave the previous section in force
+            std::string hdr = line;
+            if (size_t sc = hdr.find(';'); sc != std::string::npos) hdr = Trim(hdr.substr(0, sc));  // "[start] ; my menu"
+            if (hdr.size() >= 2 && hdr.back() == ']' && (!maxLine || line.size() <= maxLine)) {
+                section = Lower(Trim(hdr.substr(1, hdr.size() - 2)));
+            } else {
+                section.clear();  // keys drop until the next good header
+                drop++;
+            }
+            continue;
+        }
         if (maxLine && line.size() > maxLine) { drop++; continue; }
-        if (line.front() == '[' && line.back() == ']') { section = Lower(Trim(line.substr(1, line.size() - 2))); continue; }
         size_t eq = line.find('=');
         if (eq == std::string::npos) { drop++; continue; }
         std::string sk = section + "." + Lower(Trim(line.substr(0, eq)));

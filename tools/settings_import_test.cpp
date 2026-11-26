@@ -87,6 +87,20 @@ int wmain() {
     r = st::MergeImport(cur, "\xEF\xBB\xBF[general]\r\ntheme = dark\r\n");
     CHECK(r.applied == 1 && st::ParseIni(r.text)["general.theme"] == "dark");
 
+    // A header with a comment is still that header; a broken or over-long one switches sections off until the next good
+    // one, so its keys never land in the section above it.
+    r = st::MergeImport(cur, "[taskbar]\nspeed = 50\n[start] ; my start menu\nspeed = 200\n");
+    v = st::ParseIni(r.text);
+    CHECK(v["taskbar.speed"] == "50" && v["start.speed"] == "200");
+    r = st::MergeImport(cur, "[taskbar]\nspeed = 50\n[start\nspeed = 70\n");
+    v = st::ParseIni(r.text);
+    CHECK(v["taskbar.speed"] == "50" && r.applied == 1 && r.dropped == 2);
+    r = st::MergeImport(cur, "[taskbar]\nspeed = 50\n[" + std::string(300, 'x') + "]\nspeed = 60\n");
+    v = st::ParseIni(r.text);
+    CHECK(v["taskbar.speed"] == "50" && r.applied == 1);
+    r = st::MergeImport(cur, "[taskbar]\nspeed = 50\n[]\nspeed = 80\n");
+    CHECK(st::ParseIni(r.text)["taskbar.speed"] == "50");
+
     puts(g_fail ? "FAILED" : "PASSED");
     return g_fail ? 1 : 0;
 }
